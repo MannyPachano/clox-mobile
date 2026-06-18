@@ -1,0 +1,70 @@
+{
+  "expo": {
+    "name": "Clox",
+    "slug": "clox-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "scheme": "clox",
+    "userInterfaceStyle": "automatic",
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#f3efe7"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.getclox.clock",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "Clox records your location when you clock in to confirm you're at the job site.",
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    },
+    "android": {
+      "package": "com.getclox.clock",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#b84a2c"
+      },
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.CAMERA"
+      ]
+    },
+    "plugins": [
+      "expo-secure-store",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Clox records your location when you clock in to confirm you're at the job site."
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Clox takes a selfie when you clock in, to confirm it's you.",
+          "microphonePermission": false,
+          "recordAudioAndroid": false
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "color": "#b84a2c"
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "2dcdc983-13fa-4199-8a2d-362e610d7d80"
+      }
+    },
+    "owner": "cloxlabs"
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "cli": {
+    "version": ">= 5.0.0",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal"
+    },
+    "preview": {
+      "distribution": "internal",
+      "android": {
+        "buildType": "apk"
+      },
+      "env": {
+        "EXPO_PUBLIC_SUPABASE_URL": "https://zioqdeoxybjfaowhpblc.supabase.co",
+        "EXPO_PUBLIC_SUPABASE_ANON_KEY": "sb_publishable_T7dDnbAyyYHSS5_615PihA_wdh0DQeu",
+        "EXPO_PUBLIC_API_BASE_URL": "https://app.getclox.com"
+      }
+    },
+    "production": {
+      "distribution": "store",
+      "autoIncrement": true,
+      "env": {
+        "EXPO_PUBLIC_SUPABASE_URL": "https://zioqdeoxybjfaowhpblc.supabase.co",
+        "EXPO_PUBLIC_SUPABASE_ANON_KEY": "sb_publishable_T7dDnbAyyYHSS5_615PihA_wdh0DQeu",
+        "EXPO_PUBLIC_API_BASE_URL": "https://app.getclox.com"
+      }
+    }
+  },
+  "submit": {
+    "production": {}
+  }
+}

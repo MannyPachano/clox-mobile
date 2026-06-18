@@ -1,0 +1,10 @@
+node_modules/
+.expo/
+dist/
+web-build/
+*.log
+.DS_Store
+
+# Local secrets — the publishable keys are safe to ship, but keep .env out of git
+# anyway and use .env.example as the template.
+.env
