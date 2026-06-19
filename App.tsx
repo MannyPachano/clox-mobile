@@ -6,6 +6,7 @@ import { SafeAreaProvider } from "react-native-safe-area-context";
 import type { Session } from "@supabase/supabase-js";
 
 import { getStatus } from "./src/api";
+import { ErrorBoundary } from "./src/components/ErrorBoundary";
 import { installErrorReporting } from "./src/error-reporting";
 import { ManagerTabs } from "./src/navigation/ManagerTabs";
 import { registerForPush, unregisterForPush } from "./src/push";
@@ -95,8 +96,9 @@ export default function App() {
 
   return (
     <SafeAreaProvider>
-      <View style={styles.root}>
-        <StatusBar style="dark" />
+      <ErrorBoundary>
+        <View style={styles.root}>
+          <StatusBar style="dark" />
         {loading || resolvingRole ? (
           <View style={styles.center}>
             <ActivityIndicator color={lightColors.accent} size="large" />
@@ -112,7 +114,8 @@ export default function App() {
             <ClockScreen session={session} onSignOut={handleSignOut} />
           </TutorialProvider>
         )}
-      </View>
+        </View>
+      </ErrorBoundary>
     </SafeAreaProvider>
   );
 }

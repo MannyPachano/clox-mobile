@@ -348,6 +348,50 @@ export function ClockScreen({ session, onSignOut }: Props) {
   const isDark = palette === darkColors;
   const styles = useMemo(() => makeStyles(palette), [palette]);
 
+  // Declared BEFORE the early `if (!ready) return` below so the number of hooks
+  // is identical on every render. A hook after a conditional return changes the
+  // hook count between renders and throws "Rendered more hooks than during the
+  // previous render," which hard-crashes a release (Hermes) build.
+  const handleDeleteAccount = useCallback(() => {
+    Alert.alert(
+      "Delete account",
+      "This permanently deletes your account and personal details. Your past " +
+        "time entries stay with your employer for payroll but can no longer be " +
+        "tied to you. This can't be undone.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Delete account",
+          style: "destructive",
+          onPress: () => {
+            void (async () => {
+              const token = await getAccessToken();
+              if (!token) {
+                Alert.alert(
+                  "Sign in required",
+                  "Please sign in again and retry.",
+                );
+                return;
+              }
+              const res = await deleteAccount(token);
+              if (res.ok) {
+                onSignOut();
+                return;
+              }
+              const message =
+                res.error === "is_owner"
+                  ? "You own this organization. Transfer ownership or delete the organization first. You can do that on the web app under Settings."
+                  : res.error === "last_manager"
+                    ? "You're the only manager. Add another manager before deleting your account."
+                    : "Something went wrong deleting your account. Please try again, or contact support.";
+              Alert.alert("Couldn't delete account", message);
+            })();
+          },
+        },
+      ],
+    );
+  }, [onSignOut]);
+
   if (!ready) {
     return (
       <SafeAreaView style={[styles.container, styles.center]}>
@@ -382,46 +426,6 @@ export function ClockScreen({ session, onSignOut }: Props) {
           : []),
       ]
     : [];
-
-  const handleDeleteAccount = useCallback(() => {
-    Alert.alert(
-      "Delete account",
-      "This permanently deletes your account and personal details. Your past " +
-        "time entries stay with your employer for payroll but can no longer be " +
-        "tied to you. This can't be undone.",
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Delete account",
-          style: "destructive",
-          onPress: () => {
-            void (async () => {
-              const token = await getAccessToken();
-              if (!token) {
-                Alert.alert(
-                  "Sign in required",
-                  "Please sign in again and retry.",
-                );
-                return;
-              }
-              const res = await deleteAccount(token);
-              if (res.ok) {
-                onSignOut();
-                return;
-              }
-              const message =
-                res.error === "is_owner"
-                  ? "You own this organization. Transfer ownership or delete the organization first — you can do that on the web app under Settings."
-                  : res.error === "last_manager"
-                    ? "You're the only manager. Add another manager before deleting your account."
-                    : "Something went wrong deleting your account. Please try again, or contact support.";
-              Alert.alert("Couldn't delete account", message);
-            })();
-          },
-        },
-      ],
-    );
-  }, [onSignOut]);
 
   return (
     <ThemeContext.Provider value={palette}>
