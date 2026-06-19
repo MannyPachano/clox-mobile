@@ -3,6 +3,7 @@ import {
   ActivityIndicator,
   Alert,
   AppState,
+  Modal,
   ScrollView,
   StyleSheet,
   Text,
@@ -115,6 +116,7 @@ export function ClockScreen({ session, onSignOut }: Props) {
   const [taskId, setTaskId] = useState<string | null>(null);
   const [history, setHistory] = useState<HistoryShift[]>([]);
   const [selectedShift, setSelectedShift] = useState<HistoryShift | null>(null);
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
 
   const refresh = useCallback(async () => {
     const token = await getAccessToken();
@@ -433,14 +435,17 @@ export function ClockScreen({ session, onSignOut }: Props) {
         <StatusBar style={isDark ? "light" : "dark"} />
         <View style={styles.header}>
           <Wordmark palette={palette} size={22} />
-          <View style={styles.headerActions}>
-            <TouchableOpacity onPress={startTutorial} hitSlop={12}>
-              <Text style={styles.signOut}>Tutorial</Text>
-            </TouchableOpacity>
-            <TouchableOpacity onPress={onSignOut} hitSlop={12}>
-              <Text style={styles.signOut}>Sign out</Text>
-            </TouchableOpacity>
-          </View>
+          <TouchableOpacity
+            onPress={() => setAccountMenuOpen(true)}
+            hitSlop={10}
+            accessibilityRole="button"
+            accessibilityLabel="Account menu"
+            style={styles.avatarBtn}
+          >
+            <Text style={styles.avatarInitial}>
+              {(userName || "U").trim().charAt(0).toUpperCase()}
+            </Text>
+          </TouchableOpacity>
         </View>
 
         <ScrollView
@@ -642,17 +647,9 @@ export function ClockScreen({ session, onSignOut }: Props) {
           ) : null}
 
           <Text style={styles.offlineHint}>
-            Works offline — your punch is saved on this phone and syncs
+            Works offline. Your punch is saved on this phone and syncs
             automatically when you&apos;re back online.
           </Text>
-
-          <TouchableOpacity
-            onPress={handleDeleteAccount}
-            hitSlop={8}
-            style={styles.deleteAccountWrap}
-          >
-            <Text style={styles.deleteAccount}>Delete account</Text>
-          </TouchableOpacity>
         </ScrollView>
 
         <SelfieCapture
@@ -669,6 +666,63 @@ export function ClockScreen({ session, onSignOut }: Props) {
           rows={detailRows}
           onClose={() => setSelectedShift(null)}
         />
+
+        <Modal
+          visible={accountMenuOpen}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setAccountMenuOpen(false)}
+        >
+          <TouchableOpacity
+            style={styles.sheetBackdrop}
+            activeOpacity={1}
+            onPress={() => setAccountMenuOpen(false)}
+          >
+            <TouchableOpacity activeOpacity={1} style={styles.sheetCard}>
+              <Text style={styles.sheetName} numberOfLines={1}>
+                {userName}
+              </Text>
+              {orgName ? (
+                <Text style={styles.sheetSub} numberOfLines={1}>
+                  {orgName}
+                </Text>
+              ) : null}
+
+              <View style={styles.sheetDivider} />
+
+              <TouchableOpacity
+                style={styles.sheetRow}
+                onPress={() => {
+                  setAccountMenuOpen(false);
+                  startTutorial();
+                }}
+              >
+                <Text style={styles.sheetRowText}>Replay tutorial</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.sheetRow}
+                onPress={() => {
+                  setAccountMenuOpen(false);
+                  onSignOut();
+                }}
+              >
+                <Text style={styles.sheetRowText}>Sign out</Text>
+              </TouchableOpacity>
+
+              <View style={styles.sheetDivider} />
+
+              <TouchableOpacity
+                style={styles.sheetRow}
+                onPress={() => {
+                  setAccountMenuOpen(false);
+                  handleDeleteAccount();
+                }}
+              >
+                <Text style={styles.sheetRowDanger}>Delete account</Text>
+              </TouchableOpacity>
+            </TouchableOpacity>
+          </TouchableOpacity>
+        </Modal>
 
         {banner ? (
           <TouchableOpacity
@@ -699,10 +753,34 @@ const makeStyles = (c: Palette) =>
       paddingTop: 12,
       paddingBottom: 4,
     },
-    headerActions: { flexDirection: "row", alignItems: "center", gap: 18 },
-    signOut: { color: c.textMuted, fontSize: 15, fontWeight: "600" },
-    deleteAccountWrap: { alignSelf: "center", marginTop: 28, paddingVertical: 8 },
-    deleteAccount: { color: c.danger, fontSize: 14, fontWeight: "600" },
+    avatarBtn: {
+      width: 36,
+      height: 36,
+      borderRadius: 18,
+      backgroundColor: c.accent,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    avatarInitial: { color: c.accentText, fontSize: 16, fontWeight: "700" },
+    sheetBackdrop: {
+      flex: 1,
+      backgroundColor: "rgba(0,0,0,0.45)",
+      justifyContent: "flex-end",
+    },
+    sheetCard: {
+      backgroundColor: c.surface,
+      borderTopLeftRadius: 20,
+      borderTopRightRadius: 20,
+      paddingHorizontal: 20,
+      paddingTop: 20,
+      paddingBottom: 36,
+    },
+    sheetName: { color: c.text, fontSize: 17, fontWeight: "700" },
+    sheetSub: { color: c.textMuted, fontSize: 14, marginTop: 2 },
+    sheetDivider: { height: 1, backgroundColor: c.border, marginVertical: 12 },
+    sheetRow: { paddingVertical: 14 },
+    sheetRowText: { color: c.text, fontSize: 16, fontWeight: "600" },
+    sheetRowDanger: { color: c.danger, fontSize: 16, fontWeight: "600" },
     body: {
       flexGrow: 1,
       paddingHorizontal: 24,
