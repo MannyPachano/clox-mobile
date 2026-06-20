@@ -687,6 +687,11 @@ export function ClockScreen({ session, onSignOut }: Props) {
                   {orgName}
                 </Text>
               ) : null}
+              {session.user.email ? (
+                <Text style={styles.sheetEmail} numberOfLines={1}>
+                  {session.user.email}
+                </Text>
+              ) : null}
 
               <View style={styles.sheetDivider} />
 
@@ -777,6 +782,7 @@ const makeStyles = (c: Palette) =>
     },
     sheetName: { color: c.text, fontSize: 17, fontWeight: "700" },
     sheetSub: { color: c.textMuted, fontSize: 14, marginTop: 2 },
+    sheetEmail: { color: c.textMuted, fontSize: 13, marginTop: 2 },
     sheetDivider: { height: 1, backgroundColor: c.border, marginVertical: 12 },
     sheetRow: { paddingVertical: 14 },
     sheetRowText: { color: c.text, fontSize: 16, fontWeight: "600" },
