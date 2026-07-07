@@ -11,6 +11,7 @@ import {
 } from "react-native";
 
 import { Wordmark } from "../components/Wordmark";
+import { haptics } from "../lib/haptics";
 import { supabase } from "../supabase";
 import { lightColors, type Palette } from "../theme";
 
@@ -24,6 +25,7 @@ export function LoginScreen() {
   const [error, setError] = useState<string | null>(null);
 
   async function onSignIn() {
+    haptics.light();
     setError(null);
     setBusy(true);
     const { error: err } = await supabase.auth.signInWithPassword({
@@ -31,7 +33,10 @@ export function LoginScreen() {
       password,
     });
     // On success, App's onAuthStateChange swaps to the Clock screen.
-    if (err) setError(err.message);
+    if (err) {
+      setError(err.message);
+      haptics.error();
+    }
     setBusy(false);
   }
 
@@ -88,6 +93,10 @@ export function LoginScreen() {
 
         <Text style={styles.hint}>
           Use the same email and password as the Clox website.
+        </Text>
+        <Text style={styles.hint}>
+          First time here or forgot your password? Set or reset it on the Clox
+          website, then sign in with that email and password.
         </Text>
       </View>
     </KeyboardAvoidingView>

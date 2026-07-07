@@ -10,6 +10,7 @@ import { ErrorBoundary } from "./src/components/ErrorBoundary";
 import { installErrorReporting } from "./src/error-reporting";
 import { ManagerTabs } from "./src/navigation/ManagerTabs";
 import { registerForPush, unregisterForPush } from "./src/push";
+import { clearQueue, drainQueue } from "./src/queue";
 import { ClockScreen } from "./src/screens/ClockScreen";
 import { LoginScreen } from "./src/screens/LoginScreen";
 import { getAccessToken, supabase } from "./src/supabase";
@@ -86,7 +87,20 @@ export default function App() {
 
   const handleSignOut = async () => {
     const t = await getAccessToken();
-    if (t) await unregisterForPush(t);
+    if (t) {
+      await unregisterForPush(t);
+      // Flush queued punches under THIS user first so they're attributed
+      // correctly, then clear whatever couldn't send. The queue is device-
+      // global and drains under whoever signs in next, so anything left would
+      // otherwise record this user's punches as the next user's.
+      try {
+        await drainQueue(t);
+      } catch {
+        // Offline or a failed send — the clear below drops the remainder
+        // rather than leaving it to mis-attribute.
+      }
+    }
+    await clearQueue();
     await supabase.auth.signOut();
   };
 

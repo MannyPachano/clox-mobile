@@ -18,6 +18,7 @@ import {
   type PendingTimesheet,
 } from "../api";
 import { EditEntryModal } from "../components/EditEntryModal";
+import { haptics } from "../lib/haptics";
 import { getAccessToken } from "../supabase";
 import { lightColors as c } from "../theme";
 
@@ -96,6 +97,7 @@ export function ApprovalsScreen() {
   const decideTimesheets = useCallback(
     async (ids: string[], action: "approve" | "reject") => {
       if (ids.length === 0) return;
+      haptics[action === "approve" ? "success" : "warning"]();
       const token = await getAccessToken();
       if (!token) return;
       setBanner(null);
@@ -117,6 +119,7 @@ export function ApprovalsScreen() {
 
   const decideLeave = useCallback(
     async (id: string, decision: "approved" | "rejected") => {
+      haptics[decision === "approved" ? "success" : "warning"]();
       const token = await getAccessToken();
       if (!token) return;
       setBanner(null);
@@ -164,7 +167,13 @@ export function ApprovalsScreen() {
         }
       >
         {empty ? (
-          <Text style={styles.allClear}>All caught up — nothing pending.</Text>
+          <>
+            <Text style={styles.allClear}>All caught up. Nothing pending.</Text>
+            <Text style={styles.allClearHint}>
+              Timesheets and time-off requests from your team land here for you
+              to approve or reject. There is nothing to review right now.
+            </Text>
+          </>
         ) : null}
 
         {timesheets.length > 0 ? (
@@ -190,7 +199,7 @@ export function ApprovalsScreen() {
                 <Text style={styles.who} numberOfLines={1}>
                   {t.employee}
                   {t.source !== "timer" && t.source !== "mobile" ? (
-                    <Text style={styles.badge}>  {t.source}</Text>
+                    <Text style={styles.badge}>  from {t.source}</Text>
                   ) : null}
                 </Text>
                 <Text style={styles.meta} numberOfLines={1}>
@@ -289,6 +298,14 @@ const styles = StyleSheet.create({
     fontSize: 16,
     textAlign: "center",
     marginTop: 48,
+  },
+  allClearHint: {
+    color: c.textMuted,
+    fontSize: 14,
+    textAlign: "center",
+    lineHeight: 20,
+    marginTop: 10,
+    paddingHorizontal: 16,
   },
   section: { marginTop: 16 },
   sectionHead: {

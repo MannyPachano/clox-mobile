@@ -1,4 +1,5 @@
 import { API_BASE_URL } from "./config";
+import { getAttestationForPunch } from "./attestation";
 import type { QueuedPunch } from "./queue";
 
 export type Option = { id: string; name: string };
@@ -24,6 +25,13 @@ export type StatusResponse = {
   tutorialCompleted: boolean;
   projects: Option[];
   tasksByProject: Record<string, Option[]>;
+  /** Geofence config for the client-side pre-check. `enforced` is false (and
+   *  `worksites` empty) when this worker is exempt or unassigned. Advisory: the
+   *  server re-checks on the punch and is the authority. */
+  geofence: {
+    enforced: boolean;
+    worksites: { latitude: number; longitude: number; radiusM: number }[];
+  };
 };
 
 export type ApiResult<T> =
@@ -82,10 +90,14 @@ export function deleteAccount(
   return request("account/delete", token, "POST", {});
 }
 
-export function clockIn(
+export async function clockIn(
   token: string,
   punch: QueuedPunch,
 ): Promise<ApiResult<unknown>> {
+  // Device attestation is generated here, at send time: the app is online while
+  // draining the queue, so the token is fresh and the tap stayed fast. It binds
+  // to the punch id. Best-effort — returns {} and is simply omitted on failure.
+  const attestation = await getAttestationForPunch(punch.id, token);
   return request("clock-in", token, "POST", {
     idempotencyKey: punch.id,
     clientTime: punch.clientTime,
@@ -96,6 +108,8 @@ export function clockIn(
     latitude: punch.latitude,
     longitude: punch.longitude,
     accuracyM: punch.accuracyM,
+    mocked: punch.mocked,
+    ...attestation,
   });
 }
 
@@ -307,6 +321,20 @@ export function getManagerSchedule(
 ): Promise<ApiResult<{ shifts: ScheduledShiftDto[]; employees: Option[] }>> {
   const qs = `from=${encodeURIComponent(fromIso)}&to=${encodeURIComponent(toIso)}`;
   return request(`manager/schedule?${qs}`, token, "GET");
+}
+
+export type MyScheduledShift = {
+  id: string;
+  startsAt: string;
+  endsAt: string;
+  isSeries: boolean;
+};
+
+/** The signed-in employee's own upcoming scheduled shifts, soonest first. */
+export function getMySchedule(
+  token: string,
+): Promise<ApiResult<{ shifts: MyScheduledShift[]; scheduleEnabled: boolean }>> {
+  return request("my-schedule", token, "GET");
 }
 
 export function createManagerShift(

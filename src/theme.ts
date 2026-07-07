@@ -54,8 +54,6 @@ export const lightColors: Palette = {
  */
 export type ThemePreference = "auto" | "light" | "dark";
 
-export const THEME_PREFERENCES: ThemePreference[] = ["auto", "light", "dark"];
-
 export function normalizeThemePreference(v: unknown): ThemePreference {
   return v === "light" || v === "dark" ? v : "auto";
 }

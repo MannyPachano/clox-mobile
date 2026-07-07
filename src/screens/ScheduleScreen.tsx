@@ -250,7 +250,12 @@ export function ScheduleScreen() {
                         <Text style={styles.who} numberOfLines={1}>
                           {s.employeeName}
                           {s.isSeries ? (
-                            <Text style={styles.badge}>  ↻</Text>
+                            <Text
+                              style={styles.badge}
+                              accessibilityLabel="Part of a repeating series"
+                            >
+                              {"  ↻ Repeats"}
+                            </Text>
                           ) : null}
                         </Text>
                         <Text style={styles.when}>

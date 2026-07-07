@@ -20,10 +20,14 @@ import type { Session } from "@supabase/supabase-js";
 import {
   deleteAccount,
   getHistory,
+  getMySchedule,
   getStatus,
   type HistoryShift,
+  type MyScheduledShift,
   type Option,
 } from "../api";
+import { precheckGeofence, type Fence } from "../geofence";
+import { haptics } from "../lib/haptics";
 import { SelectField } from "../components/SelectField";
 import { SelfieCapture } from "../components/SelfieCapture";
 import { ShiftDetailSheet } from "../components/ShiftDetailSheet";
@@ -115,16 +119,20 @@ export function ClockScreen({ session, onSignOut }: Props) {
   const [projectId, setProjectId] = useState<string | null>(null);
   const [taskId, setTaskId] = useState<string | null>(null);
   const [history, setHistory] = useState<HistoryShift[]>([]);
+  const [upcoming, setUpcoming] = useState<MyScheduledShift[]>([]);
   const [selectedShift, setSelectedShift] = useState<HistoryShift | null>(null);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
+  // Worksite fences for the client-side clock-in pre-check. Empty = no geofence.
+  const [fences, setFences] = useState<Fence[]>([]);
 
   const refresh = useCallback(async () => {
     const token = await getAccessToken();
     if (!token) return;
     try {
-      const [statusRes, historyRes] = await Promise.all([
+      const [statusRes, historyRes, scheduleRes] = await Promise.all([
         getStatus(token),
         getHistory(token),
+        getMySchedule(token),
       ]);
       if (statusRes.ok) {
         const d = statusRes.data;
@@ -135,6 +143,7 @@ export function ClockScreen({ session, onSignOut }: Props) {
         setThemePreference(normalizeThemePreference(d.themePreference));
         setProjects(d.projects);
         setTasksByProject(d.tasksByProject);
+        setFences(d.geofence?.worksites ?? []);
         // Apply server truth only when the queue is empty — otherwise an
         // in-flight optimistic punch would be clobbered. (Also how a rejected
         // clock-in reverts: punch dropped → queue empty → server says "no
@@ -148,6 +157,7 @@ export function ClockScreen({ session, onSignOut }: Props) {
         }
       }
       if (historyRes.ok) setHistory(historyRes.data.shifts);
+      if (scheduleRes.ok) setUpcoming(scheduleRes.data.shifts);
     } catch {
       // Offline — keep optimistic local state.
     } finally {
@@ -203,6 +213,7 @@ export function ClockScreen({ session, onSignOut }: Props) {
         latitude: null,
         longitude: null,
         accuracyM: null,
+        mocked: null,
       };
       try {
         await enqueuePunch(punch);
@@ -231,6 +242,7 @@ export function ClockScreen({ session, onSignOut }: Props) {
         latitude: null,
         longitude: null,
         accuracyM: null,
+        mocked: null,
       };
       try {
         await enqueuePunch(punch);
@@ -266,6 +278,33 @@ export function ClockScreen({ session, onSignOut }: Props) {
       setBusy(true);
       setBanner(null);
       const coords = await getPunchLocation();
+      // Offline, the server can't tell the worker on the spot that they look
+      // off-site — the punch would only fail on a later sync, after they've
+      // left. So when there's no connection, warn now from the cached fences.
+      // Advisory only and fail-open: this must never stop a clock-in.
+      try {
+        if (fences.length > 0) {
+          const net = await NetInfo.fetch();
+          if (!net.isConnected) {
+            const check = precheckGeofence(coords, fences);
+            if (check === "off_site") {
+              setBanner(
+                "Heads up: you look off the job site. If you're not on site, this clock-in won't count once you're back online.",
+              );
+            } else if (check === "no_location") {
+              setBanner(
+                "Heads up: Clox couldn't get your location. If you're on site, turn location on so this clock-in counts once you're back online.",
+              );
+            } else if (check === "inaccurate") {
+              setBanner(
+                "Heads up: your GPS signal is too weak to confirm the job site. Move into the open so this clock-in counts once you're back online.",
+              );
+            }
+          }
+        }
+      } catch {
+        // Advisory only — never block clocking in on a pre-check failure.
+      }
       const punch: QueuedPunch = {
         id: newUuid(),
         kind: "in",
@@ -277,6 +316,7 @@ export function ClockScreen({ session, onSignOut }: Props) {
         latitude: coords.latitude,
         longitude: coords.longitude,
         accuracyM: coords.accuracyM,
+        mocked: coords.mocked,
       };
       try {
         await enqueuePunch(punch);
@@ -294,10 +334,11 @@ export function ClockScreen({ session, onSignOut }: Props) {
       await sync();
       setBusy(false);
     },
-    [projectId, taskId, note, sync],
+    [projectId, taskId, note, sync, fences],
   );
 
   const onClockIn = useCallback(() => {
+    haptics.medium();
     if (selfieRequired) {
       setBanner(null);
       setCameraOpen(true);
@@ -315,6 +356,7 @@ export function ClockScreen({ session, onSignOut }: Props) {
   );
 
   const onClockOut = useCallback(async () => {
+    haptics.medium();
     setBusy(true);
     setBanner(null);
     setShiftStartedAt(null);
@@ -324,6 +366,7 @@ export function ClockScreen({ session, onSignOut }: Props) {
   }, [enqueueSimple]);
 
   const onBreakStart = useCallback(async () => {
+    haptics.light();
     setBusy(true);
     setBanner(null);
     setOnBreakSince(new Date().toISOString());
@@ -332,6 +375,7 @@ export function ClockScreen({ session, onSignOut }: Props) {
   }, [enqueueSimple]);
 
   const onBreakEnd = useCallback(async () => {
+    haptics.light();
     setBusy(true);
     setBanner(null);
     setOnBreakSince(null);
@@ -355,39 +399,53 @@ export function ClockScreen({ session, onSignOut }: Props) {
   // hook count between renders and throws "Rendered more hooks than during the
   // previous render," which hard-crashes a release (Hermes) build.
   const handleDeleteAccount = useCallback(() => {
+    const runDelete = () => {
+      void (async () => {
+        const token = await getAccessToken();
+        if (!token) {
+          Alert.alert("Sign in required", "Please sign in again and retry.");
+          return;
+        }
+        const res = await deleteAccount(token);
+        if (res.ok) {
+          onSignOut();
+          return;
+        }
+        const message =
+          res.error === "is_owner"
+            ? "You own this organization. Transfer ownership or delete the organization first. You can do that on the web app under Settings."
+            : res.error === "last_manager"
+              ? "You're the only manager. Add another manager before deleting your account."
+              : "Something went wrong deleting your account. Please try again, or contact support.";
+        Alert.alert("Couldn't delete account", message);
+      })();
+    };
+
+    // Two-step confirmation. This is irreversible and its entry point sits in
+    // the same sheet as Sign out, so it must never complete on a single tap.
     Alert.alert(
-      "Delete account",
-      "This permanently deletes your account and personal details. Your past " +
+      "Delete my account",
+      "This permanently deletes your login and personal details. Your past " +
         "time entries stay with your employer for payroll but can no longer be " +
         "tied to you. This can't be undone.",
       [
         { text: "Cancel", style: "cancel" },
         {
-          text: "Delete account",
+          text: "Continue",
           style: "destructive",
           onPress: () => {
-            void (async () => {
-              const token = await getAccessToken();
-              if (!token) {
-                Alert.alert(
-                  "Sign in required",
-                  "Please sign in again and retry.",
-                );
-                return;
-              }
-              const res = await deleteAccount(token);
-              if (res.ok) {
-                onSignOut();
-                return;
-              }
-              const message =
-                res.error === "is_owner"
-                  ? "You own this organization. Transfer ownership or delete the organization first. You can do that on the web app under Settings."
-                  : res.error === "last_manager"
-                    ? "You're the only manager. Add another manager before deleting your account."
-                    : "Something went wrong deleting your account. Please try again, or contact support.";
-              Alert.alert("Couldn't delete account", message);
-            })();
+            Alert.alert(
+              "Are you sure?",
+              "Deleting your account is permanent and can't be undone.",
+              [
+                { text: "Cancel", style: "cancel" },
+                {
+                  text: "Delete my account",
+                  style: "destructive",
+                  onPress: runDelete,
+                },
+              ],
+            );
           },
         },
       ],
@@ -608,7 +666,11 @@ export function ClockScreen({ session, onSignOut }: Props) {
           )}
 
           {projectMissing ? (
-            <Text style={styles.requireHint}>Pick a project to clock in.</Text>
+            <Text style={styles.requireHint}>
+              {projects.length === 0
+                ? "Your organization requires a project to clock in, but none have been set up yet. Ask your manager to add a project on the Clox website."
+                : "Pick a project to clock in."}
+            </Text>
           ) : pending > 0 ? (
             <Text style={styles.pending}>
               {pending} {pending === 1 ? "punch" : "punches"} waiting to sync
@@ -616,6 +678,30 @@ export function ClockScreen({ session, onSignOut }: Props) {
           ) : (
             <Text style={styles.synced}>All punches synced</Text>
           )}
+
+          {upcoming.length > 0 ? (
+            <View style={styles.history}>
+              <Text style={styles.historyTitle}>Upcoming shifts</Text>
+              {upcoming.slice(0, 3).map((s) => (
+                <View key={s.id} style={styles.historyRow}>
+                  <View style={styles.historyLeft}>
+                    <Text style={styles.historyDate}>
+                      {formatDate(Date.parse(s.startsAt))}
+                    </Text>
+                    <Text style={styles.historySub} numberOfLines={1}>
+                      {formatClock(Date.parse(s.startsAt))} –{" "}
+                      {formatClock(Date.parse(s.endsAt))}
+                    </Text>
+                  </View>
+                </View>
+              ))}
+              {upcoming.length > 3 ? (
+                <Text style={styles.upcomingMore}>
+                  + {upcoming.length - 3} more scheduled
+                </Text>
+              ) : null}
+            </View>
+          ) : null}
 
           {history.length > 0 ? (
             <View ref={historyRef} style={styles.history}>
@@ -714,16 +800,15 @@ export function ClockScreen({ session, onSignOut }: Props) {
                 <Text style={styles.sheetRowText}>Sign out</Text>
               </TouchableOpacity>
 
-              <View style={styles.sheetDivider} />
-
               <TouchableOpacity
-                style={styles.sheetRow}
+                style={styles.sheetDeleteLink}
+                hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
                 onPress={() => {
                   setAccountMenuOpen(false);
                   handleDeleteAccount();
                 }}
               >
-                <Text style={styles.sheetRowDanger}>Delete account</Text>
+                <Text style={styles.sheetDeleteText}>Delete my account</Text>
               </TouchableOpacity>
             </TouchableOpacity>
           </TouchableOpacity>
@@ -787,6 +872,15 @@ const makeStyles = (c: Palette) =>
     sheetRow: { paddingVertical: 14 },
     sheetRowText: { color: c.text, fontSize: 16, fontWeight: "600" },
     sheetRowDanger: { color: c.danger, fontSize: 16, fontWeight: "600" },
+    // Deliberately de-emphasized and set apart from Sign out so it can't be
+    // mis-tapped when reaching for sign-out. It stays small and muted; the
+    // destructive intent is confirmed in a two-step dialog, not by a big red row.
+    sheetDeleteLink: {
+      marginTop: 24,
+      paddingVertical: 10,
+      alignItems: "center",
+    },
+    sheetDeleteText: { color: c.textMuted, fontSize: 13, fontWeight: "500" },
     body: {
       flexGrow: 1,
       paddingHorizontal: 24,
@@ -900,6 +994,7 @@ const makeStyles = (c: Palette) =>
     historyLeft: { flex: 1, paddingRight: 12 },
     historyDate: { color: c.text, fontSize: 15, fontWeight: "600" },
     historySub: { color: c.textMuted, fontSize: 13, marginTop: 2 },
+    upcomingMore: { color: c.textMuted, fontSize: 13, marginTop: 8 },
     historyDur: { color: c.text, fontSize: 15, fontWeight: "700" },
     historyChevron: { color: c.textMuted, fontSize: 18, marginLeft: 8 },
     offlineHint: {

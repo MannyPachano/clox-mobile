@@ -216,8 +216,18 @@ export function RosterScreen() {
               tintColor={c.accent}
             />
           }
+          ListHeaderComponent={
+            onShiftCount > 0 ? (
+              <Text style={styles.hint}>
+                Tap anyone on the clock to clock them out.
+              </Text>
+            ) : null
+          }
           ListEmptyComponent={
-            <Text style={styles.empty}>No team members yet.</Text>
+            <Text style={styles.empty}>
+              No team members yet. Invite your crew from the Clox website. Once
+              they sign in here, they show up on this roster.
+            </Text>
           }
         />
       )}
@@ -279,6 +289,11 @@ const styles = StyleSheet.create({
   sub: { color: c.text, fontSize: 13, marginTop: 2 },
   subOff: { color: c.textMuted, fontSize: 13, marginTop: 2 },
   chev: { color: c.textMuted, fontSize: 22, marginLeft: 8 },
+  hint: {
+    color: c.textMuted,
+    fontSize: 13,
+    marginBottom: 4,
+  },
   empty: {
     color: c.textMuted,
     fontSize: 15,

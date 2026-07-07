@@ -19,8 +19,11 @@
       "supportsTablet": false,
       "bundleIdentifier": "com.getclox.clock",
       "infoPlist": {
-        "NSLocationWhenInUseUsageDescription": "Clox records your location when you clock in to confirm you're at the job site.",
+        "NSLocationWhenInUseUsageDescription": "Clox checks your location only when you clock in or out, to confirm you're at the job site. It does not track you in the background.",
         "ITSAppUsesNonExemptEncryption": false
+      },
+      "entitlements": {
+        "com.apple.developer.devicecheck.appattest-environment": "production"
       }
     },
     "android": {
@@ -42,13 +45,13 @@
       [
         "expo-location",
         {
-          "locationWhenInUsePermission": "Clox records your location when you clock in to confirm you're at the job site."
+          "locationWhenInUsePermission": "Clox checks your location only when you clock in or out, to confirm you're at the job site. It does not track you in the background."
         }
       ],
       [
         "expo-camera",
         {
-          "cameraPermission": "Clox takes a selfie when you clock in, to confirm it's you.",
+          "cameraPermission": "Clox can take a clock-in selfie to confirm it's you. It is optional and only used if your employer turns it on.",
           "microphonePermission": false,
           "recordAudioAndroid": false
         }
@@ -58,7 +61,8 @@
         {
           "color": "#b84a2c"
         }
-      ]
+      ],
+      "expo-font"
     ],
     "extra": {
       "eas": {

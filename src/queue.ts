@@ -29,6 +29,7 @@ export type QueuedPunch = {
   latitude: number | null;
   longitude: number | null;
   accuracyM: number | null;
+  mocked: boolean | null; // device mock-location flag at clock-in (Android only)
 };
 
 export type DrainResult = {
@@ -47,14 +48,17 @@ const LABELS: Record<PunchKind, string> = {
 
 // Friendly text for the server's error codes (shown in the banner).
 const ERROR_MESSAGES: Record<string, string> = {
-  geo_outside: "you're outside the job-site area",
-  geo_required: "turn on location to clock in here",
-  geo_inaccurate: "location was too inaccurate — move outside and retry",
-  project_required: "pick a project first",
-  bad_project: "that project isn't available",
-  no_scheduled_shift: "no scheduled shift right now",
-  too_early: "it's too early for your scheduled shift",
-  nothing_to_stop: "you weren't clocked in",
+  // Ordered by how far the location check got: no fix, then a fix too coarse to
+  // trust, then a good fix that landed outside the fence.
+  geo_required: "Turn on location so Clox can check the job site.",
+  geo_inaccurate:
+    "The GPS signal is too weak to place you. Move into the open and try again.",
+  geo_outside: "You're not at the job site. Move on site and try again.",
+  project_required: "Pick a project first.",
+  bad_project: "That project isn't available.",
+  no_scheduled_shift: "You don't have a scheduled shift right now.",
+  too_early: "It's too early for your scheduled shift.",
+  nothing_to_stop: "You weren't clocked in.",
 };
 
 function friendly(code: string): string {
@@ -113,6 +117,23 @@ export async function enqueuePunch(punch: QueuedPunch): Promise<void> {
 
 export async function queuedCount(): Promise<number> {
   return (await readQueue()).length;
+}
+
+/**
+ * Drop every queued punch. Called on sign-out: the queue is a single
+ * device-global key with no per-user scoping, and `drainQueue` sends each
+ * punch under whatever bearer token is current. Without this, punches the
+ * previous user queued offline would drain under the NEXT person to sign in
+ * on the same device, recording one worker's shift as another's.
+ */
+export async function clearQueue(): Promise<void> {
+  await withQueueLock(async () => {
+    try {
+      await AsyncStorage.removeItem(QUEUE_KEY);
+    } catch (err) {
+      reportError(err, "queue.clearQueue");
+    }
+  });
 }
 
 function send(token: string, punch: QueuedPunch) {

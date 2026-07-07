@@ -8,3 +8,7 @@ web-build/
 # Local secrets — the publishable keys are safe to ship, but keep .env out of git
 # anyway and use .env.example as the template.
 .env
+
+# Google Play submit credential (service-account JSON from Play Console).
+# It's a secret — never commit it. Referenced by eas.json submit.production.android.
+google-play-service-account.json
