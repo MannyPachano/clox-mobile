@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -33,7 +33,7 @@ import { SelfieCapture } from "../components/SelfieCapture";
 import { EditEntryModal } from "../components/EditEntryModal";
 import { RequestEditModal } from "../components/RequestEditModal";
 import { Wordmark } from "../components/Wordmark";
-import { getPunchLocation } from "../location";
+import { getPunchLocation, warmUpLocation } from "../location";
 import {
   drainQueue,
   enqueuePunch,
@@ -98,12 +98,16 @@ type Props = {
    *  tapping an own recent shift edits directly vs. requests a change. Comes
    *  from the shell that App.tsx already role-gated, not a re-fetch. */
   isManager?: boolean;
+  /** Bumped by the manager shell whenever the Clock tab regains focus, so the
+   *  screen refetches (e.g. to show a shift just edited on another tab). */
+  focusNonce?: number;
 };
 
 export function ClockScreen({
   session,
   onSignOut,
   isManager = false,
+  focusNonce,
 }: Props) {
   const [userName, setUserName] = useState(session.user.email ?? "Employee");
   const [orgName, setOrgName] = useState("");
@@ -138,6 +142,10 @@ export function ClockScreen({
   const refresh = useCallback(async () => {
     const token = await getAccessToken();
     if (!token) return;
+    // Snapshot the queue BEFORE the round-trip too: if a punch drained to the
+    // server mid-fetch, this status snapshot predates it, so we must not apply
+    // it as truth (it would wipe the optimistic ON state).
+    const queuedBefore = await queuedCount();
     try {
       const [statusRes, historyRes, scheduleRes] = await Promise.all([
         getStatus(token),
@@ -158,7 +166,7 @@ export function ClockScreen({
         // in-flight optimistic punch would be clobbered. (Also how a rejected
         // clock-in reverts: punch dropped → queue empty → server says "no
         // active shift" → optimistic timer clears.)
-        if ((await queuedCount()) === 0) {
+        if (queuedBefore === 0 && (await queuedCount()) === 0) {
           const active = d.activeEntry;
           setShiftStartedAt(active?.startedAt ?? null);
           setOnBreakSince(d.onBreakSince);
@@ -187,7 +195,21 @@ export function ClockScreen({
   useEffect(() => {
     void refresh();
     void sync();
+    // Warm the GPS on open so the first clock-in doesn't wait on a cold fix.
+    void warmUpLocation();
   }, [refresh, sync]);
+
+  const didFocusMountRef = useRef(false);
+  useEffect(() => {
+    // The manager shell bumps focusNonce when the Clock tab regains focus, so a
+    // shift edited on another tab shows up here without reopening the app. Skip
+    // the initial mount, which the effect above already covers.
+    if (!didFocusMountRef.current) {
+      didFocusMountRef.current = true;
+      return;
+    }
+    void refresh();
+  }, [focusNonce, refresh]);
 
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 1000);
@@ -340,9 +362,12 @@ export function ClockScreen({
       setShiftStartedAt(punch.clientTime);
       setOnBreakSince(null);
       setNote("");
-      setPending(await queuedCount());
-      await sync();
+      // The punch is safely queued, so free the button now and send in the
+      // background — the clock-in registers instantly instead of waiting on the
+      // network round-trip. The offline queue guarantees delivery and retry.
       setBusy(false);
+      setPending(await queuedCount());
+      void sync();
     },
     [projectId, taskId, note, sync, fences],
   );
@@ -403,6 +428,23 @@ export function ClockScreen({
   const palette = resolvePalette(themePreference, clockedIn);
   const isDark = palette === darkColors;
   const styles = useMemo(() => makeStyles(palette), [palette]);
+
+  // A STABLE entry object for the manager's own-shift editor. Passing a fresh
+  // object literal each render would re-fire EditEntryModal's prefill effect on
+  // every timer tick and clobber the manager's in-progress time change.
+  const editEntry = useMemo(
+    () =>
+      editShift
+        ? {
+            id: editShift.id,
+            start: editShift.start,
+            end: editShift.end,
+            projectId: editShift.projectId,
+            note: editShift.note,
+          }
+        : null,
+    [editShift],
+  );
 
   // Declared BEFORE the early `if (!ready) return` below so the number of hooks
   // is identical on every render. A hook after a conditional return changes the
@@ -740,17 +782,7 @@ export function ClockScreen({
 
         <EditEntryModal
           visible={editShift !== null}
-          entry={
-            editShift
-              ? {
-                  id: editShift.id,
-                  start: editShift.start,
-                  end: editShift.end,
-                  projectId: editShift.projectId,
-                  note: editShift.note,
-                }
-              : null
-          }
+          entry={editEntry}
           onClose={() => setEditShift(null)}
           onSaved={() => {
             setEditShift(null);

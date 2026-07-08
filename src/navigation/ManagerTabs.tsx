@@ -1,10 +1,11 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AppState } from "react-native";
 
 import { Ionicons } from "@expo/vector-icons";
 import {
   NavigationContainer,
   DefaultTheme,
+  useFocusEffect,
   type Theme,
 } from "@react-navigation/native";
 import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
@@ -20,6 +21,41 @@ import { getAccessToken } from "../supabase";
 import { lightColors } from "../theme";
 
 const Tab = createBottomTabNavigator();
+
+/**
+ * The Clock tab for a manager. Bumps a nonce on focus so ClockScreen refetches
+ * (e.g. to show a shift just edited on another tab). ClockScreen is shared with
+ * the employee shell, which has no navigator, so the focus hook lives here.
+ */
+function ManagerClockTab({
+  session,
+  onSignOut,
+}: {
+  session: Session;
+  onSignOut: () => void;
+}) {
+  const [focusNonce, setFocusNonce] = useState(0);
+  const firstFocus = useRef(true);
+  useFocusEffect(
+    useCallback(() => {
+      // The initial focus is the mount, which ClockScreen already loads on.
+      // Only bump on a RE-focus so returning to the tab refetches once.
+      if (firstFocus.current) {
+        firstFocus.current = false;
+        return;
+      }
+      setFocusNonce((n) => n + 1);
+    }, []),
+  );
+  return (
+    <ClockScreen
+      session={session}
+      onSignOut={onSignOut}
+      isManager
+      focusNonce={focusNonce}
+    />
+  );
+}
 
 const ICONS: Record<string, keyof typeof Ionicons.glyphMap> = {
   Clock: "time-outline",
@@ -106,9 +142,7 @@ export function ManagerTabs({
         })}
       >
         <Tab.Screen name="Clock">
-          {() => (
-            <ClockScreen session={session} onSignOut={onSignOut} isManager />
-          )}
+          {() => <ManagerClockTab session={session} onSignOut={onSignOut} />}
         </Tab.Screen>
         <Tab.Screen name="Roster" component={RosterScreen} />
         <Tab.Screen name="Schedule" component={ScheduleScreen} />

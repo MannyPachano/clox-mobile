@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 import {
   ActivityIndicator,
   RefreshControl,
@@ -9,6 +9,7 @@ import {
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import { useFocusEffect } from "@react-navigation/native";
 
 import {
   decidePayroll,
@@ -89,9 +90,13 @@ export function ApprovalsScreen() {
     }
   }, []);
 
-  useEffect(() => {
-    void load();
-  }, [load]);
+  // Refetch every time the Approvals tab regains focus, so new requests and
+  // approvals from elsewhere show up without reopening the app.
+  useFocusEffect(
+    useCallback(() => {
+      void load();
+    }, [load]),
+  );
 
   const onRefresh = useCallback(() => {
     setRefreshing(true);
@@ -161,9 +166,10 @@ export function ApprovalsScreen() {
               ? "That shift is approved and locked. Unlock it on the web first."
               : "Couldn't update — try again.",
           );
-        } else if (decision === "approved") {
-          // Approving also approves the corrected shift server-side, so refresh
-          // to reflect the cleared queues (it won't bounce back to timesheets).
+        } else {
+          // Reload after any decision: approve applies + approves the shift,
+          // reject returns it to the timesheet queue (it was shadow-hidden
+          // while the request was pending). Both need a refetch to show right.
           void load();
         }
       } catch {

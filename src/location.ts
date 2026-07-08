@@ -48,6 +48,26 @@ function fromPosition(pos: Location.LocationObject): Coords {
  * We also capture the device mock-location flag so the server can flag a
  * spoofed punch.
  */
+/**
+ * Spin up the GPS and populate the last-known cache ahead of a punch, so the
+ * FIRST clock-in after opening the app doesn't wait on a cold satellite lock.
+ * Best-effort and silent: it only runs when permission is ALREADY granted (it
+ * never prompts here — the punch itself still asks if needed), and any failure
+ * is ignored. Balanced accuracy is enough to warm the chip and seed a fix that
+ * getPunchLocation can fall back to; the punch still asks for a High fix.
+ */
+export async function warmUpLocation(): Promise<void> {
+  try {
+    const { status } = await Location.getForegroundPermissionsAsync();
+    if (status !== "granted") return;
+    await Location.getCurrentPositionAsync({
+      accuracy: Location.Accuracy.Balanced,
+    });
+  } catch {
+    // Warm-up is purely an optimization — never surface or throw.
+  }
+}
+
 export async function getPunchLocation(): Promise<Coords> {
   try {
     const { status } = await Location.requestForegroundPermissionsAsync();

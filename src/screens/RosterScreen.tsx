@@ -10,6 +10,7 @@ import {
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import { useFocusEffect } from "@react-navigation/native";
 
 import { closeShift, getManagerRoster, type ManagerRosterEntry } from "../api";
 import { AddEntryModal } from "../components/AddEntryModal";
@@ -90,9 +91,11 @@ export function RosterScreen() {
     }
   }, []);
 
-  useEffect(() => {
-    void load();
-  }, [load]);
+  useFocusEffect(
+    useCallback(() => {
+      void load();
+    }, [load]),
+  );
 
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 30000);
