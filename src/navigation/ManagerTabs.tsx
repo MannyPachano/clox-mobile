@@ -63,7 +63,11 @@ export function ManagerTabs({
       try {
         const res = await getManagerSummary(t);
         if (active && res.ok) {
-          setPending(res.data.pendingApprovals + res.data.pendingLeave);
+          setPending(
+            res.data.pendingApprovals +
+              res.data.pendingLeave +
+              res.data.pendingEditRequests,
+          );
         }
       } catch {
         // best-effort — the badge just won't update on a blip
@@ -102,7 +106,9 @@ export function ManagerTabs({
         })}
       >
         <Tab.Screen name="Clock">
-          {() => <ClockScreen session={session} onSignOut={onSignOut} />}
+          {() => (
+            <ClockScreen session={session} onSignOut={onSignOut} isManager />
+          )}
         </Tab.Screen>
         <Tab.Screen name="Roster" component={RosterScreen} />
         <Tab.Screen name="Schedule" component={ScheduleScreen} />

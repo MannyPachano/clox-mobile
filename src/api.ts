@@ -161,6 +161,7 @@ export type HistoryShift = {
   start: string;
   end: string;
   durationMs: number;
+  projectId: string | null;
   project: string | null;
   task: string | null;
   note: string | null;
@@ -170,6 +171,24 @@ export function getHistory(
   token: string,
 ): Promise<ApiResult<{ shifts: HistoryShift[] }>> {
   return request<{ shifts: HistoryShift[] }>("history", token, "GET");
+}
+
+/**
+ * Employee submits a correction request for one of THEIR OWN completed shifts.
+ * It does not take effect until a manager approves it. requestedProject is the
+ * full desired value (omit/keep to leave it unchanged).
+ */
+export function createEntryEditRequest(
+  token: string,
+  input: {
+    timeEntryId: string;
+    startIso: string;
+    endIso: string;
+    projectId?: string | null;
+    reason?: string | null;
+  },
+): Promise<ApiResult<{ ok: boolean; requestId: string }>> {
+  return request("entry-edit-request", token, "POST", input);
 }
 
 export function registerPushToken(
@@ -236,10 +255,71 @@ export type PendingLeave = {
   notes: string | null;
 };
 
+/** A pending employee correction request, for the manager Approvals queue. */
+export type EditRequestDto = {
+  id: string;
+  employee: string;
+  reason: string | null;
+  originalStart: string;
+  originalEnd: string;
+  requestedStart: string;
+  requestedEnd: string;
+  project: string | null;
+  createdAt: string;
+};
+
 export function getManagerPending(
   token: string,
-): Promise<ApiResult<{ timesheets: PendingTimesheet[]; leave: PendingLeave[] }>> {
+): Promise<
+  ApiResult<{
+    timesheets: PendingTimesheet[];
+    leave: PendingLeave[];
+    editRequests: EditRequestDto[];
+  }>
+> {
   return request("manager/pending", token, "GET");
+}
+
+/**
+ * A clocked shift that EditEntryModal can edit. A pending timesheet, a browsed
+ * team-member shift, and (in future) an own history row all satisfy this shape.
+ */
+export type EditableEntry = {
+  id: string;
+  /** Optional subtitle in the edit sheet (omit for the manager's own shift). */
+  employee?: string;
+  start: string;
+  end: string;
+  projectId: string | null;
+  note: string | null;
+};
+
+/** One completed clocked shift for a specific employee (manager browse list). */
+export type ManagerEntry = {
+  id: string;
+  start: string;
+  end: string;
+  durationMs: number;
+  project: string | null;
+  projectId: string | null;
+  note: string | null;
+  source: string;
+  /** Approved+locked; editing returns 409 until unlocked on the web. */
+  locked: boolean;
+  approved: boolean;
+};
+
+/** A specific employee's completed clocked shifts in a window (manager only). */
+export function getManagerEntries(
+  token: string,
+  employeeUserId: string,
+  fromIso: string,
+  toIso: string,
+): Promise<ApiResult<{ entries: ManagerEntry[] }>> {
+  const qs =
+    `employeeUserId=${encodeURIComponent(employeeUserId)}` +
+    `&from=${encodeURIComponent(fromIso)}&to=${encodeURIComponent(toIso)}`;
+  return request(`manager/entries?${qs}`, token, "GET");
 }
 
 export function decidePayroll(
@@ -258,10 +338,30 @@ export function reviewLeave(
   return request("manager/leave/review", token, "POST", { id, decision });
 }
 
+/**
+ * Manager approves or rejects an employee's clocked-shift correction request.
+ * Approve applies the change; reject leaves the original entry untouched.
+ */
+export function reviewEntryEditRequest(
+  token: string,
+  id: string,
+  decision: "approved" | "rejected",
+): Promise<ApiResult<unknown>> {
+  return request("manager/edit-request/review", token, "POST", {
+    id,
+    decision,
+  });
+}
+
 export function getManagerSummary(
   token: string,
 ): Promise<
-  ApiResult<{ pendingApprovals: number; pendingLeave: number; onShift: number }>
+  ApiResult<{
+    pendingApprovals: number;
+    pendingLeave: number;
+    pendingEditRequests: number;
+    onShift: number;
+  }>
 > {
   return request("manager/summary", token, "GET");
 }
@@ -349,4 +449,21 @@ export function deleteManagerShift(
   id: string,
 ): Promise<ApiResult<unknown>> {
   return request("manager/schedule", token, "DELETE", { id });
+}
+
+/**
+ * Edit ONE scheduled shift (times + optionally the employee). Single occurrence
+ * only — the repeating series stays on the web. POST (not PATCH) to match the
+ * mobile request() method set and the manager/entry/update convention.
+ */
+export function updateManagerShift(
+  token: string,
+  shift: {
+    id: string;
+    startIso: string;
+    endIso: string;
+    employeeUserId?: string;
+  },
+): Promise<ApiResult<unknown>> {
+  return request("manager/schedule/update", token, "POST", shift);
 }

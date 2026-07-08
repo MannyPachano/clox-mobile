@@ -13,7 +13,9 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import {
   decidePayroll,
   getManagerPending,
+  reviewEntryEditRequest,
   reviewLeave,
+  type EditRequestDto,
   type PendingLeave,
   type PendingTimesheet,
 } from "../api";
@@ -59,6 +61,7 @@ function dur(ms: number): string {
 export function ApprovalsScreen() {
   const [timesheets, setTimesheets] = useState<PendingTimesheet[]>([]);
   const [leave, setLeave] = useState<PendingLeave[]>([]);
+  const [editRequests, setEditRequests] = useState<EditRequestDto[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [banner, setBanner] = useState<string | null>(null);
@@ -76,6 +79,7 @@ export function ApprovalsScreen() {
       if (res.ok) {
         setTimesheets(res.data.timesheets);
         setLeave(res.data.leave);
+        setEditRequests(res.data.editRequests);
       }
     } catch {
       // keep last-known queue on a network blip
@@ -140,6 +144,36 @@ export function ApprovalsScreen() {
     [leave],
   );
 
+  const decideEditRequest = useCallback(
+    async (id: string, decision: "approved" | "rejected") => {
+      haptics[decision === "approved" ? "success" : "warning"]();
+      const token = await getAccessToken();
+      if (!token) return;
+      setBanner(null);
+      const prev = editRequests;
+      setEditRequests((r) => r.filter((x) => x.id !== id));
+      try {
+        const res = await reviewEntryEditRequest(token, id, decision);
+        if (!res.ok) {
+          setEditRequests(prev);
+          setBanner(
+            res.status === 409
+              ? "That shift is approved and locked. Unlock it on the web first."
+              : "Couldn't update — try again.",
+          );
+        } else if (decision === "approved") {
+          // Applying the change re-opens the entry for payroll approval, so
+          // refresh to pull the corrected shift into the timesheets queue.
+          void load();
+        }
+      } catch {
+        setEditRequests(prev);
+        setBanner("No connection — try again.");
+      }
+    },
+    [editRequests, load],
+  );
+
   if (loading) {
     return (
       <SafeAreaView style={[styles.container, styles.center]} edges={["top"]}>
@@ -148,7 +182,10 @@ export function ApprovalsScreen() {
     );
   }
 
-  const empty = timesheets.length === 0 && leave.length === 0;
+  const empty =
+    timesheets.length === 0 &&
+    leave.length === 0 &&
+    editRequests.length === 0;
 
   return (
     <SafeAreaView style={styles.container} edges={["top"]}>
@@ -170,8 +207,9 @@ export function ApprovalsScreen() {
           <>
             <Text style={styles.allClear}>All caught up. Nothing pending.</Text>
             <Text style={styles.allClearHint}>
-              Timesheets and time-off requests from your team land here for you
-              to approve or reject. There is nothing to review right now.
+              Timesheets, time-off, and shift-change requests from your team
+              land here for you to approve or reject. There is nothing to review
+              right now.
             </Text>
           </>
         ) : null}
@@ -266,6 +304,48 @@ export function ApprovalsScreen() {
             ))}
           </View>
         ) : null}
+
+        {editRequests.length > 0 ? (
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>
+              Edit requests ({editRequests.length})
+            </Text>
+            {editRequests.map((r) => (
+              <View key={r.id} style={styles.card}>
+                <Text style={styles.who} numberOfLines={1}>
+                  {r.employee}
+                </Text>
+                <Text style={styles.meta} numberOfLines={1}>
+                  {dateShort(r.originalStart)} · was {clock(r.originalStart)}–
+                  {clock(r.originalEnd)}
+                </Text>
+                <Text style={styles.reqNew} numberOfLines={1}>
+                  Requested: {clock(r.requestedStart)}–{clock(r.requestedEnd)}
+                  {r.project ? ` · ${r.project}` : ""}
+                </Text>
+                {r.reason ? (
+                  <Text style={styles.notes} numberOfLines={3}>
+                    {r.reason}
+                  </Text>
+                ) : null}
+                <View style={styles.actions}>
+                  <TouchableOpacity
+                    style={[styles.btn, styles.reject]}
+                    onPress={() => decideEditRequest(r.id, "rejected")}
+                  >
+                    <Text style={styles.rejectText}>Reject</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.btn, styles.approve]}
+                    onPress={() => decideEditRequest(r.id, "approved")}
+                  >
+                    <Text style={styles.approveText}>Approve</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            ))}
+          </View>
+        ) : null}
       </ScrollView>
 
       <EditEntryModal
@@ -334,6 +414,7 @@ const styles = StyleSheet.create({
   who: { color: c.text, fontSize: 16, fontWeight: "700" },
   badge: { color: c.textMuted, fontSize: 12, fontWeight: "600" },
   meta: { color: c.textMuted, fontSize: 13, marginTop: 3 },
+  reqNew: { color: c.text, fontSize: 13, fontWeight: "600", marginTop: 3 },
   notes: { color: c.text, fontSize: 13, marginTop: 6, lineHeight: 18 },
   actions: { flexDirection: "row", justifyContent: "flex-end", marginTop: 12 },
   tsActions: {

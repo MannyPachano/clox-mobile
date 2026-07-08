@@ -64,6 +64,7 @@ export function ScheduleScreen() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
+  const [editShift, setEditShift] = useState<ScheduledShiftDto | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
 
   const weekStart = useMemo(() => mondayOf(weekOffset), [weekOffset]);
@@ -244,7 +245,7 @@ export function ScheduleScreen() {
                       key={s.id}
                       style={styles.shift}
                       activeOpacity={0.6}
-                      onPress={() => confirmDelete(s)}
+                      onPress={() => setEditShift(s)}
                     >
                       <View style={styles.shiftText}>
                         <Text style={styles.who} numberOfLines={1}>
@@ -262,7 +263,7 @@ export function ScheduleScreen() {
                           {clock(s.startsAt)} – {clock(s.endsAt)}
                         </Text>
                       </View>
-                      <Text style={styles.remove}>✕</Text>
+                      <Text style={styles.remove}>›</Text>
                     </TouchableOpacity>
                   ))
                 )}
@@ -273,13 +274,26 @@ export function ScheduleScreen() {
       )}
 
       <AddShiftModal
-        visible={addOpen}
+        visible={addOpen || editShift != null}
         employees={employees}
-        onClose={() => setAddOpen(false)}
+        shift={editShift}
+        onClose={() => {
+          setAddOpen(false);
+          setEditShift(null);
+        }}
         onCreated={() => {
           setAddOpen(false);
           setBanner("Shift scheduled.");
           void load();
+        }}
+        onUpdated={() => {
+          setEditShift(null);
+          setBanner("Shift updated.");
+          void load();
+        }}
+        onRemove={(s) => {
+          setEditShift(null);
+          confirmDelete(s);
         }}
       />
 

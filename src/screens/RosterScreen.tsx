@@ -13,6 +13,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 
 import { closeShift, getManagerRoster, type ManagerRosterEntry } from "../api";
 import { AddEntryModal } from "../components/AddEntryModal";
+import { EmployeeShiftsSheet } from "../components/EmployeeShiftsSheet";
 import { getAccessToken } from "../supabase";
 import { lightColors as c } from "../theme";
 
@@ -57,6 +58,10 @@ export function RosterScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   const [addOpen, setAddOpen] = useState(false);
+  const [shiftsFor, setShiftsFor] = useState<{
+    userId: string;
+    name: string;
+  } | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -149,31 +154,44 @@ export function RosterScreen() {
   const renderItem = ({ item }: { item: ManagerRosterEntry }) => {
     const since = item.shiftStartedAt ? Date.parse(item.shiftStartedAt) : null;
     return (
-      <TouchableOpacity
-        style={styles.row}
-        disabled={!item.onShift}
-        activeOpacity={0.6}
-        onPress={() => confirmClose(item)}
-      >
-        <View style={[styles.dot, item.onShift ? styles.dotOn : styles.dotOff]} />
-        <View style={styles.rowText}>
-          <Text style={styles.name} numberOfLines={1}>
-            {item.name}
-            {item.role === "manager" ? (
-              <Text style={styles.badge}>  manager</Text>
-            ) : null}
-          </Text>
-          {item.onShift && since ? (
-            <Text style={styles.sub} numberOfLines={1}>
-              On since {clock(since)} · {dur(now - since)}
-              {item.project ? ` · ${item.project}` : ""}
+      <View style={styles.row}>
+        <TouchableOpacity
+          style={styles.rowMain}
+          activeOpacity={0.6}
+          onPress={() => setShiftsFor({ userId: item.userId, name: item.name })}
+        >
+          <View
+            style={[styles.dot, item.onShift ? styles.dotOn : styles.dotOff]}
+          />
+          <View style={styles.rowText}>
+            <Text style={styles.name} numberOfLines={1}>
+              {item.name}
+              {item.role === "manager" ? (
+                <Text style={styles.badge}>  manager</Text>
+              ) : null}
             </Text>
-          ) : (
-            <Text style={styles.subOff}>Off the clock</Text>
-          )}
-        </View>
-        {item.onShift ? <Text style={styles.chev}>›</Text> : null}
-      </TouchableOpacity>
+            {item.onShift && since ? (
+              <Text style={styles.sub} numberOfLines={1}>
+                On since {clock(since)} · {dur(now - since)}
+                {item.project ? ` · ${item.project}` : ""}
+              </Text>
+            ) : (
+              <Text style={styles.subOff}>Off the clock</Text>
+            )}
+          </View>
+        </TouchableOpacity>
+        {item.onShift ? (
+          <TouchableOpacity
+            style={styles.clockOutBtn}
+            activeOpacity={0.8}
+            onPress={() => confirmClose(item)}
+          >
+            <Text style={styles.clockOutText}>Clock out</Text>
+          </TouchableOpacity>
+        ) : (
+          <Text style={styles.chev}>›</Text>
+        )}
+      </View>
     );
   };
 
@@ -217,9 +235,10 @@ export function RosterScreen() {
             />
           }
           ListHeaderComponent={
-            onShiftCount > 0 ? (
+            sorted.length > 0 ? (
               <Text style={styles.hint}>
-                Tap anyone on the clock to clock them out.
+                Tap a name to view and edit their shifts. Use Clock out to close
+                a running shift.
               </Text>
             ) : null
           }
@@ -240,6 +259,12 @@ export function RosterScreen() {
           setAddOpen(false);
           setBanner("Entry added — it's now pending your approval.");
         }}
+      />
+
+      <EmployeeShiftsSheet
+        visible={shiftsFor != null}
+        employee={shiftsFor}
+        onClose={() => setShiftsFor(null)}
       />
 
       {banner ? (
@@ -283,12 +308,22 @@ const styles = StyleSheet.create({
   dot: { width: 10, height: 10, borderRadius: 5, marginRight: 14 },
   dotOn: { backgroundColor: c.success },
   dotOff: { backgroundColor: c.border },
+  rowMain: { flex: 1, flexDirection: "row", alignItems: "center" },
   rowText: { flex: 1 },
   name: { color: c.text, fontSize: 16, fontWeight: "600" },
   badge: { color: c.textMuted, fontSize: 13, fontWeight: "600" },
   sub: { color: c.text, fontSize: 13, marginTop: 2 },
   subOff: { color: c.textMuted, fontSize: 13, marginTop: 2 },
   chev: { color: c.textMuted, fontSize: 22, marginLeft: 8 },
+  clockOutBtn: {
+    borderWidth: 1,
+    borderColor: c.border,
+    borderRadius: 10,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    marginLeft: 8,
+  },
+  clockOutText: { color: c.text, fontSize: 13, fontWeight: "600" },
   hint: {
     color: c.textMuted,
     fontSize: 13,

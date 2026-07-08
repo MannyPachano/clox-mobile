@@ -6,15 +6,15 @@ import {
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   TouchableOpacity,
-  View,
 } from "react-native";
 
 import {
-  createManagerShift,
-  updateManagerShift,
+  createEntryEditRequest,
+  getStatus,
+  type HistoryShift,
   type Option,
-  type ScheduledShiftDto,
 } from "../api";
 import { getAccessToken } from "../supabase";
 import { lightColors as c } from "../theme";
@@ -30,26 +30,24 @@ function pad(n: number): string {
   return n.toString().padStart(2, "0");
 }
 
-/** Next 42 days as options, id = "YYYY-MM-DD" (local) — scheduling looks ahead. */
 function buildDays(): Option[] {
   const base = new Date();
   base.setHours(0, 0, 0, 0);
   const out: Option[] = [];
-  for (let i = 0; i < 42; i++) {
-    const d = new Date(base.getTime() + i * 86_400_000);
+  for (let i = 0; i < 14; i++) {
+    const d = new Date(base.getTime() - i * 86_400_000);
     const id = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
     const name =
       i === 0
         ? "Today"
         : i === 1
-          ? "Tomorrow"
+          ? "Yesterday"
           : `${DAYS[d.getDay()]}, ${MONTHS[d.getMonth()]} ${d.getDate()}`;
     out.push({ id, name });
   }
   return out;
 }
 
-/** Times in 15-min steps, id = "HH:MM" (24h), name = "9:00 AM". */
 function buildTimes(): Option[] {
   const out: Option[] = [];
   for (let h = 0; h < 24; h++) {
@@ -70,13 +68,11 @@ function toIso(dateId: string, timeId: string): string | null {
   return Number.isNaN(dt.getTime()) ? null : dt.toISOString();
 }
 
-/** ISO → "YYYY-MM-DD" (local), for seeding the date picker when editing. */
 function ymdOf(iso: string): string {
   const d = new Date(iso);
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
-/** ISO → nearest-15-min "HH:MM" so it matches a time option when editing. */
 function nearest15(iso: string): string {
   const d = new Date(iso);
   let mins = Math.round((d.getHours() * 60 + d.getMinutes()) / 15) * 15;
@@ -86,82 +82,65 @@ function nearest15(iso: string): string {
 
 type Props = {
   visible: boolean;
-  employees: Option[];
-  /** Pre-select a date (id = "YYYY-MM-DD") when opened from a specific day. */
-  initialDateId?: string;
-  /** When set, the modal edits this shift instead of creating a new one. */
-  shift?: ScheduledShiftDto | null;
+  shift: HistoryShift | null;
   onClose: () => void;
-  onCreated: () => void;
-  onUpdated?: () => void;
-  onRemove?: (shift: ScheduledShiftDto) => void;
+  onSubmitted: () => void;
 };
 
-export function AddShiftModal({
+/**
+ * An employee proposes a correction to one of their OWN clocked shifts. This
+ * does not change the record directly: it creates a request their manager
+ * approves or rejects. Mirrors EditEntryModal, plus a reason field.
+ */
+export function RequestEditModal({
   visible,
-  employees,
-  initialDateId,
   shift,
   onClose,
-  onCreated,
-  onUpdated,
-  onRemove,
+  onSubmitted,
 }: Props) {
   const days = useMemo(buildDays, []);
   const times = useMemo(buildTimes, []);
-  const editing = shift != null;
 
-  // When editing a shift whose date is outside the default add-window (e.g. an
-  // earlier day of the current week, or a series occurrence), make sure that
-  // date is still a selectable, correctly-labelled option.
-  const dayOptions = useMemo(() => {
-    if (!shift) return days;
-    const sid = ymdOf(shift.startsAt);
-    if (days.some((o) => o.id === sid)) return days;
-    const [y, mo, d] = sid.split("-").map(Number);
-    const dt = new Date(y, mo - 1, d);
-    const name = `${DAYS[dt.getDay()]}, ${MONTHS[dt.getMonth()]} ${dt.getDate()}`;
-    return [{ id: sid, name }, ...days];
-  }, [days, shift]);
-
-  const [employeeId, setEmployeeId] = useState<string | null>(null);
-  const [dateId, setDateId] = useState<string>(initialDateId ?? "");
-  const [startId, setStartId] = useState<string | null>("09:00");
-  const [endId, setEndId] = useState<string | null>("17:00");
+  const [projects, setProjects] = useState<Option[]>([]);
+  const [dateId, setDateId] = useState("");
+  const [startId, setStartId] = useState<string | null>(null);
+  const [endId, setEndId] = useState<string | null>(null);
+  const [projectId, setProjectId] = useState<string | null>(null);
+  const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Seed each time the sheet opens: from the shift when editing, else defaults.
+  useEffect(() => {
+    if (!shift) return;
+    setDateId(ymdOf(shift.start));
+    setStartId(nearest15(shift.start));
+    setEndId(nearest15(shift.end));
+    setProjectId(shift.projectId);
+    setReason("");
+    setError(null);
+  }, [shift]);
+
   useEffect(() => {
     if (!visible) return;
-    if (shift) {
-      setEmployeeId(shift.employeeUserId);
-      setDateId(ymdOf(shift.startsAt));
-      setStartId(nearest15(shift.startsAt));
-      setEndId(nearest15(shift.endsAt));
-    } else {
-      setEmployeeId(null);
-      setDateId(initialDateId ?? days[0]?.id ?? "");
-      setStartId("09:00");
-      setEndId("17:00");
-    }
-    setError(null);
-  }, [visible, shift, initialDateId, days]);
+    void getAccessToken().then(async (t) => {
+      if (!t) return;
+      try {
+        const res = await getStatus(t);
+        if (res.ok) setProjects(res.data.projects);
+      } catch {
+        // optional
+      }
+    });
+  }, [visible]);
 
-  function cancel() {
+  async function submit() {
+    if (!shift) return;
     setError(null);
-    onClose();
-  }
-
-  async function save() {
-    setError(null);
-    if (!employeeId) return setError("Pick an employee.");
     if (!startId || !endId) return setError("Pick start and end times.");
     const startIso = toIso(dateId, startId);
     let endIso = toIso(dateId, endId);
     if (!startIso || !endIso) return setError("Invalid time.");
-    // End not after start means the shift crosses midnight (a night crew): roll
-    // the end to the next day rather than rejecting it.
+    // End not after start means the shift crosses midnight: roll to next day.
     if (Date.parse(endIso) <= Date.parse(startIso)) {
       endIso = new Date(Date.parse(endIso) + 86_400_000).toISOString();
     }
@@ -172,24 +151,15 @@ export function AddShiftModal({
       return setError("Not signed in.");
     }
     try {
-      if (shift) {
-        const res = await updateManagerShift(t, {
-          id: shift.id,
-          startIso,
-          endIso,
-          employeeUserId: employeeId,
-        });
-        if (res.ok) onUpdated?.();
-        else setError("Couldn't save the shift. Try again.");
-      } else {
-        const res = await createManagerShift(t, {
-          employeeUserId: employeeId,
-          startIso,
-          endIso,
-        });
-        if (res.ok) onCreated();
-        else setError("Couldn't add the shift. Try again.");
-      }
+      const res = await createEntryEditRequest(t, {
+        timeEntryId: shift.id,
+        startIso,
+        endIso,
+        projectId,
+        reason: reason.trim() || null,
+      });
+      if (res.ok) onSubmitted();
+      else setError("Couldn't send the request. Try again.");
     } catch {
       setError("No connection. Try again.");
     } finally {
@@ -202,27 +172,21 @@ export function AddShiftModal({
       visible={visible}
       transparent
       animationType="slide"
-      onRequestClose={cancel}
+      onRequestClose={onClose}
     >
-      <Pressable style={styles.backdrop} onPress={cancel}>
+      <Pressable style={styles.backdrop} onPress={onClose}>
         <Pressable style={styles.sheet} onPress={() => {}}>
-          <Text style={styles.title}>
-            {editing ? "Edit shift" : "Schedule a shift"}
+          <Text style={styles.title}>Request a change</Text>
+          <Text style={styles.subtitle}>
+            Your manager reviews this before it changes your timesheet.
           </Text>
           <ScrollView style={styles.scroll} keyboardShouldPersistTaps="handled">
             <SelectField
-              label="Employee"
-              value={employeeId}
-              options={employees}
-              placeholder="Choose an employee"
-              onSelect={setEmployeeId}
-            />
-            <SelectField
               label="Date"
               value={dateId}
-              options={dayOptions}
+              options={days}
               placeholder="Date"
-              onSelect={(v) => setDateId(v ?? days[0]?.id ?? "")}
+              onSelect={(v) => setDateId(v ?? dateId)}
             />
             <SelectField
               label="Start"
@@ -238,40 +202,42 @@ export function AddShiftModal({
               placeholder="End time"
               onSelect={setEndId}
             />
-            <Text style={styles.hint}>
-              {shift?.isSeries
-                ? "This edits only this one shift. Change the repeating series on the web."
-                : "For repeating shifts, use the web app."}
-            </Text>
+            <SelectField
+              label="Project"
+              value={projectId}
+              options={projects}
+              placeholder="No project"
+              onSelect={setProjectId}
+              noneLabel="No project"
+            />
+            <TextInput
+              style={styles.note}
+              placeholder="Reason for the change (optional)"
+              placeholderTextColor={c.textMuted}
+              value={reason}
+              onChangeText={setReason}
+              editable={!busy}
+              multiline
+            />
+            <Text style={styles.hint}>Times round to 15 minutes.</Text>
             {error ? <Text style={styles.error}>{error}</Text> : null}
-            {editing && onRemove && shift ? (
-              <TouchableOpacity
-                style={styles.remove}
-                onPress={() => onRemove(shift)}
-                disabled={busy}
-              >
-                <Text style={styles.removeText}>Remove shift</Text>
-              </TouchableOpacity>
-            ) : null}
           </ScrollView>
-          <View style={styles.actions}>
-            <TouchableOpacity onPress={cancel} hitSlop={8}>
+          <Pressable style={styles.actions}>
+            <TouchableOpacity onPress={onClose} hitSlop={8}>
               <Text style={styles.cancel}>Cancel</Text>
             </TouchableOpacity>
             <TouchableOpacity
               style={[styles.save, busy && styles.disabled]}
-              onPress={save}
+              onPress={submit}
               disabled={busy}
             >
               {busy ? (
                 <ActivityIndicator color={c.accentText} />
               ) : (
-                <Text style={styles.saveText}>
-                  {editing ? "Save" : "Schedule"}
-                </Text>
+                <Text style={styles.saveText}>Send request</Text>
               )}
             </TouchableOpacity>
-          </View>
+          </Pressable>
         </Pressable>
       </Pressable>
     </Modal>
@@ -297,13 +263,29 @@ const styles = StyleSheet.create({
     fontSize: 20,
     fontWeight: "800",
     paddingHorizontal: 20,
+  },
+  subtitle: {
+    color: c.textMuted,
+    fontSize: 14,
+    paddingHorizontal: 20,
+    marginTop: 2,
     marginBottom: 8,
   },
   scroll: { paddingHorizontal: 20 },
-  hint: { color: c.textMuted, fontSize: 13, marginTop: 2, marginBottom: 8 },
+  note: {
+    backgroundColor: c.surface,
+    borderColor: c.border,
+    borderWidth: 1,
+    borderRadius: 14,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    color: c.text,
+    fontSize: 16,
+    minHeight: 60,
+    marginBottom: 10,
+  },
+  hint: { color: c.textMuted, fontSize: 12, marginBottom: 8 },
   error: { color: c.danger, fontSize: 14, marginBottom: 8 },
-  remove: { alignItems: "center", paddingVertical: 10, marginBottom: 2 },
-  removeText: { color: c.danger, fontSize: 15, fontWeight: "600" },
   actions: {
     flexDirection: "row",
     alignItems: "center",

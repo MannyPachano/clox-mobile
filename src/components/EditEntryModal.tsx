@@ -14,8 +14,8 @@ import {
 import {
   getStatus,
   updateManagerEntry,
+  type EditableEntry,
   type Option,
-  type PendingTimesheet,
 } from "../api";
 import { getAccessToken } from "../supabase";
 import { lightColors as c } from "../theme";
@@ -84,7 +84,7 @@ function nearest15(iso: string): string {
 
 type Props = {
   visible: boolean;
-  entry: PendingTimesheet | null;
+  entry: EditableEntry | null;
   onClose: () => void;
   onSaved: () => void;
 };
@@ -131,10 +131,12 @@ export function EditEntryModal({ visible, entry, onClose, onSaved }: Props) {
     setError(null);
     if (!startId || !endId) return setError("Pick start and end times.");
     const startIso = toIso(dateId, startId);
-    const endIso = toIso(dateId, endId);
+    let endIso = toIso(dateId, endId);
     if (!startIso || !endIso) return setError("Invalid time.");
+    // End not after start means the shift crosses midnight: roll end to the next
+    // day rather than rejecting an overnight shift.
     if (Date.parse(endIso) <= Date.parse(startIso)) {
-      return setError("End must be after start.");
+      endIso = new Date(Date.parse(endIso) + 86_400_000).toISOString();
     }
     setBusy(true);
     const t = await getAccessToken();
@@ -171,7 +173,9 @@ export function EditEntryModal({ visible, entry, onClose, onSaved }: Props) {
       <Pressable style={styles.backdrop} onPress={onClose}>
         <Pressable style={styles.sheet} onPress={() => {}}>
           <Text style={styles.title}>Edit entry</Text>
-          {entry ? <Text style={styles.who}>{entry.employee}</Text> : null}
+          {entry?.employee ? (
+            <Text style={styles.who}>{entry.employee}</Text>
+          ) : null}
           <ScrollView style={styles.scroll} keyboardShouldPersistTaps="handled">
             <SelectField
               label="Date"

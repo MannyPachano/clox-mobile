@@ -30,6 +30,7 @@ import { precheckGeofence, type Fence } from "../geofence";
 import { haptics } from "../lib/haptics";
 import { SelectField } from "../components/SelectField";
 import { SelfieCapture } from "../components/SelfieCapture";
+import { RequestEditModal } from "../components/RequestEditModal";
 import { ShiftDetailSheet } from "../components/ShiftDetailSheet";
 import { Wordmark } from "../components/Wordmark";
 import { getPunchLocation } from "../location";
@@ -93,9 +94,17 @@ function formatDuration(ms: number): string {
 type Props = {
   session: Session;
   onSignOut: () => void;
+  /** True when rendered inside the manager shell (ManagerTabs). Drives whether
+   *  tapping an own recent shift edits directly vs. requests a change. Comes
+   *  from the shell that App.tsx already role-gated, not a re-fetch. */
+  isManager?: boolean;
 };
 
-export function ClockScreen({ session, onSignOut }: Props) {
+export function ClockScreen({
+  session,
+  onSignOut,
+  isManager = false,
+}: Props) {
   const [userName, setUserName] = useState(session.user.email ?? "Employee");
   const [orgName, setOrgName] = useState("");
   const [shiftStartedAt, setShiftStartedAt] = useState<string | null>(null);
@@ -121,6 +130,7 @@ export function ClockScreen({ session, onSignOut }: Props) {
   const [history, setHistory] = useState<HistoryShift[]>([]);
   const [upcoming, setUpcoming] = useState<MyScheduledShift[]>([]);
   const [selectedShift, setSelectedShift] = useState<HistoryShift | null>(null);
+  const [requestShift, setRequestShift] = useState<HistoryShift | null>(null);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   // Worksite fences for the client-side clock-in pre-check. Empty = no geofence.
   const [fences, setFences] = useState<Fence[]>([]);
@@ -710,7 +720,9 @@ export function ClockScreen({ session, onSignOut }: Props) {
                 <TouchableOpacity
                   key={s.id}
                   style={styles.historyRow}
-                  onPress={() => setSelectedShift(s)}
+                  onPress={() =>
+                    isManager ? setSelectedShift(s) : setRequestShift(s)
+                  }
                   activeOpacity={0.6}
                 >
                   <View style={styles.historyLeft}>
@@ -751,6 +763,16 @@ export function ClockScreen({ session, onSignOut }: Props) {
           }
           rows={detailRows}
           onClose={() => setSelectedShift(null)}
+        />
+
+        <RequestEditModal
+          visible={requestShift !== null}
+          shift={requestShift}
+          onClose={() => setRequestShift(null)}
+          onSubmitted={() => {
+            setRequestShift(null);
+            setBanner("Change requested. Your manager will review it.");
+          }}
         />
 
         <Modal
