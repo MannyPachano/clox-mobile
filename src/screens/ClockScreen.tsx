@@ -30,8 +30,8 @@ import { precheckGeofence, type Fence } from "../geofence";
 import { haptics } from "../lib/haptics";
 import { SelectField } from "../components/SelectField";
 import { SelfieCapture } from "../components/SelfieCapture";
+import { EditEntryModal } from "../components/EditEntryModal";
 import { RequestEditModal } from "../components/RequestEditModal";
-import { ShiftDetailSheet } from "../components/ShiftDetailSheet";
 import { Wordmark } from "../components/Wordmark";
 import { getPunchLocation } from "../location";
 import {
@@ -129,7 +129,7 @@ export function ClockScreen({
   const [taskId, setTaskId] = useState<string | null>(null);
   const [history, setHistory] = useState<HistoryShift[]>([]);
   const [upcoming, setUpcoming] = useState<MyScheduledShift[]>([]);
-  const [selectedShift, setSelectedShift] = useState<HistoryShift | null>(null);
+  const [editShift, setEditShift] = useState<HistoryShift | null>(null);
   const [requestShift, setRequestShift] = useState<HistoryShift | null>(null);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   // Worksite fences for the client-side clock-in pre-check. Empty = no geofence.
@@ -478,24 +478,6 @@ export function ClockScreen({
   const projectMissing = !clockedIn && requireProject && !projectId;
   const showPickers = !onBreak;
 
-  const detailRows = selectedShift
-    ? [
-        {
-          label: "Time",
-          value: `${formatClock(Date.parse(selectedShift.start))} – ${formatClock(
-            Date.parse(selectedShift.end),
-          )}`,
-        },
-        { label: "Duration", value: formatDuration(selectedShift.durationMs) },
-        { label: "Project", value: selectedShift.project ?? "No project" },
-        ...(selectedShift.task
-          ? [{ label: "Task", value: selectedShift.task }]
-          : []),
-        ...(selectedShift.note
-          ? [{ label: "Note", value: selectedShift.note }]
-          : []),
-      ]
-    : [];
 
   return (
     <ThemeContext.Provider value={palette}>
@@ -721,7 +703,7 @@ export function ClockScreen({
                   key={s.id}
                   style={styles.historyRow}
                   onPress={() =>
-                    isManager ? setSelectedShift(s) : setRequestShift(s)
+                    isManager ? setEditShift(s) : setRequestShift(s)
                   }
                   activeOpacity={0.6}
                 >
@@ -756,13 +738,24 @@ export function ClockScreen({
           onUse={onSelfieUse}
         />
 
-        <ShiftDetailSheet
-          visible={selectedShift !== null}
-          title={
-            selectedShift ? formatDate(Date.parse(selectedShift.start)) : ""
+        <EditEntryModal
+          visible={editShift !== null}
+          entry={
+            editShift
+              ? {
+                  id: editShift.id,
+                  start: editShift.start,
+                  end: editShift.end,
+                  projectId: editShift.projectId,
+                  note: editShift.note,
+                }
+              : null
           }
-          rows={detailRows}
-          onClose={() => setSelectedShift(null)}
+          onClose={() => setEditShift(null)}
+          onSaved={() => {
+            setEditShift(null);
+            void refresh();
+          }}
         />
 
         <RequestEditModal

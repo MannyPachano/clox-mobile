@@ -162,8 +162,8 @@ export function ApprovalsScreen() {
               : "Couldn't update — try again.",
           );
         } else if (decision === "approved") {
-          // Applying the change re-opens the entry for payroll approval, so
-          // refresh to pull the corrected shift into the timesheets queue.
+          // Approving also approves the corrected shift server-side, so refresh
+          // to reflect the cleared queues (it won't bounce back to timesheets).
           void load();
         }
       } catch {
