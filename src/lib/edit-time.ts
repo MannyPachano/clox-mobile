@@ -67,6 +67,23 @@ function nextDay(dateId: string): string | null {
 }
 
 /**
+ * Build just a start ISO for a start-only edit of a RUNNING shift (the day is
+ * fixed to the shift's start date; there is no end yet). The start must land
+ * in the past — a running shift can't have started in the future.
+ */
+export function buildRunningStart(
+  dateId: string,
+  startTime: Date,
+): { ok: true; startIso: string } | { ok: false; error: string } {
+  const startIso = combineIso(dateId, startTime);
+  if (!startIso) return { ok: false, error: "Invalid time." };
+  if (Date.parse(startIso) >= Date.now()) {
+    return { ok: false, error: "The start time has to be in the past." };
+  }
+  return { ok: true, startIso };
+}
+
+/**
  * Build start/end ISO from a day plus two exact times.
  *  - If end is not after start, it is treated as crossing midnight and rebuilt
  *    on the NEXT local day via the same wall-clock time (DST-safe — it keeps the

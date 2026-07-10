@@ -30,6 +30,9 @@ export type QueuedPunch = {
   longitude: number | null;
   accuracyM: number | null;
   mocked: boolean | null; // device mock-location flag at clock-in (Android only)
+  /** switch_project only — true retags the whole current entry in place
+   *  instead of splitting it at clientTime. */
+  applyToShift?: boolean;
 };
 
 export type DrainResult = {

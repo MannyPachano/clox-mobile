@@ -22,6 +22,7 @@ import {
   getHistory,
   getMySchedule,
   getStatus,
+  type EditableEntry,
   type HistoryShift,
   type MyScheduledShift,
   type Option,
@@ -54,11 +55,23 @@ import { useTutorial, useTutorialTarget } from "../tutorial/TutorialContext";
 import { TutorialOverlay } from "../tutorial/TutorialOverlay";
 import { newUuid } from "../uuid";
 
+// iOS only exposes the WiFi network name when this is on (plus the Access WiFi
+// Information entitlement and precise location permission). Harmless on
+// Android. Module-level so it runs once, before any clock-in.
+NetInfo.configure({ shouldFetchWiFiSSID: true });
+
 const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTHS = [
   "Jan", "Feb", "Mar", "Apr", "May", "Jun",
   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
+
+/** How the blocked-clock-in alert names the required network(s). */
+function wifiNetworkNames(ssids: string[]): string {
+  const named = ssids.map((s) => s.trim()).filter((s) => s.length > 0);
+  if (named.length >= 1 && named.length <= 3) return named.join(" or ");
+  return "one of the saved site networks";
+}
 
 function formatElapsed(ms: number): string {
   const total = Math.floor((ms > 0 ? ms : 0) / 1000);
@@ -138,6 +151,21 @@ export function ClockScreen({
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   // Worksite fences for the client-side clock-in pre-check. Empty = no geofence.
   const [fences, setFences] = useState<Fence[]>([]);
+  // WiFi-restricted clock-in config. Unlike the geofence advisory this one
+  // BLOCKS: only the phone can see the SSID, so the check lives here.
+  const [wifi, setWifi] = useState<{ enforced: boolean; ssids: string[] }>({
+    enforced: false,
+    ssids: [],
+  });
+  // The RUNNING entry's id + start, for the start-time editor. Only set from
+  // server truth (an offline optimistic clock-in has no entry id yet). Kept
+  // referentially stable across refreshes so the editor's prefill effect only
+  // refires when the entry actually changes.
+  const [activeEntry, setActiveEntry] = useState<{
+    id: string;
+    start: string;
+  } | null>(null);
+  const [adjustOpen, setAdjustOpen] = useState(false);
 
   const refresh = useCallback(async () => {
     const token = await getAccessToken();
@@ -162,6 +190,11 @@ export function ClockScreen({
         setProjects(d.projects);
         setTasksByProject(d.tasksByProject);
         setFences(d.geofence?.worksites ?? []);
+        setWifi(
+          d.wifi
+            ? { enforced: d.wifi.enforced, ssids: d.wifi.ssids ?? [] }
+            : { enforced: false, ssids: [] },
+        );
         // Apply server truth only when the queue is empty — otherwise an
         // in-flight optimistic punch would be clobbered. (Also how a rejected
         // clock-in reverts: punch dropped → queue empty → server says "no
@@ -172,6 +205,14 @@ export function ClockScreen({
           setOnBreakSince(d.onBreakSince);
           setProjectId(active ? active.projectId : null);
           setTaskId(active ? active.taskId : null);
+          setActiveEntry((prev) => {
+            if (!active) return null;
+            return prev &&
+              prev.id === active.id &&
+              prev.start === active.entryStartIso
+              ? prev
+              : { id: active.id, start: active.entryStartIso };
+          });
         }
       }
       if (historyRes.ok) setHistory(historyRes.data.shifts);
@@ -215,6 +256,13 @@ export function ClockScreen({
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
   }, []);
+
+  useEffect(() => {
+    // If the running entry disappears while the start-time editor is open
+    // (e.g. the server closed the shift), drop the editor flag too. Otherwise
+    // the modal would pop back open on its own at the next clock-in.
+    if (!activeEntry) setAdjustOpen(false);
+  }, [activeEntry]);
 
   useEffect(() => {
     const appSub = AppState.addEventListener("change", (s) => {
@@ -262,7 +310,11 @@ export function ClockScreen({
   );
 
   const enqueueSwitch = useCallback(
-    async (nextProjectId: string | null, nextTaskId: string | null) => {
+    async (
+      nextProjectId: string | null,
+      nextTaskId: string | null,
+      applyToShift: boolean,
+    ) => {
       const punch: QueuedPunch = {
         id: newUuid(),
         kind: "switch_project",
@@ -275,6 +327,7 @@ export function ClockScreen({
         longitude: null,
         accuracyM: null,
         mocked: null,
+        ...(applyToShift ? { applyToShift: true } : {}),
       };
       try {
         await enqueuePunch(punch);
@@ -290,25 +343,104 @@ export function ClockScreen({
 
   const onProjectChange = useCallback(
     (id: string | null) => {
-      setProjectId(id);
-      setTaskId(null);
-      if (shiftStartedAt) void enqueueSwitch(id, null);
+      if (!shiftStartedAt) {
+        setProjectId(id);
+        setTaskId(null);
+        return;
+      }
+      if (id === projectId) return;
+      const apply = (applyToShift: boolean) => {
+        setProjectId(id);
+        setTaskId(null);
+        void enqueueSwitch(id, null, applyToShift);
+      };
+      // Forgot-to-tag case: the running entry has no project yet, so the pick
+      // simply labels the whole shift. No choice to make.
+      if (projectId === null) {
+        apply(true);
+        return;
+      }
+      // Cancel reverts by doing nothing: the picker is controlled by state,
+      // which only updates once a choice is made.
+      Alert.alert(
+        "Change project",
+        "You are on the clock. You can switch to the new project from now, or apply it to the whole shift.",
+        [
+          { text: "Switch from now", onPress: () => apply(false) },
+          { text: "Apply to whole shift", onPress: () => apply(true) },
+          { text: "Cancel", style: "cancel" },
+        ],
+      );
     },
-    [shiftStartedAt, enqueueSwitch],
+    [shiftStartedAt, projectId, enqueueSwitch],
   );
 
   const onTaskChange = useCallback(
     (id: string | null) => {
-      setTaskId(id);
-      if (shiftStartedAt) void enqueueSwitch(projectId, id);
+      if (!shiftStartedAt) {
+        setTaskId(id);
+        return;
+      }
+      if (id === taskId) return;
+      const apply = (applyToShift: boolean) => {
+        setTaskId(id);
+        void enqueueSwitch(projectId, id, applyToShift);
+      };
+      Alert.alert(
+        "Change task",
+        "You are on the clock. You can switch to the new task from now, or apply it to the whole shift.",
+        [
+          { text: "Switch from now", onPress: () => apply(false) },
+          { text: "Apply to whole shift", onPress: () => apply(true) },
+          { text: "Cancel", style: "cancel" },
+        ],
+      );
     },
-    [shiftStartedAt, projectId, enqueueSwitch],
+    [shiftStartedAt, taskId, projectId, enqueueSwitch],
   );
 
   const doClockIn = useCallback(
     async (selfie: string | null) => {
       setBusy(true);
       setBanner(null);
+      // WiFi-restricted clock-in: the org can require punching in from a saved
+      // site network. This check BLOCKS (no enqueue) and runs before anything
+      // else — the phone is the only party that can read the SSID, and NetInfo
+      // knows the network name even with no internet, so it works offline too.
+      // Clock-out, breaks, and project switches are never gated.
+      if (wifi.enforced && wifi.ssids.length > 0) {
+        const names = wifiNetworkNames(wifi.ssids);
+        const allowed = wifi.ssids.map((s) => s.trim());
+        let blockMessage: string | null = null;
+        try {
+          const net = await NetInfo.fetch();
+          const rawSsid =
+            net.type === "wifi"
+              ? ((net.details as { ssid?: string | null } | null)?.ssid ?? null)
+              : null;
+          const ssid = rawSsid === null ? null : rawSsid.trim();
+          if (net.type !== "wifi") {
+            blockMessage = `Your manager requires clock-in from the site WiFi network. Connect to ${names} and try again.`;
+          } else if (ssid === null || ssid === "" || ssid === "<unknown ssid>") {
+            // Android reports "<unknown ssid>" without precise location; iOS
+            // returns null. Both mean the name could not be read.
+            blockMessage =
+              "Clox could not read the WiFi network name. Allow precise location for Clox in Settings, then try again.";
+          } else if (!allowed.includes(ssid)) {
+            blockMessage = `Your manager requires clock-in from the site WiFi network. Connect to ${names} and try again.`;
+          }
+        } catch {
+          // Fail closed: enforcement lives entirely on this check, so an
+          // unreadable network state can't be a bypass.
+          blockMessage =
+            "Clox could not check the WiFi network. Try again in a moment.";
+        }
+        if (blockMessage) {
+          setBusy(false);
+          Alert.alert("Connect to the site WiFi", blockMessage);
+          return;
+        }
+      }
       const coords = await getPunchLocation();
       // Offline, the server can't tell the worker on the spot that they look
       // off-site — the punch would only fail on a later sync, after they've
@@ -361,6 +493,9 @@ export function ClockScreen({
       }
       setShiftStartedAt(punch.clientTime);
       setOnBreakSince(null);
+      // The new entry's server id is unknown until the punch syncs — clear any
+      // stale one so the start-time editor can't target a previous entry.
+      setActiveEntry(null);
       setNote("");
       // The punch is safely queued, so free the button now and send in the
       // background — the clock-in registers instantly instead of waiting on the
@@ -369,7 +504,7 @@ export function ClockScreen({
       setPending(await queuedCount());
       void sync();
     },
-    [projectId, taskId, note, sync, fences],
+    [projectId, taskId, note, sync, fences, wifi],
   );
 
   const onClockIn = useCallback(() => {
@@ -396,6 +531,7 @@ export function ClockScreen({
     setBanner(null);
     setShiftStartedAt(null);
     setOnBreakSince(null);
+    setActiveEntry(null);
     await enqueueSimple("out");
     setBusy(false);
   }, [enqueueSimple]);
@@ -444,6 +580,22 @@ export function ClockScreen({
           }
         : null,
     [editShift],
+  );
+
+  // The RUNNING entry shaped for the manager's start-only editor. Memoized for
+  // the same reason as editEntry above (activeEntry is already kept
+  // referentially stable across refreshes).
+  const runningEditEntry = useMemo<EditableEntry | null>(
+    () =>
+      activeEntry
+        ? {
+            id: activeEntry.id,
+            start: activeEntry.start,
+            projectId: null,
+            note: null,
+          }
+        : null,
+    [activeEntry],
   );
 
   // Declared BEFORE the early `if (!ready) return` below so the number of hooks
@@ -586,6 +738,18 @@ export function ClockScreen({
                     Shift running · {formatElapsed(elapsed)}
                   </Text>
                 ) : null}
+                {activeEntry ? (
+                  // Hidden until the clock-in has synced: an offline punch has
+                  // no server entry id to adjust yet.
+                  <TouchableOpacity
+                    onPress={() => setAdjustOpen(true)}
+                    hitSlop={8}
+                    accessibilityRole="button"
+                    accessibilityLabel="Adjust start time"
+                  >
+                    <Text style={styles.adjustLink}>Adjust start time</Text>
+                  </TouchableOpacity>
+                ) : null}
               </>
             )}
           </View>
@@ -618,7 +782,8 @@ export function ClockScreen({
               ) : null}
               {clockedIn ? (
                 <Text style={styles.switchHint}>
-                  Changing the project switches your current shift.
+                  Changing the project switches your shift from now, or you can
+                  apply it to the whole shift.
                 </Text>
               ) : null}
             </>
@@ -800,6 +965,38 @@ export function ClockScreen({
           }}
         />
 
+        {/* Start-time adjustment for the RUNNING shift. Managers edit the
+            entry directly; everyone else files a correction request that a
+            manager approves. */}
+        {isManager ? (
+          <EditEntryModal
+            visible={adjustOpen && runningEditEntry !== null}
+            entry={runningEditEntry}
+            startOnly
+            onClose={() => setAdjustOpen(false)}
+            onSaved={() => {
+              setAdjustOpen(false);
+              // The timer anchors on the server's startedAt. Refetch and show
+              // whatever the server returns instead of computing locally.
+              void refresh();
+            }}
+          />
+        ) : (
+          <RequestEditModal
+            visible={adjustOpen && activeEntry !== null}
+            shift={null}
+            startOnly
+            running={activeEntry}
+            onClose={() => setAdjustOpen(false)}
+            onSubmitted={() => {
+              setAdjustOpen(false);
+              setBanner(
+                "Sent. Your manager approves this before it changes your timesheet.",
+              );
+            }}
+          />
+        )}
+
         <Modal
           visible={accountMenuOpen}
           transparent
@@ -974,6 +1171,13 @@ const makeStyles = (c: Palette) =>
       fontSize: 14,
       fontWeight: "600",
       marginTop: 12,
+    },
+    adjustLink: {
+      color: c.accent,
+      fontSize: 14,
+      fontWeight: "600",
+      textDecorationLine: "underline",
+      marginTop: 14,
     },
     switchHint: {
       color: c.textMuted,

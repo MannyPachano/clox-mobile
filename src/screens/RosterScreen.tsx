@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -12,8 +12,14 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useFocusEffect } from "@react-navigation/native";
 
-import { closeShift, getManagerRoster, type ManagerRosterEntry } from "../api";
+import {
+  closeShift,
+  getManagerRoster,
+  type EditableEntry,
+  type ManagerRosterEntry,
+} from "../api";
 import { AddEntryModal } from "../components/AddEntryModal";
+import { EditEntryModal } from "../components/EditEntryModal";
 import { EmployeeShiftsSheet } from "../components/EmployeeShiftsSheet";
 import { getAccessToken } from "../supabase";
 import { lightColors as c } from "../theme";
@@ -63,7 +69,29 @@ export function RosterScreen() {
     userId: string;
     name: string;
   } | null>(null);
+  // A team member's RUNNING entry, for the start-only editor.
+  const [adjustFor, setAdjustFor] = useState<{
+    entryId: string;
+    startIso: string;
+    name: string;
+  } | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
+
+  // Stable entry object for EditEntryModal (a fresh literal each render would
+  // re-fire its prefill effect on every roster tick).
+  const adjustEntry = useMemo<EditableEntry | null>(
+    () =>
+      adjustFor
+        ? {
+            id: adjustFor.entryId,
+            employee: adjustFor.name,
+            start: adjustFor.startIso,
+            projectId: null,
+            note: null,
+          }
+        : null,
+    [adjustFor],
+  );
 
   const load = useCallback(async () => {
     const token = await getAccessToken();
@@ -156,6 +184,8 @@ export function RosterScreen() {
 
   const renderItem = ({ item }: { item: ManagerRosterEntry }) => {
     const since = item.shiftStartedAt ? Date.parse(item.shiftStartedAt) : null;
+    const activeEntryId = item.activeEntryId ?? null;
+    const activeStartIso = item.activeStartIso ?? null;
     return (
       <View style={styles.row}>
         <TouchableOpacity
@@ -184,13 +214,30 @@ export function RosterScreen() {
           </View>
         </TouchableOpacity>
         {item.onShift ? (
-          <TouchableOpacity
-            style={styles.clockOutBtn}
-            activeOpacity={0.8}
-            onPress={() => confirmClose(item)}
-          >
-            <Text style={styles.clockOutText}>Clock out</Text>
-          </TouchableOpacity>
+          <>
+            {activeEntryId && activeStartIso ? (
+              <TouchableOpacity
+                style={styles.clockOutBtn}
+                activeOpacity={0.8}
+                onPress={() =>
+                  setAdjustFor({
+                    entryId: activeEntryId,
+                    startIso: activeStartIso,
+                    name: item.name,
+                  })
+                }
+              >
+                <Text style={styles.clockOutText}>Adjust start</Text>
+              </TouchableOpacity>
+            ) : null}
+            <TouchableOpacity
+              style={styles.clockOutBtn}
+              activeOpacity={0.8}
+              onPress={() => confirmClose(item)}
+            >
+              <Text style={styles.clockOutText}>Clock out</Text>
+            </TouchableOpacity>
+          </>
         ) : (
           <Text style={styles.chev}>›</Text>
         )}
@@ -240,8 +287,8 @@ export function RosterScreen() {
           ListHeaderComponent={
             sorted.length > 0 ? (
               <Text style={styles.hint}>
-                Tap a name to view and edit their shifts. Use Clock out to close
-                a running shift.
+                Tap a name to view and edit their shifts. Use Adjust start to
+                fix when a running shift began, or Clock out to close it.
               </Text>
             ) : null
           }
@@ -268,6 +315,18 @@ export function RosterScreen() {
         visible={shiftsFor != null}
         employee={shiftsFor}
         onClose={() => setShiftsFor(null)}
+      />
+
+      <EditEntryModal
+        visible={adjustFor != null}
+        entry={adjustEntry}
+        startOnly
+        onClose={() => setAdjustFor(null)}
+        onSaved={() => {
+          setAdjustFor(null);
+          setBanner("Start time updated.");
+          void load();
+        }}
       />
 
       {banner ? (

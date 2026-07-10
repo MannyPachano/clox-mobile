@@ -15,7 +15,11 @@ export type StatusResponse = {
   activeEntry: {
     id: string;
     startTime: string;
+    /** Shift anchor — drives the on-screen timer. */
     startedAt: string;
+    /** Start of the CURRENT entry segment (later than startedAt after a
+     *  mid-shift project switch). Prefills the start-time editor. */
+    entryStartIso: string;
     projectId: string | null;
     taskId: string | null;
     note: string | null;
@@ -31,6 +35,13 @@ export type StatusResponse = {
   geofence: {
     enforced: boolean;
     worksites: { latitude: number; longitude: number; radiusM: number }[];
+  };
+  /** WiFi-restricted clock-in. When enforced with saved SSIDs, the app blocks
+   *  clock-in unless the phone is on one of these networks (exact name match).
+   *  Client-side only — the phone is the only party that can see the SSID. */
+  wifi: {
+    enforced: boolean;
+    ssids: string[];
   };
 };
 
@@ -153,6 +164,9 @@ export function switchProject(
     clientTime: punch.clientTime,
     projectId: punch.projectId,
     taskId: punch.taskId,
+    // true = retag the CURRENT entry in place (no split); omitted = today's
+    // split-at-clientTime behavior.
+    ...(punch.applyToShift ? { applyToShift: true } : {}),
   });
 }
 
@@ -174,16 +188,19 @@ export function getHistory(
 }
 
 /**
- * Employee submits a correction request for one of THEIR OWN completed shifts.
- * It does not take effect until a manager approves it. requestedProject is the
- * full desired value (omit/keep to leave it unchanged).
+ * Employee submits a correction request for one of THEIR OWN shifts. It does
+ * not take effect until a manager approves it. requestedProject is the full
+ * desired value (omit/keep to leave it unchanged). For a RUNNING shift, omit
+ * endIso entirely (the server rejects endIso on a running entry) — approval
+ * applies the new start and the shift keeps running. Completed shifts must
+ * still send endIso.
  */
 export function createEntryEditRequest(
   token: string,
   input: {
     timeEntryId: string;
     startIso: string;
-    endIso: string;
+    endIso?: string;
     projectId?: string | null;
     reason?: string | null;
   },
@@ -218,6 +235,10 @@ export type ManagerRosterEntry = {
   onShift: boolean;
   shiftStartedAt: string | null;
   project: string | null;
+  /** Present only while onShift: the running entry's id + its start, so a
+   *  manager can adjust the start time without closing the shift. */
+  activeEntryId?: string | null;
+  activeStartIso?: string | null;
 };
 
 export function getManagerRoster(
@@ -289,7 +310,8 @@ export type EditableEntry = {
   /** Optional subtitle in the edit sheet (omit for the manager's own shift). */
   employee?: string;
   start: string;
-  end: string;
+  /** Omitted for a RUNNING entry (start-only edit — the shift has no end yet). */
+  end?: string;
   projectId: string | null;
   note: string | null;
 };
@@ -379,6 +401,11 @@ export function createManagerEntry(
   return request("manager/entry", token, "POST", entry);
 }
 
+/**
+ * endIso omitted = keep the current end, which may still be open (running
+ * shift). Start-only edits of a running entry are allowed; the server rejects
+ * a startIso at or after now.
+ */
 export function updateManagerEntry(
   token: string,
   entry: {
@@ -386,6 +413,7 @@ export function updateManagerEntry(
     startIso?: string;
     endIso?: string;
     projectId?: string | null;
+    taskId?: string | null;
     note?: string | null;
   },
 ): Promise<ApiResult<unknown>> {

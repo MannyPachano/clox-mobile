@@ -16,7 +16,13 @@ import {
   type HistoryShift,
   type Option,
 } from "../api";
-import { buildEditDays, buildShiftRange, withDay, ymdOf } from "../lib/edit-time";
+import {
+  buildEditDays,
+  buildRunningStart,
+  buildShiftRange,
+  withDay,
+  ymdOf,
+} from "../lib/edit-time";
 import { getAccessToken } from "../supabase";
 import { lightColors as c } from "../theme";
 import { SelectField } from "./SelectField";
@@ -25,6 +31,12 @@ import { TimeField } from "./TimeField";
 type Props = {
   visible: boolean;
   shift: HistoryShift | null;
+  /** Start-only mode for the RUNNING shift: only the Start field and reason
+   *  show, the date is fixed to the shift's start date, and the request sends
+   *  startIso alone (no endIso — the shift keeps running after approval). Pass
+   *  `running` instead of `shift` in this mode. */
+  startOnly?: boolean;
+  running?: { id: string; start: string } | null;
   onClose: () => void;
   onSubmitted: () => void;
 };
@@ -37,6 +49,8 @@ type Props = {
 export function RequestEditModal({
   visible,
   shift,
+  startOnly = false,
+  running = null,
   onClose,
   onSubmitted,
 }: Props) {
@@ -53,18 +67,30 @@ export function RequestEditModal({
 
   const dayOptions = useMemo(() => withDay(days, dateId), [days, dateId]);
 
-  useEffect(() => {
-    if (!shift) return;
-    setDateId(ymdOf(shift.start));
-    setStartTime(new Date(shift.start));
-    setEndTime(new Date(shift.end));
-    setProjectId(shift.projectId);
-    setReason("");
-    setError(null);
-  }, [shift]);
-
+  // Prefill on every open so reopening starts from the shift's real values,
+  // not leftover edits from a previous visit.
   useEffect(() => {
     if (!visible) return;
+    if (startOnly) {
+      if (!running) return;
+      setDateId(ymdOf(running.start));
+      setStartTime(new Date(running.start));
+      setEndTime(new Date());
+      setProjectId(null);
+    } else {
+      if (!shift) return;
+      setDateId(ymdOf(shift.start));
+      setStartTime(new Date(shift.start));
+      setEndTime(new Date(shift.end));
+      setProjectId(shift.projectId);
+    }
+    setReason("");
+    setError(null);
+  }, [visible, shift, startOnly, running]);
+
+  useEffect(() => {
+    // Start-only mode has no project picker, so skip the fetch.
+    if (!visible || startOnly) return;
     void getAccessToken().then(async (t) => {
       if (!t) return;
       try {
@@ -74,13 +100,34 @@ export function RequestEditModal({
         // optional
       }
     });
-  }, [visible]);
+  }, [visible, startOnly]);
 
   async function submit() {
-    if (!shift) return;
     setError(null);
-    const range = buildShiftRange(dateId, startTime, endTime);
-    if (!range.ok) return setError(range.error);
+    // Start-only (running shift): send the new start alone. No endIso — the
+    // server rejects an end on a running entry and approval keeps it running.
+    let input: Parameters<typeof createEntryEditRequest>[1];
+    if (startOnly) {
+      if (!running) return;
+      const start = buildRunningStart(dateId, startTime);
+      if (!start.ok) return setError(start.error);
+      input = {
+        timeEntryId: running.id,
+        startIso: start.startIso,
+        reason: reason.trim() || null,
+      };
+    } else {
+      if (!shift) return;
+      const range = buildShiftRange(dateId, startTime, endTime);
+      if (!range.ok) return setError(range.error);
+      input = {
+        timeEntryId: shift.id,
+        startIso: range.startIso,
+        endIso: range.endIso,
+        projectId,
+        reason: reason.trim() || null,
+      };
+    }
     setBusy(true);
     const t = await getAccessToken();
     if (!t) {
@@ -88,13 +135,7 @@ export function RequestEditModal({
       return setError("Not signed in.");
     }
     try {
-      const res = await createEntryEditRequest(t, {
-        timeEntryId: shift.id,
-        startIso: range.startIso,
-        endIso: range.endIso,
-        projectId,
-        reason: reason.trim() || null,
-      });
+      const res = await createEntryEditRequest(t, input);
       if (res.ok) onSubmitted();
       else if (res.status === 409) {
         setError("This shift is already approved. Ask your manager to reopen it first.");
@@ -115,11 +156,17 @@ export function RequestEditModal({
     >
       <Pressable style={styles.backdrop} onPress={onClose}>
         <Pressable style={styles.sheet} onPress={() => {}}>
-          <Text style={styles.title}>Request a change</Text>
+          <Text style={styles.title}>
+            {startOnly ? "Adjust start time" : "Request a change"}
+          </Text>
           <Text style={styles.subtitle}>
             Your manager reviews this before it changes your timesheet.
           </Text>
           <ScrollView style={styles.scroll} keyboardShouldPersistTaps="handled">
+            {/* The date shows in startOnly mode too: an overnight shift's
+                real start can be the previous day, and pinning the date
+                would make that correction impossible. buildRunningStart
+                still rejects anything not in the past. */}
             <SelectField
               label="Date"
               value={dateId}
@@ -128,15 +175,19 @@ export function RequestEditModal({
               onSelect={(v) => setDateId(v ?? dateId)}
             />
             <TimeField label="Start" value={startTime} onChange={setStartTime} />
-            <TimeField label="End" value={endTime} onChange={setEndTime} />
-            <SelectField
-              label="Project"
-              value={projectId}
-              options={projects}
-              placeholder="No project"
-              onSelect={setProjectId}
-              noneLabel="No project"
-            />
+            {!startOnly ? (
+              <>
+                <TimeField label="End" value={endTime} onChange={setEndTime} />
+                <SelectField
+                  label="Project"
+                  value={projectId}
+                  options={projects}
+                  placeholder="No project"
+                  onSelect={setProjectId}
+                  noneLabel="No project"
+                />
+              </>
+            ) : null}
             <TextInput
               style={styles.note}
               placeholder="Reason for the change (optional)"

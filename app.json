@@ -23,7 +23,8 @@
         "ITSAppUsesNonExemptEncryption": false
       },
       "entitlements": {
-        "com.apple.developer.devicecheck.appattest-environment": "production"
+        "com.apple.developer.devicecheck.appattest-environment": "production",
+        "com.apple.developer.networking.wifi-info": true
       }
     },
     "android": {
@@ -35,6 +36,8 @@
       "permissions": [
         "ACCESS_COARSE_LOCATION",
         "ACCESS_FINE_LOCATION",
+        "ACCESS_NETWORK_STATE",
+        "ACCESS_WIFI_STATE",
         "android.permission.ACCESS_COARSE_LOCATION",
         "android.permission.ACCESS_FINE_LOCATION",
         "android.permission.CAMERA"

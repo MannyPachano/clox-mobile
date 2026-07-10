@@ -17,7 +17,13 @@ import {
   type EditableEntry,
   type Option,
 } from "../api";
-import { buildEditDays, buildShiftRange, withDay, ymdOf } from "../lib/edit-time";
+import {
+  buildEditDays,
+  buildRunningStart,
+  buildShiftRange,
+  withDay,
+  ymdOf,
+} from "../lib/edit-time";
 import { getAccessToken } from "../supabase";
 import { lightColors as c } from "../theme";
 import { SelectField } from "./SelectField";
@@ -26,11 +32,21 @@ import { TimeField } from "./TimeField";
 type Props = {
   visible: boolean;
   entry: EditableEntry | null;
+  /** Start-only mode for a RUNNING shift: only the Start field shows, the date
+   *  is fixed to the shift's start date, and the save sends startIso alone (no
+   *  endIso — the shift keeps running). */
+  startOnly?: boolean;
   onClose: () => void;
   onSaved: () => void;
 };
 
-export function EditEntryModal({ visible, entry, onClose, onSaved }: Props) {
+export function EditEntryModal({
+  visible,
+  entry,
+  startOnly = false,
+  onClose,
+  onSaved,
+}: Props) {
   const days = useMemo(buildEditDays, []);
 
   const [projects, setProjects] = useState<Option[]>([]);
@@ -45,19 +61,22 @@ export function EditEntryModal({ visible, entry, onClose, onSaved }: Props) {
   // Keep the entry's own date selectable even if it's older than the 14-day list.
   const dayOptions = useMemo(() => withDay(days, dateId), [days, dateId]);
 
-  // Prefill from the entry being edited — exact times, no rounding.
+  // Prefill from the entry being edited — exact times, no rounding. Keyed on
+  // `visible` too, so reopening the modal for the same entry (e.g. the running
+  // shift) starts from the entry's real values, not leftover edits.
   useEffect(() => {
-    if (!entry) return;
+    if (!visible || !entry) return;
     setDateId(ymdOf(entry.start));
     setStartTime(new Date(entry.start));
-    setEndTime(new Date(entry.end));
+    setEndTime(entry.end ? new Date(entry.end) : new Date());
     setProjectId(entry.projectId);
     setNote(entry.note ?? "");
     setError(null);
-  }, [entry]);
+  }, [visible, entry]);
 
   useEffect(() => {
-    if (!visible) return;
+    // Start-only mode has no project picker, so skip the fetch.
+    if (!visible || startOnly) return;
     void getAccessToken().then(async (t) => {
       if (!t) return;
       try {
@@ -67,13 +86,29 @@ export function EditEntryModal({ visible, entry, onClose, onSaved }: Props) {
         // optional
       }
     });
-  }, [visible]);
+  }, [visible, startOnly]);
 
   async function save() {
     if (!entry) return;
     setError(null);
-    const range = buildShiftRange(dateId, startTime, endTime);
-    if (!range.ok) return setError(range.error);
+    // Start-only (running shift): send the new start alone. No endIso — the
+    // server keeps the shift open. Completed entries send the full range.
+    let payload: Parameters<typeof updateManagerEntry>[1];
+    if (startOnly) {
+      const start = buildRunningStart(dateId, startTime);
+      if (!start.ok) return setError(start.error);
+      payload = { id: entry.id, startIso: start.startIso };
+    } else {
+      const range = buildShiftRange(dateId, startTime, endTime);
+      if (!range.ok) return setError(range.error);
+      payload = {
+        id: entry.id,
+        startIso: range.startIso,
+        endIso: range.endIso,
+        projectId,
+        note: note.trim() || null,
+      };
+    }
     setBusy(true);
     const t = await getAccessToken();
     if (!t) {
@@ -81,13 +116,7 @@ export function EditEntryModal({ visible, entry, onClose, onSaved }: Props) {
       return setError("Not signed in.");
     }
     try {
-      const res = await updateManagerEntry(t, {
-        id: entry.id,
-        startIso: range.startIso,
-        endIso: range.endIso,
-        projectId,
-        note: note.trim() || null,
-      });
+      const res = await updateManagerEntry(t, payload);
       if (res.ok) onSaved();
       else if (res.status === 409) {
         setError("This entry is locked (already approved). Unlock it on the web to edit.");
@@ -108,11 +137,17 @@ export function EditEntryModal({ visible, entry, onClose, onSaved }: Props) {
     >
       <Pressable style={styles.backdrop} onPress={onClose}>
         <Pressable style={styles.sheet} onPress={() => {}}>
-          <Text style={styles.title}>Edit entry</Text>
+          <Text style={styles.title}>
+            {startOnly ? "Adjust start time" : "Edit entry"}
+          </Text>
           {entry?.employee ? (
             <Text style={styles.who}>{entry.employee}</Text>
           ) : null}
           <ScrollView style={styles.scroll} keyboardShouldPersistTaps="handled">
+            {/* The date shows in startOnly mode too: an overnight shift's
+                real start can be the previous day, and pinning the date
+                would make that correction impossible. buildRunningStart
+                still rejects anything not in the past. */}
             <SelectField
               label="Date"
               value={dateId}
@@ -121,25 +156,31 @@ export function EditEntryModal({ visible, entry, onClose, onSaved }: Props) {
               onSelect={(v) => setDateId(v ?? dateId)}
             />
             <TimeField label="Start" value={startTime} onChange={setStartTime} />
-            <TimeField label="End" value={endTime} onChange={setEndTime} />
-            <SelectField
-              label="Project"
-              value={projectId}
-              options={projects}
-              placeholder="No project"
-              onSelect={setProjectId}
-              noneLabel="No project"
-            />
-            <TextInput
-              style={styles.note}
-              placeholder="Note (optional)"
-              placeholderTextColor={c.textMuted}
-              value={note}
-              onChangeText={setNote}
-              editable={!busy}
-            />
+            {!startOnly ? (
+              <>
+                <TimeField label="End" value={endTime} onChange={setEndTime} />
+                <SelectField
+                  label="Project"
+                  value={projectId}
+                  options={projects}
+                  placeholder="No project"
+                  onSelect={setProjectId}
+                  noneLabel="No project"
+                />
+                <TextInput
+                  style={styles.note}
+                  placeholder="Note (optional)"
+                  placeholderTextColor={c.textMuted}
+                  value={note}
+                  onChangeText={setNote}
+                  editable={!busy}
+                />
+              </>
+            ) : null}
             <Text style={styles.hint}>
-              Saving re-opens the entry for approval.
+              {startOnly
+                ? "The shift keeps running. Only the start time changes."
+                : "Saving re-opens the entry for approval."}
             </Text>
             {error ? <Text style={styles.error}>{error}</Text> : null}
           </ScrollView>
