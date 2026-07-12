@@ -61,6 +61,8 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     padding: 32,
+    // These literals intentionally mirror theme.ts (paper/ink/stone/clay/
+    // accentText): the boundary must render even when theme context is broken.
     backgroundColor: "#f3efe7",
   },
   title: {
@@ -83,7 +85,7 @@ const styles = StyleSheet.create({
     borderRadius: 10,
   },
   buttonText: {
-    color: "#ffffff",
+    color: "#fbf8f3",
     fontSize: 15,
     fontWeight: "500",
   },

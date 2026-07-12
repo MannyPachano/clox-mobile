@@ -22,7 +22,7 @@ import { AddEntryModal } from "../components/AddEntryModal";
 import { EditEntryModal } from "../components/EditEntryModal";
 import { EmployeeShiftsSheet } from "../components/EmployeeShiftsSheet";
 import { getAccessToken } from "../supabase";
-import { lightColors as c } from "../theme";
+import { lightColors as c, radii } from "../theme";
 
 // Manager screens use the light "paper" theme (the dark on-shift palette is for
 // an employee's own running clock).
@@ -353,7 +353,7 @@ const styles = StyleSheet.create({
   labor: { color: c.text, fontSize: 14, fontWeight: "600", marginTop: 2 },
   addBtn: {
     backgroundColor: c.accent,
-    borderRadius: 12,
+    borderRadius: radii.md,
     paddingVertical: 9,
     paddingHorizontal: 14,
   },
@@ -402,5 +402,5 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     paddingHorizontal: 20,
   },
-  bannerText: { color: "#fff", fontSize: 14, textAlign: "center" },
+  bannerText: { color: c.accentText, fontSize: 14, textAlign: "center" },
 });

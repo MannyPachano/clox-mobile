@@ -8,7 +8,7 @@ import {
   View,
 } from "react-native";
 
-import { useColors, type Palette } from "../theme";
+import { useColors, type Palette, scrim } from "../theme";
 
 export type DetailRow = { label: string; value: string };
 
@@ -63,7 +63,7 @@ const makeStyles = (c: Palette) =>
   StyleSheet.create({
     backdrop: {
       flex: 1,
-      backgroundColor: "rgba(0,0,0,0.6)",
+      backgroundColor: scrim,
       justifyContent: "flex-end",
     },
     sheet: {

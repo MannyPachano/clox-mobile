@@ -10,7 +10,7 @@ import {
 } from "react-native";
 
 import type { Option } from "../api";
-import { useColors, type Palette } from "../theme";
+import { useColors, type Palette, scrim, radii } from "../theme";
 
 type Props = {
   label: string;
@@ -137,7 +137,7 @@ const makeStyles = (c: Palette) =>
     chevron: { color: c.textMuted, fontSize: 14, marginLeft: 8 },
     backdrop: {
       flex: 1,
-      backgroundColor: "rgba(0,0,0,0.6)",
+      backgroundColor: scrim,
       justifyContent: "flex-end",
     },
     sheet: {
@@ -161,7 +161,7 @@ const makeStyles = (c: Palette) =>
       alignItems: "center",
       paddingHorizontal: 16,
       paddingVertical: 16,
-      borderRadius: 12,
+      borderRadius: radii.md,
     },
     optionText: { flex: 1, color: c.text, fontSize: 17 },
     optionSelected: { color: c.accent, fontWeight: "700" },

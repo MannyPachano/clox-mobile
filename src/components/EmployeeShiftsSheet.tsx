@@ -17,7 +17,7 @@ import {
   type ManagerEntry,
 } from "../api";
 import { getAccessToken } from "../supabase";
-import { lightColors as c } from "../theme";
+import { lightColors as c, scrim } from "../theme";
 import { EditEntryModal } from "./EditEntryModal";
 
 const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -192,7 +192,7 @@ export function EmployeeShiftsSheet({ visible, employee, onClose }: Props) {
 const styles = StyleSheet.create({
   backdrop: {
     flex: 1,
-    backgroundColor: "rgba(0,0,0,0.6)",
+    backgroundColor: scrim,
     justifyContent: "flex-end",
   },
   sheet: {

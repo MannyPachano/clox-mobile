@@ -446,5 +446,5 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     paddingHorizontal: 20,
   },
-  bannerText: { color: "#fff", fontSize: 14, textAlign: "center" },
+  bannerText: { color: c.accentText, fontSize: 14, textAlign: "center" },
 });

@@ -1098,6 +1098,8 @@ const makeStyles = (c: Palette) =>
     avatarInitial: { color: c.accentText, fontSize: 16, fontWeight: "700" },
     sheetBackdrop: {
       flex: 1,
+      // Deliberately lighter than the shared scrim token: this sheet opens
+      // over the dark on-shift screen, where 0.6 reads as a blackout.
       backgroundColor: "rgba(0,0,0,0.45)",
       justifyContent: "flex-end",
     },
@@ -1260,5 +1262,5 @@ const makeStyles = (c: Palette) =>
       paddingVertical: 12,
       paddingHorizontal: 20,
     },
-    bannerText: { color: "#fff", fontSize: 14, textAlign: "center" },
+    bannerText: { color: c.accentText, fontSize: 14, textAlign: "center" },
   });

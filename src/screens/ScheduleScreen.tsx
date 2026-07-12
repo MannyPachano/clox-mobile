@@ -20,7 +20,7 @@ import {
 } from "../api";
 import { AddShiftModal } from "../components/AddShiftModal";
 import { getAccessToken } from "../supabase";
-import { lightColors as c } from "../theme";
+import { lightColors as c, radii } from "../theme";
 
 // Manager screens use the light "paper" theme.
 
@@ -320,7 +320,7 @@ const styles = StyleSheet.create({
   title: { color: c.text, fontSize: 28, fontWeight: "800", flex: 1 },
   addBtn: {
     backgroundColor: c.accent,
-    borderRadius: 12,
+    borderRadius: radii.md,
     paddingVertical: 9,
     paddingHorizontal: 14,
   },
@@ -353,7 +353,7 @@ const styles = StyleSheet.create({
     backgroundColor: c.surface,
     borderColor: c.border,
     borderWidth: 1,
-    borderRadius: 12,
+    borderRadius: radii.md,
     paddingVertical: 12,
     paddingHorizontal: 14,
     marginBottom: 8,
@@ -368,5 +368,5 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     paddingHorizontal: 20,
   },
-  bannerText: { color: "#fff", fontSize: 14, textAlign: "center" },
+  bannerText: { color: c.accentText, fontSize: 14, textAlign: "center" },
 });

@@ -9,10 +9,11 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { useColors } from "../theme";
+import { useColors, scrim, radii } from "../theme";
 import { useTutorial, type Rect } from "./TutorialContext";
 
-const DIM = "rgba(0,0,0,0.6)";
+// Shared overlay scrim from the theme tokens.
+const DIM = scrim;
 
 /**
  * Spotlight overlay for the mobile guided tour. Dims the screen (four rects
@@ -209,7 +210,7 @@ export function TutorialOverlay() {
               activeOpacity={0.85}
               style={{
                 backgroundColor: c.accent,
-                borderRadius: 12,
+                borderRadius: radii.md,
                 paddingVertical: 10,
                 paddingHorizontal: 20,
               }}

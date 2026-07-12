@@ -24,7 +24,7 @@ import {
   ymdOf,
 } from "../lib/edit-time";
 import { getAccessToken } from "../supabase";
-import { lightColors as c } from "../theme";
+import { lightColors as c, scrim } from "../theme";
 import { SelectField } from "./SelectField";
 import { TimeField } from "./TimeField";
 
@@ -224,7 +224,7 @@ export function RequestEditModal({
 const styles = StyleSheet.create({
   backdrop: {
     flex: 1,
-    backgroundColor: "rgba(0,0,0,0.6)",
+    backgroundColor: scrim,
     justifyContent: "flex-end",
   },
   sheet: {

@@ -1,8 +1,15 @@
 import { createContext, useContext } from "react";
 
-// Clox uses a light "paper" look by default and can flip to a dark "on-shift"
-// palette while the timer is running (mirrors the web's body.clx-shift-active).
-// The clay accent stays constant across both so the brand reads the same.
+/**
+ * Phase 2 reference — replaces src/theme.ts in clox-mobile.
+ *
+ * Changes vs production: six palette VALUES updated (see 00-README table),
+ * plus additive `spacing`, `radii`, `scrim`, and `type` exports. Every
+ * existing export keeps its name and shape, so all current imports keep
+ * working unchanged. Deliberate contrast divergences from the web palette
+ * are kept and commented; do not "align" them to the web values.
+ */
+
 export type Palette = {
   bg: string;
   surface: string;
@@ -21,10 +28,10 @@ export const darkColors: Palette = {
   bg: "#0f0f0e", // clx-ink
   surface: "#1c1c1a",
   surfaceAlt: "#26261f",
-  text: "#f4f4f2",
-  textMuted: "#a3a39b",
+  text: "#f3efe7", // warm paper (was #f4f4f2): matches web dark-mode foreground
+  textMuted: "#a3a39b", // lighter than web dark stone on purpose: small-text contrast
   accent: "#b84a2c", // clx-clay
-  accentText: "#f8f5f0",
+  accentText: "#fbf8f3", // unified with light.accentText (web btn-primary-fg)
   success: "#8aa06f",
   danger: "#e2655a",
   border: "#33332d",
@@ -33,25 +40,57 @@ export const darkColors: Palette = {
 
 export const lightColors: Palette = {
   bg: "#f3efe7", // warm paper
-  surface: "#ffffff",
-  surfaceAlt: "#ece5d8",
-  text: "#1a1a17",
+  surface: "#fbf9f4", // web card surface (was #ffffff): warm, sits in the brand
+  surfaceAlt: "#e9e4d8", // exact web paper-2 (was #ece5d8)
+  text: "#0f0f0e", // exact web ink (was #1a1a17)
   textMuted: "#6a6760", // clx-stone
   accent: "#b84a2c", // clx-clay
   accentText: "#fbf8f3",
-  success: "#4f5e42", // deep moss, readable on light
-  danger: "#bb3b2a",
+  success: "#4f5e42", // deep moss on purpose: readable at small sizes on paper
+  danger: "#bb3b2a", // darker than web danger on purpose: readable on paper
   border: "#ddd5c5",
-  warn: "#9a6b15",
+  warn: "#9a6b15", // darker than web amber on purpose: readable on paper
 };
 
+/** Shared modal/overlay scrim. ClockScreen may keep its lighter 0.45 locally. */
+export const scrim = "rgba(0,0,0,0.6)";
+
+/** Spacing scale. Use for new/touched styles; no big-bang migration. */
+export const spacing = {
+  xs: 4,
+  sm: 8,
+  md: 12,
+  lg: 16,
+  xl: 20,
+  xxl: 24,
+  xxxl: 32,
+} as const;
+
+/** Corner radii. md (14) is the app's dominant card/button radius. */
+export const radii = {
+  sm: 10,
+  md: 14,
+  lg: 18,
+  pill: 999,
+} as const;
+
 /**
- * User preference for the on-shift color switch (set on the web, read by both
- * apps from the profile):
- *   - "auto"  → dark while clocked in, light when off (the default)
- *   - "light" → always light
- *   - "dark"  → always dark
+ * Type ramp reflecting current real usage (heavy weights are deliberate:
+ * glare and glove-distance readability). Timer digits must be tabular so
+ * the running clock does not jitter.
  */
+export const type = {
+  timer: {
+    fontSize: 52,
+    fontWeight: "800",
+    fontVariant: ["tabular-nums"],
+  },
+  title: { fontSize: 22, fontWeight: "700" },
+  body: { fontSize: 16, fontWeight: "400" },
+  label: { fontSize: 14, fontWeight: "600" },
+  caption: { fontSize: 13, fontWeight: "500" },
+} as const;
+
 export type ThemePreference = "auto" | "light" | "dark";
 
 export function normalizeThemePreference(v: unknown): ThemePreference {
@@ -67,7 +106,5 @@ export function resolvePalette(
   return shiftActive ? darkColors : lightColors;
 }
 
-// Light by default. A clocked-in screen provides the resolved palette to its
-// subtree so shared components (e.g. the picker) follow the active theme.
 export const ThemeContext = createContext<Palette>(lightColors);
 export const useColors = (): Palette => useContext(ThemeContext);
