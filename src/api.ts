@@ -348,8 +348,15 @@ export function decidePayroll(
   token: string,
   action: "approve" | "reject",
   ids: string[],
+  // Rejecting no longer deletes the shift — it marks it rejected with a reason
+  // the employee sees, so the server requires a reason on "reject".
+  reason?: string,
 ): Promise<ApiResult<{ ok: boolean; count: number }>> {
-  return request("manager/payroll/decide", token, "POST", { action, ids });
+  return request("manager/payroll/decide", token, "POST", {
+    action,
+    ids,
+    ...(reason ? { reason } : {}),
+  });
 }
 
 export function reviewLeave(

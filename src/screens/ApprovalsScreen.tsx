@@ -1,10 +1,13 @@
 import { useCallback, useState } from "react";
 import {
   ActivityIndicator,
+  Modal,
+  Pressable,
   RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   TouchableOpacity,
   View,
 } from "react-native";
@@ -23,7 +26,7 @@ import {
 import { EditEntryModal } from "../components/EditEntryModal";
 import { haptics } from "../lib/haptics";
 import { getAccessToken } from "../supabase";
-import { lightColors as c } from "../theme";
+import { lightColors as c, scrim } from "../theme";
 
 const MONTHS = [
   "Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -67,6 +70,14 @@ export function ApprovalsScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [banner, setBanner] = useState<string | null>(null);
   const [editEntry, setEditEntry] = useState<PendingTimesheet | null>(null);
+  // Rejecting no longer deletes the shift — it needs a reason the worker sees,
+  // so a tap on Reject opens this confirm sheet instead of firing immediately.
+  const [rejectTarget, setRejectTarget] = useState<{
+    ids: string[];
+    label: string;
+  } | null>(null);
+  const [rejectReason, setRejectReason] = useState("");
+  const [rejecting, setRejecting] = useState(false);
 
   const load = useCallback(async () => {
     const token = await getAccessToken();
@@ -104,7 +115,7 @@ export function ApprovalsScreen() {
   }, [load]);
 
   const decideTimesheets = useCallback(
-    async (ids: string[], action: "approve" | "reject") => {
+    async (ids: string[], action: "approve" | "reject", reason?: string) => {
       if (ids.length === 0) return;
       haptics[action === "approve" ? "success" : "warning"]();
       const token = await getAccessToken();
@@ -113,7 +124,7 @@ export function ApprovalsScreen() {
       const prev = timesheets;
       setTimesheets((ts) => ts.filter((t) => !ids.includes(t.id)));
       try {
-        const res = await decidePayroll(token, action, ids);
+        const res = await decidePayroll(token, action, ids, reason);
         if (!res.ok) {
           setTimesheets(prev);
           setBanner(`Couldn't ${action} — try again.`);
@@ -125,6 +136,20 @@ export function ApprovalsScreen() {
     },
     [timesheets],
   );
+
+  // Confirm a reject with its required reason. The row is only removed once the
+  // server accepts it (unlike approve's optimistic path) so a missing reason
+  // can't silently drop it.
+  const confirmReject = useCallback(async () => {
+    if (!rejectTarget) return;
+    const reason = rejectReason.trim();
+    if (reason.length === 0) return;
+    setRejecting(true);
+    await decideTimesheets(rejectTarget.ids, "reject", reason);
+    setRejecting(false);
+    setRejectTarget(null);
+    setRejectReason("");
+  }, [rejectTarget, rejectReason, decideTimesheets]);
 
   const decideLeave = useCallback(
     async (id: string, decision: "approved" | "rejected") => {
@@ -258,7 +283,13 @@ export function ApprovalsScreen() {
                   <View style={styles.actionsRight}>
                     <TouchableOpacity
                       style={[styles.btn, styles.reject]}
-                      onPress={() => decideTimesheets([t.id], "reject")}
+                      onPress={() => {
+                        setRejectReason("");
+                        setRejectTarget({
+                          ids: [t.id],
+                          label: `${t.employee} · ${dateShort(t.start)}`,
+                        });
+                      }}
                     >
                       <Text style={styles.rejectText}>Reject</Text>
                     </TouchableOpacity>
@@ -364,6 +395,64 @@ export function ApprovalsScreen() {
         }}
       />
 
+      <Modal
+        visible={rejectTarget !== null}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setRejectTarget(null)}
+      >
+        <Pressable
+          style={styles.rejectBackdrop}
+          onPress={() => (rejecting ? null : setRejectTarget(null))}
+        >
+          <Pressable style={styles.rejectSheet} onPress={() => {}}>
+            <Text style={styles.rejectTitle}>Reject this shift?</Text>
+            {rejectTarget ? (
+              <Text style={styles.rejectMeta}>{rejectTarget.label}</Text>
+            ) : null}
+            <Text style={styles.rejectLabel}>Reason (the employee will see this)</Text>
+            <TextInput
+              style={styles.rejectInput}
+              value={rejectReason}
+              onChangeText={setRejectReason}
+              placeholder="Not scheduled. Please confirm with the foreman."
+              placeholderTextColor={c.textMuted}
+              editable={!rejecting}
+              multiline
+              maxLength={280}
+            />
+            <Text style={styles.rejectNote}>
+              The shift stays on their timesheet so they can correct and
+              resubmit. Nothing is deleted.
+            </Text>
+            <View style={styles.rejectActions}>
+              <TouchableOpacity
+                onPress={() => setRejectTarget(null)}
+                hitSlop={8}
+                disabled={rejecting}
+              >
+                <Text style={styles.rejectCancel}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[
+                  styles.rejectConfirm,
+                  (rejecting || rejectReason.trim().length === 0) &&
+                    styles.rejectConfirmDisabled,
+                ]}
+                onPress={confirmReject}
+                disabled={rejecting || rejectReason.trim().length === 0}
+              >
+                {rejecting ? (
+                  <ActivityIndicator color={c.accentText} />
+                ) : (
+                  <Text style={styles.rejectConfirmText}>Reject shift</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
       {banner ? (
         <TouchableOpacity style={styles.bannerWrap} onPress={() => setBanner(null)}>
           <Text style={styles.bannerText}>{banner}  (tap to dismiss)</Text>
@@ -447,4 +536,56 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
   },
   bannerText: { color: c.accentText, fontSize: 14, textAlign: "center" },
+  rejectBackdrop: {
+    flex: 1,
+    backgroundColor: scrim,
+    justifyContent: "flex-end",
+  },
+  rejectSheet: {
+    backgroundColor: c.bg,
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    padding: 20,
+    paddingBottom: 28,
+  },
+  rejectTitle: { color: c.text, fontSize: 20, fontWeight: "800" },
+  rejectMeta: { color: c.textMuted, fontSize: 14, marginTop: 4, marginBottom: 8 },
+  rejectLabel: {
+    color: c.textMuted,
+    fontSize: 12,
+    fontWeight: "700",
+    letterSpacing: 0.6,
+    textTransform: "uppercase",
+    marginTop: 8,
+    marginBottom: 6,
+  },
+  rejectInput: {
+    backgroundColor: c.surface,
+    borderColor: c.border,
+    borderWidth: 1,
+    borderRadius: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    color: c.text,
+    fontSize: 16,
+    minHeight: 70,
+    textAlignVertical: "top",
+  },
+  rejectNote: { color: c.textMuted, fontSize: 13, lineHeight: 18, marginTop: 12 },
+  rejectActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginTop: 18,
+  },
+  rejectCancel: { color: c.textMuted, fontSize: 16, fontWeight: "600" },
+  rejectConfirm: {
+    backgroundColor: c.accent,
+    borderRadius: 14,
+    paddingVertical: 12,
+    paddingHorizontal: 24,
+    alignItems: "center",
+  },
+  rejectConfirmDisabled: { opacity: 0.5 },
+  rejectConfirmText: { color: c.accentText, fontSize: 16, fontWeight: "700" },
 });
