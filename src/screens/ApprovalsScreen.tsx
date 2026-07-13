@@ -115,11 +115,15 @@ export function ApprovalsScreen() {
   }, [load]);
 
   const decideTimesheets = useCallback(
-    async (ids: string[], action: "approve" | "reject", reason?: string) => {
-      if (ids.length === 0) return;
+    async (
+      ids: string[],
+      action: "approve" | "reject",
+      reason?: string,
+    ): Promise<boolean> => {
+      if (ids.length === 0) return false;
       haptics[action === "approve" ? "success" : "warning"]();
       const token = await getAccessToken();
-      if (!token) return;
+      if (!token) return false;
       setBanner(null);
       const prev = timesheets;
       setTimesheets((ts) => ts.filter((t) => !ids.includes(t.id)));
@@ -128,27 +132,32 @@ export function ApprovalsScreen() {
         if (!res.ok) {
           setTimesheets(prev);
           setBanner(`Couldn't ${action} — try again.`);
+          return false;
         }
+        return true;
       } catch {
         setTimesheets(prev);
         setBanner("No connection — try again.");
+        return false;
       }
     },
     [timesheets],
   );
 
-  // Confirm a reject with its required reason. The row is only removed once the
-  // server accepts it (unlike approve's optimistic path) so a missing reason
-  // can't silently drop it.
+  // Confirm a reject with its required reason. On failure keep the sheet open
+  // with the typed reason so the manager can retry without re-typing; only
+  // dismiss + clear once the server accepts it.
   const confirmReject = useCallback(async () => {
     if (!rejectTarget) return;
     const reason = rejectReason.trim();
     if (reason.length === 0) return;
     setRejecting(true);
-    await decideTimesheets(rejectTarget.ids, "reject", reason);
+    const ok = await decideTimesheets(rejectTarget.ids, "reject", reason);
     setRejecting(false);
-    setRejectTarget(null);
-    setRejectReason("");
+    if (ok) {
+      setRejectTarget(null);
+      setRejectReason("");
+    }
   }, [rejectTarget, rejectReason, decideTimesheets]);
 
   const decideLeave = useCallback(
