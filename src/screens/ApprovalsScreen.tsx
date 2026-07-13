@@ -78,6 +78,10 @@ export function ApprovalsScreen() {
   } | null>(null);
   const [rejectReason, setRejectReason] = useState("");
   const [rejecting, setRejecting] = useState(false);
+  // Shown INSIDE the reject sheet — the global banner is a sibling of the
+  // native <Modal> and would be drawn behind it, so a failed reject needs its
+  // own in-sheet error to be visible.
+  const [rejectError, setRejectError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     const token = await getAccessToken();
@@ -152,11 +156,17 @@ export function ApprovalsScreen() {
     const reason = rejectReason.trim();
     if (reason.length === 0) return;
     setRejecting(true);
+    setRejectError(null);
     const ok = await decideTimesheets(rejectTarget.ids, "reject", reason);
     setRejecting(false);
     if (ok) {
       setRejectTarget(null);
       setRejectReason("");
+      setRejectError(null);
+    } else {
+      // decideTimesheets also set the global banner, but it's occluded by this
+      // sheet — show the error here so the manager actually sees it.
+      setRejectError("Couldn't reject. Check your connection and try again.");
     }
   }, [rejectTarget, rejectReason, decideTimesheets]);
 
@@ -294,6 +304,7 @@ export function ApprovalsScreen() {
                       style={[styles.btn, styles.reject]}
                       onPress={() => {
                         setRejectReason("");
+                        setRejectError(null);
                         setRejectTarget({
                           ids: [t.id],
                           label: `${t.employee} · ${dateShort(t.start)}`,
@@ -434,6 +445,9 @@ export function ApprovalsScreen() {
               The shift stays on their timesheet so they can correct and
               resubmit. Nothing is deleted.
             </Text>
+            {rejectError ? (
+              <Text style={styles.rejectError}>{rejectError}</Text>
+            ) : null}
             <View style={styles.rejectActions}>
               <TouchableOpacity
                 onPress={() => setRejectTarget(null)}
@@ -581,6 +595,13 @@ const styles = StyleSheet.create({
     textAlignVertical: "top",
   },
   rejectNote: { color: c.textMuted, fontSize: 13, lineHeight: 18, marginTop: 12 },
+  rejectError: {
+    color: c.danger,
+    fontSize: 13,
+    fontWeight: "600",
+    lineHeight: 18,
+    marginTop: 12,
+  },
   rejectActions: {
     flexDirection: "row",
     alignItems: "center",
