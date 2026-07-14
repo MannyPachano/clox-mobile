@@ -62,6 +62,9 @@ const ERROR_MESSAGES: Record<string, string> = {
   no_scheduled_shift: "You don't have a scheduled shift right now.",
   too_early: "It's too early for your scheduled shift.",
   nothing_to_stop: "You weren't clocked in.",
+  // Server gates new clock-ins once the org's trial ends with no plan.
+  trial_expired:
+    "Your team's Clox trial has ended. Ask your manager to pick a plan, then you can clock in again.",
 };
 
 function friendly(code: string): string {
