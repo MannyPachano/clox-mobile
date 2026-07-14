@@ -915,16 +915,35 @@ export function ClockScreen({
                   activeOpacity={0.6}
                 >
                   <View style={styles.historyLeft}>
-                    <Text style={styles.historyDate}>
-                      {formatDate(Date.parse(s.start))}
-                    </Text>
+                    <View style={styles.historyDateRow}>
+                      <Text style={styles.historyDate}>
+                        {formatDate(Date.parse(s.start))}
+                      </Text>
+                      {s.rejected ? (
+                        <View style={styles.rejectedBadge}>
+                          <Text style={styles.rejectedBadgeText}>REJECTED</Text>
+                        </View>
+                      ) : null}
+                    </View>
                     <Text style={styles.historySub} numberOfLines={1}>
                       {formatClock(Date.parse(s.start))} –{" "}
                       {formatClock(Date.parse(s.end))}
                       {s.project ? ` · ${s.project}` : ""}
                     </Text>
+                    {s.rejected ? (
+                      <Text style={styles.rejectedReason} numberOfLines={2}>
+                        {s.rejectionReason
+                          ? `“${s.rejectionReason}” — tap to fix and resubmit`
+                          : "Tap to correct and resubmit"}
+                      </Text>
+                    ) : null}
                   </View>
-                  <Text style={styles.historyDur}>
+                  <Text
+                    style={[
+                      styles.historyDur,
+                      s.rejected && styles.historyDurRejected,
+                    ]}
+                  >
                     {formatDuration(s.durationMs)}
                   </Text>
                   <Text style={styles.historyChevron}>›</Text>
@@ -1245,11 +1264,32 @@ const makeStyles = (c: Palette) =>
       borderTopColor: c.border,
     },
     historyLeft: { flex: 1, paddingRight: 12 },
+    historyDateRow: { flexDirection: "row", alignItems: "center", gap: 8 },
     historyDate: { color: c.text, fontSize: 15, fontWeight: "600" },
     historySub: { color: c.textMuted, fontSize: 13, marginTop: 2 },
     upcomingMore: { color: c.textMuted, fontSize: 13, marginTop: 8 },
     historyDur: { color: c.text, fontSize: 15, fontWeight: "700" },
     historyChevron: { color: c.textMuted, fontSize: 18, marginLeft: 8 },
+    // A rejected shift: a red badge by the date, the manager's reason below, and
+    // a struck-through duration — it is not worked time until the employee fixes
+    // it. Tapping the row opens the correction request sheet.
+    rejectedBadge: {
+      backgroundColor: c.danger,
+      borderRadius: 6,
+      paddingHorizontal: 6,
+      paddingVertical: 1,
+    },
+    rejectedBadgeText: {
+      color: c.accentText,
+      fontSize: 10,
+      fontWeight: "700",
+      letterSpacing: 0.4,
+    },
+    rejectedReason: { color: c.danger, fontSize: 13, marginTop: 3 },
+    historyDurRejected: {
+      color: c.textMuted,
+      textDecorationLine: "line-through",
+    },
     offlineHint: {
       color: c.textMuted,
       fontSize: 13,

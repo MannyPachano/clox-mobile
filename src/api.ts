@@ -179,6 +179,10 @@ export type HistoryShift = {
   project: string | null;
   task: string | null;
   note: string | null;
+  /** A manager rejected this shift; the employee needs to correct + resubmit. */
+  rejected: boolean;
+  /** Why it was rejected — shown to the employee so they know what to fix. */
+  rejectionReason: string | null;
 };
 
 export function getHistory(
