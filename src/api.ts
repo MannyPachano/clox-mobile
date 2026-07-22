@@ -444,7 +444,14 @@ export function closeShift(
 
 // ── Manager schedule (planned shifts) ───────────────────────────────────────
 
-export type BoardColor = "clay" | "moss" | "amber";
+export type BoardColor =
+  | "clay"
+  | "moss"
+  | "amber"
+  | "slate"
+  | "plum"
+  | "pine"
+  | "sand";
 
 export type ScheduledShiftDto = {
   id: string;

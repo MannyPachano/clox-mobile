@@ -22,6 +22,13 @@ export type Palette = {
   danger: string;
   border: string;
   warn: string;
+  /* The four extra project board colors (clay/moss/amber map to accent/success
+     /warn). Per-theme so the small board dot stays readable on paper and on the
+     dark surface, the same reason success/warn diverge above. */
+  projSlate: string;
+  projPlum: string;
+  projPine: string;
+  projSand: string;
 };
 
 export const darkColors: Palette = {
@@ -36,6 +43,11 @@ export const darkColors: Palette = {
   danger: "#e2655a",
   border: "#33332d",
   warn: "#e0b15a",
+  // Lighter tones so the dot reads on the dark surface (mirrors web dark).
+  projSlate: "#93a7b8",
+  projPlum: "#b593a6",
+  projPine: "#8fb0a3",
+  projSand: "#c2b083",
 };
 
 export const lightColors: Palette = {
@@ -50,6 +62,11 @@ export const lightColors: Palette = {
   danger: "#bb3b2a", // darker than web danger on purpose: readable on paper
   border: "#ddd5c5",
   warn: "#9a6b15", // darker than web amber on purpose: readable on paper
+  // Deepened on purpose, same reason as success/warn: readable on paper.
+  projSlate: "#47586a",
+  projPlum: "#664459",
+  projPine: "#2f5044",
+  projSand: "#7a6a3f",
 };
 
 /** Shared modal/overlay scrim. ClockScreen may keep its lighter 0.45 locally. */

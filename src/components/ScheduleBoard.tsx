@@ -49,13 +49,17 @@ function clock(iso: string): string {
   return `${h}:${pad(m)} ${ampm}`;
 }
 
-/** The board palette maps the three tokens onto the mobile theme (clay=accent,
- *  moss=success, amber=warn), so a shift's project reads the same hue the web
- *  board tints it. */
+/** The board palette maps the seven tokens onto the mobile theme (clay=accent,
+ *  moss=success, amber=warn, plus four per-theme project colors), so a shift's
+ *  project reads the same hue the web board tints it. */
 function dotColor(color: BoardColor | null): string | null {
   if (color === "clay") return c.accent;
   if (color === "moss") return c.success;
   if (color === "amber") return c.warn;
+  if (color === "slate") return c.projSlate;
+  if (color === "plum") return c.projPlum;
+  if (color === "pine") return c.projPine;
+  if (color === "sand") return c.projSand;
   return null;
 }
 
