@@ -11,6 +11,7 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useFocusEffect } from "@react-navigation/native";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 
 import {
   closeShift,
@@ -21,8 +22,12 @@ import {
 import { AddEntryModal } from "../components/AddEntryModal";
 import { EditEntryModal } from "../components/EditEntryModal";
 import { EmployeeShiftsSheet } from "../components/EmployeeShiftsSheet";
+import { RosterMap } from "../components/RosterMap";
 import { getAccessToken } from "../supabase";
 import { lightColors as c, radii } from "../theme";
+
+type ViewMode = "list" | "map";
+const MODE_KEY = "clox.roster.viewmode.v1";
 
 // Manager screens use the light "paper" theme (the dark on-shift palette is for
 // an employee's own running clock).
@@ -76,6 +81,21 @@ export function RosterScreen() {
     name: string;
   } | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
+  const [mode, setMode] = useState<ViewMode>("list");
+
+  // Restore the last-used List/Map view.
+  useEffect(() => {
+    AsyncStorage.getItem(MODE_KEY)
+      .then((v) => {
+        if (v === "map" || v === "list") setMode(v);
+      })
+      .catch(() => {});
+  }, []);
+
+  const changeMode = useCallback((m: ViewMode) => {
+    setMode(m);
+    AsyncStorage.setItem(MODE_KEY, m).catch(() => {});
+  }, []);
 
   // Stable entry object for EditEntryModal (a fresh literal each render would
   // re-fire its prefill effect on every roster tick).
@@ -267,7 +287,26 @@ export function RosterScreen() {
         </TouchableOpacity>
       </View>
 
-      {loading ? (
+      <View style={styles.segment}>
+        {(["list", "map"] as const).map((m) => (
+          <TouchableOpacity
+            key={m}
+            style={[styles.segmentBtn, mode === m && styles.segmentBtnOn]}
+            onPress={() => changeMode(m)}
+            activeOpacity={0.85}
+            accessibilityRole="button"
+            accessibilityState={{ selected: mode === m }}
+          >
+            <Text style={[styles.segmentText, mode === m && styles.segmentTextOn]}>
+              {m === "list" ? "List" : "Map"}
+            </Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+
+      {mode === "map" ? (
+        <RosterMap />
+      ) : loading ? (
         <View style={styles.center}>
           <ActivityIndicator color={c.accent} size="large" />
         </View>
@@ -358,6 +397,24 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
   },
   addBtnText: { color: c.accentText, fontSize: 14, fontWeight: "700" },
+  segment: {
+    flexDirection: "row",
+    marginHorizontal: 24,
+    marginTop: 4,
+    marginBottom: 4,
+    padding: 3,
+    backgroundColor: c.surfaceAlt,
+    borderRadius: radii.md,
+  },
+  segmentBtn: {
+    flex: 1,
+    alignItems: "center",
+    paddingVertical: 7,
+    borderRadius: radii.sm,
+  },
+  segmentBtnOn: { backgroundColor: c.surface },
+  segmentText: { color: c.textMuted, fontSize: 14, fontWeight: "600" },
+  segmentTextOn: { color: c.text, fontWeight: "700" },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
   list: { paddingHorizontal: 24, paddingBottom: 24 },
   row: {

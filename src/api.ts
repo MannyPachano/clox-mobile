@@ -489,6 +489,53 @@ export function createManagerShift(
   return request("manager/schedule", token, "POST", shift);
 }
 
+// ── Manager roster map (worksites + located punches for a day range) ─────────
+
+export type MapWorksite = {
+  id: string;
+  name: string;
+  latitude: number;
+  longitude: number;
+  radiusM: number;
+};
+
+export type MapPunch = {
+  id: string;
+  userId: string;
+  displayName: string;
+  clockInMs: number;
+  /** null while the worker is still on the clock. */
+  clockOutMs: number | null;
+  projectName: string | null;
+  clockInLatitude: number;
+  clockInLongitude: number;
+};
+
+export type MapRangeData = {
+  from: string;
+  to: string;
+  worksites: MapWorksite[];
+  punches: MapPunch[];
+  /** true when the located-punch list hit the server's 400-pin cap. */
+  truncated: boolean;
+  /** Punches in range with no coordinates (not returned as pins). */
+  noLocationCount: number;
+};
+
+/**
+ * Worksites + located punches for a day range, for the roster map. `from`/`to`
+ * are org-timezone day keys (YYYY-MM-DD); equal values mean a single day.
+ * Mirrors the web worksites map for the same org and range.
+ */
+export function getManagerMapRange(
+  token: string,
+  fromKey: string,
+  toKey: string,
+): Promise<ApiResult<MapRangeData>> {
+  const qs = `from=${encodeURIComponent(fromKey)}&to=${encodeURIComponent(toKey)}`;
+  return request(`manager/map-range?${qs}`, token, "GET");
+}
+
 export function deleteManagerShift(
   token: string,
   id: string,
