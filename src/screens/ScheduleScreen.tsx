@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -11,16 +11,24 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useFocusEffect } from "@react-navigation/native";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import NetInfo from "@react-native-community/netinfo";
 
 import {
   deleteManagerShift,
   getManagerSchedule,
+  updateManagerShift,
   type Option,
   type ScheduledShiftDto,
 } from "../api";
 import { AddShiftModal } from "../components/AddShiftModal";
+import { ScheduleBoard } from "../components/ScheduleBoard";
+import { haptics } from "../lib/haptics";
 import { getAccessToken } from "../supabase";
 import { lightColors as c, radii } from "../theme";
+
+type ViewMode = "list" | "board";
+const MODE_KEY = "clox.schedule.viewmode.v1";
 
 // Manager screens use the light "paper" theme.
 
@@ -67,6 +75,33 @@ export function ScheduleScreen() {
   const [addOpen, setAddOpen] = useState(false);
   const [editShift, setEditShift] = useState<ScheduledShiftDto | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
+  const [mode, setMode] = useState<ViewMode>("list");
+  const [selectedDayKey, setSelectedDayKey] = useState(() => dayKey(new Date()));
+  const [isOffline, setIsOffline] = useState(false);
+
+  const todayKey = useMemo(() => dayKey(new Date()), []);
+
+  // Restore the last-used List/Board view.
+  useEffect(() => {
+    AsyncStorage.getItem(MODE_KEY)
+      .then((v) => {
+        if (v === "board" || v === "list") setMode(v);
+      })
+      .catch(() => {});
+  }, []);
+
+  const changeMode = useCallback((m: ViewMode) => {
+    setMode(m);
+    AsyncStorage.setItem(MODE_KEY, m).catch(() => {});
+  }, []);
+
+  // Manager mutations are online-only; the board blocks a drag when offline.
+  useEffect(() => {
+    const unsub = NetInfo.addEventListener((state) => {
+      setIsOffline(state.isConnected === false);
+    });
+    return unsub;
+  }, []);
 
   const weekStart = useMemo(() => mondayOf(weekOffset), [weekOffset]);
 
@@ -110,6 +145,66 @@ export function ScheduleScreen() {
     }
     return m;
   }, [shifts]);
+
+  const dayKeys = useMemo(() => days.map((d) => d.key), [days]);
+
+  // The board's selected day, clamped to the visible week: derived (not stored
+  // via an effect) so navigating weeks falls back to today / the week's first
+  // day without a cascading setState.
+  const effectiveDayKey = dayKeys.includes(selectedDayKey)
+    ? selectedDayKey
+    : dayKeys.includes(todayKey)
+      ? todayKey
+      : (dayKeys[0] ?? todayKey);
+
+  // Move a shift to another day, keeping its wall-clock time and duration.
+  // Optimistic: the card jumps immediately and rolls back if the save fails.
+  const moveShiftToDay = useCallback(
+    async (shift: ScheduledShiftDto, targetKey: string) => {
+      const token = await getAccessToken();
+      if (!token) return;
+      const start = new Date(shift.startsAt);
+      const durationMs = new Date(shift.endsAt).getTime() - start.getTime();
+      const [ty, tm, td] = targetKey.split("-").map(Number);
+      const newStart = new Date(
+        ty ?? 1970,
+        (tm ?? 1) - 1,
+        td ?? 1,
+        start.getHours(),
+        start.getMinutes(),
+        0,
+        0,
+      );
+      const startIso = newStart.toISOString();
+      const endIso = new Date(newStart.getTime() + durationMs).toISOString();
+
+      const prev = shifts;
+      setShifts((s) =>
+        s.map((x) =>
+          x.id === shift.id ? { ...x, startsAt: startIso, endsAt: endIso } : x,
+        ),
+      );
+      setSelectedDayKey(targetKey);
+      haptics.success();
+      try {
+        const res = await updateManagerShift(token, {
+          id: shift.id,
+          startIso,
+          endIso,
+        });
+        if (!res.ok) {
+          setShifts(prev);
+          setBanner("Couldn't move the shift. Try again.");
+        } else {
+          setBanner("Shift moved.");
+        }
+      } catch {
+        setShifts(prev);
+        setBanner("No connection. Try again.");
+      }
+    },
+    [shifts],
+  );
 
   const load = useCallback(async () => {
     const token = await getAccessToken();
@@ -198,6 +293,28 @@ export function ScheduleScreen() {
         </TouchableOpacity>
       </View>
 
+      <View style={styles.segment}>
+        {(["list", "board"] as const).map((m) => (
+          <TouchableOpacity
+            key={m}
+            style={[styles.segmentBtn, mode === m && styles.segmentBtnOn]}
+            onPress={() => changeMode(m)}
+            activeOpacity={0.85}
+            accessibilityRole="button"
+            accessibilityState={{ selected: mode === m }}
+          >
+            <Text
+              style={[
+                styles.segmentText,
+                mode === m && styles.segmentTextOn,
+              ]}
+            >
+              {m === "list" ? "List" : "Board"}
+            </Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+
       <View style={styles.weekNav}>
         <TouchableOpacity
           onPress={() => setWeekOffset((w) => w - 1)}
@@ -223,6 +340,21 @@ export function ScheduleScreen() {
         <View style={styles.center}>
           <ActivityIndicator color={c.accent} size="large" />
         </View>
+      ) : mode === "board" ? (
+        <ScheduleBoard
+          dayKeys={dayKeys}
+          todayKey={todayKey}
+          byDay={byDay}
+          selectedDayKey={effectiveDayKey}
+          onSelectDay={setSelectedDayKey}
+          draggable={!isOffline}
+          onEditShift={(s) => setEditShift(s)}
+          onMoveShift={(s, targetKey) => void moveShiftToDay(s, targetKey)}
+          onOfflineBlocked={() => {
+            haptics.warning();
+            setBanner("Offline — connect to move shifts.");
+          }}
+        />
       ) : (
         <ScrollView
           contentContainerStyle={styles.body}
@@ -325,6 +457,23 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
   },
   addBtnText: { color: c.accentText, fontSize: 14, fontWeight: "700" },
+  segment: {
+    flexDirection: "row",
+    marginHorizontal: 24,
+    marginTop: 4,
+    padding: 3,
+    backgroundColor: c.surfaceAlt,
+    borderRadius: radii.md,
+  },
+  segmentBtn: {
+    flex: 1,
+    alignItems: "center",
+    paddingVertical: 7,
+    borderRadius: radii.sm,
+  },
+  segmentBtnOn: { backgroundColor: c.surface },
+  segmentText: { color: c.textMuted, fontSize: 14, fontWeight: "600" },
+  segmentTextOn: { color: c.text, fontWeight: "700" },
   weekNav: {
     flexDirection: "row",
     alignItems: "center",

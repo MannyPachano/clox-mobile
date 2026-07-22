@@ -444,6 +444,8 @@ export function closeShift(
 
 // ── Manager schedule (planned shifts) ───────────────────────────────────────
 
+export type BoardColor = "clay" | "moss" | "amber";
+
 export type ScheduledShiftDto = {
   id: string;
   employeeUserId: string;
@@ -451,6 +453,10 @@ export type ScheduledShiftDto = {
   startsAt: string;
   endsAt: string;
   isSeries: boolean;
+  /** The project the shift is tagged with, if any — powers the day board's
+   *  color dot. null when unset or the project has no color. */
+  projectName: string | null;
+  projectColor: BoardColor | null;
 };
 
 export function getManagerSchedule(
