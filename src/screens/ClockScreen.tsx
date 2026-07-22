@@ -1,12 +1,4 @@
-import {
-  lazy,
-  Suspense,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -39,14 +31,7 @@ import {
 import { precheckGeofence, type Fence } from "../geofence";
 import { haptics } from "../lib/haptics";
 import { SelectField } from "../components/SelectField";
-// Lazily loaded: pulls in expo-camera, which is heavy to initialize. Kept off
-// the ClockScreen mount path (Part D) — it evaluates only when a selfie is
-// first opened (the component is mounted only while cameraOpen).
-const SelfieCapture = lazy(() =>
-  import("../components/SelfieCapture").then((m) => ({
-    default: m.SelfieCapture,
-  })),
-);
+import { SelfieCapture } from "../components/SelfieCapture";
 import { EditEntryModal } from "../components/EditEntryModal";
 import { RequestEditModal } from "../components/RequestEditModal";
 import { Wordmark } from "../components/Wordmark";
@@ -979,17 +964,11 @@ export function ClockScreen({
           </Text>
         </ScrollView>
 
-        {/* Mounted only while open, so expo-camera is loaded on first selfie,
-            not at ClockScreen mount (Part D). */}
-        {cameraOpen ? (
-          <Suspense fallback={null}>
-            <SelfieCapture
-              visible
-              onCancel={() => setCameraOpen(false)}
-              onUse={onSelfieUse}
-            />
-          </Suspense>
-        ) : null}
+        <SelfieCapture
+          visible={cameraOpen}
+          onCancel={() => setCameraOpen(false)}
+          onUse={onSelfieUse}
+        />
 
         <EditEntryModal
           visible={editShift !== null}

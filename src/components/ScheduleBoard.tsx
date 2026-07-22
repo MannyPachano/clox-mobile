@@ -288,6 +288,10 @@ function DraggableShiftCard({
     }
   };
 
+  // Clear any pending pre-arm long-press timer if the card unmounts (a move
+  // re-renders the day list), so a leaked timeout never lifts a gone card.
+  useEffect(() => () => clearTimer(), []);
+
   const reset = () => {
     Animated.spring(pan, {
       toValue: { x: 0, y: 0 },
@@ -384,7 +388,19 @@ function DraggableShiftCard({
       ]}
     >
       <Pressable
-        onPress={onPress}
+        onPress={() => {
+          // If the long-press armed but the finger lifted WITHOUT moving, the
+          // parent PanResponder was never granted (it only claims on a move),
+          // so this Pressable still gets the press. Treat it as a cancelled
+          // lift — clear the parent's dragging highlight and do NOT open the
+          // edit sheet. A normal tap never arms, so it still edits.
+          if (armed.current) {
+            armed.current = false;
+            onCancel();
+            return;
+          }
+          onPress();
+        }}
         style={styles.cardPress}
         accessibilityRole="button"
         accessibilityLabel={`${shift.employeeName}, ${clock(shift.startsAt)} to ${clock(shift.endsAt)}${

@@ -178,7 +178,11 @@ export function ScheduleScreen() {
       const startIso = newStart.toISOString();
       const endIso = new Date(newStart.getTime() + durationMs).toISOString();
 
-      const prev = shifts;
+      // Roll back by shift id (not a whole-array snapshot) so a concurrent
+      // refetch/add/delete during the in-flight save isn't clobbered. Restore
+      // the day the user was viewing (the shift's source day) so a failed move
+      // doesn't strand them on the now-empty target day.
+      const sourceKey = dayKey(start);
       setShifts((s) =>
         s.map((x) =>
           x.id === shift.id ? { ...x, startsAt: startIso, endsAt: endIso } : x,
@@ -186,6 +190,16 @@ export function ScheduleScreen() {
       );
       setSelectedDayKey(targetKey);
       haptics.success();
+      const rollback = () => {
+        setShifts((s) =>
+          s.map((x) =>
+            x.id === shift.id
+              ? { ...x, startsAt: shift.startsAt, endsAt: shift.endsAt }
+              : x,
+          ),
+        );
+        setSelectedDayKey(sourceKey);
+      };
       try {
         const res = await updateManagerShift(token, {
           id: shift.id,
@@ -193,17 +207,17 @@ export function ScheduleScreen() {
           endIso,
         });
         if (!res.ok) {
-          setShifts(prev);
+          rollback();
           setBanner("Couldn't move the shift. Try again.");
         } else {
           setBanner("Shift moved.");
         }
       } catch {
-        setShifts(prev);
+        rollback();
         setBanner("No connection. Try again.");
       }
     },
-    [shifts],
+    [],
   );
 
   const load = useCallback(async () => {

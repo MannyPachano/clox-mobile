@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Platform,
@@ -136,6 +136,11 @@ export function RosterMap() {
   const [data, setData] = useState<MapRangeData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
+  // react-native-maps only snapshots a custom marker View while
+  // tracksViewChanges is true; left false from mount the dots/initials render
+  // blank. Keep it true briefly (each time the pins change) so they paint, then
+  // flip it off for scroll/zoom performance.
+  const [trackMarkers, setTrackMarkers] = useState(true);
 
   const range = useMemo(() => computeRange(mode), [mode]);
 
@@ -169,6 +174,14 @@ export function RosterMap() {
   );
 
   const region = useMemo(() => (data ? boundsRegion(data) : null), [data]);
+
+  // Re-enable marker snapshotting when the pins change, then turn it off after
+  // they've painted so scroll/zoom stays cheap.
+  useEffect(() => {
+    setTrackMarkers(true);
+    const id = setTimeout(() => setTrackMarkers(false), 1500);
+    return () => clearTimeout(id);
+  }, [data]);
 
   if (!Maps) {
     return (
@@ -215,7 +228,6 @@ export function RosterMap() {
           <MapView
             style={StyleSheet.absoluteFill}
             initialRegion={region}
-            region={region}
             showsUserLocation={false}
             toolbarEnabled={false}
           >
@@ -239,7 +251,7 @@ export function RosterMap() {
                     longitude: p.clockInLongitude,
                   }}
                   anchor={{ x: 0.5, y: 0.5 }}
-                  tracksViewChanges={false}
+                  tracksViewChanges={trackMarkers}
                 >
                   {onClock ? (
                     <View style={styles.initialsPin}>

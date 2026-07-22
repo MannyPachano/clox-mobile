@@ -71,35 +71,31 @@ export default function App() {
     return () => task.cancel();
   }, [session]);
 
-  // Cold-start fast path: seed the role from the last-good snapshot so the
-  // correct shell (ClockScreen vs ManagerTabs) paints from local disk without
-  // waiting on the network getStatus below. Same user only; the functional
-  // update never clobbers a live getStatus result that already arrived.
-  useEffect(() => {
-    if (!session) return;
-    let cancelled = false;
-    void readBootSnapshot().then((snap) => {
-      if (cancelled || !snap || snap.userId !== session.user.id) return;
-      setRole((cur) => (cur === null ? snap.role : cur));
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [session]);
-
-  // Resolve the user's role (manager vs employee) authoritatively, and refresh
-  // the snapshot. A failed/offline fetch keeps whatever the snapshot already
-  // seeded (so an offline manager isn't demoted to the employee shell), falling
-  // back to "employee" only when there was no snapshot at all.
+  // Resolve the user's role. One SEQUENTIAL effect (not two racing ones): seed
+  // the shell from the last-good snapshot first — same user only, so the cold
+  // start paints ClockScreen vs ManagerTabs from local disk without waiting on
+  // the network — then reconcile with the authoritative getStatus. A failed/
+  // offline status keeps the seeded role (an offline manager is never demoted
+  // to the employee shell), falling back to "employee" only when nothing was
+  // seeded. Sequencing the two writers removes the race where the offline
+  // fallback could beat the snapshot seed.
   useEffect(() => {
     if (!session) {
       setRole(null);
       return;
     }
     let cancelled = false;
-    void getAccessToken().then(async (t) => {
+    void (async () => {
+      const snap = await readBootSnapshot();
+      if (cancelled) return;
+      const seeded =
+        snap && snap.userId === session.user.id ? snap.role : null;
+      if (seeded) setRole((cur) => cur ?? seeded);
+
+      const t = await getAccessToken();
+      if (cancelled) return;
       if (!t) {
-        if (!cancelled) setRole((cur) => cur ?? "employee");
+        setRole((cur) => cur ?? seeded ?? "employee");
         return;
       }
       try {
@@ -113,12 +109,12 @@ export default function App() {
             role: res.data.user.role,
           });
         } else {
-          setRole((cur) => cur ?? "employee");
+          setRole((cur) => cur ?? seeded ?? "employee");
         }
       } catch {
-        if (!cancelled) setRole((cur) => cur ?? "employee");
+        if (!cancelled) setRole((cur) => cur ?? seeded ?? "employee");
       }
-    });
+    })();
     return () => {
       cancelled = true;
     };
