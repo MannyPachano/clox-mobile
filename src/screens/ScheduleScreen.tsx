@@ -48,7 +48,7 @@ function dayKey(d: Date): string {
 
 function clock(iso: string): string {
   const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "—:—";
+  if (Number.isNaN(d.getTime())) return "--:--";
   let h = d.getHours();
   const m = d.getMinutes();
   const ampm = h >= 12 ? "PM" : "AM";
@@ -132,7 +132,7 @@ export function ScheduleScreen() {
       end.getMonth() === weekStart.getMonth()
         ? `${end.getDate()}`
         : `${MONTHS[end.getMonth()]} ${end.getDate()}`;
-    return `${a} – ${b}`;
+    return `${a} to ${b}`;
   }, [weekStart]);
 
   const byDay = useMemo(() => {
@@ -275,11 +275,11 @@ export function ScheduleScreen() {
 
   const confirmDelete = useCallback(
     (shift: ScheduledShiftDto) => {
-      const when = `${clock(shift.startsAt)}–${clock(shift.endsAt)}`;
+      const when = `${clock(shift.startsAt)} to ${clock(shift.endsAt)}`;
       Alert.alert(
         "Remove shift?",
         shift.isSeries
-          ? `${shift.employeeName}, ${when}. This removes only this one shift — edit the full repeating series on the web.`
+          ? `${shift.employeeName}, ${when}. This removes only this one shift. Edit the full repeating series on the web.`
           : `${shift.employeeName}, ${when}.`,
         [
           { text: "Cancel", style: "cancel" },
@@ -366,7 +366,7 @@ export function ScheduleScreen() {
           onMoveShift={(s, targetKey) => void moveShiftToDay(s, targetKey)}
           onOfflineBlocked={() => {
             haptics.warning();
-            setBanner("Offline — connect to move shifts.");
+            setBanner("Offline. Connect to move shifts.");
           }}
         />
       ) : (
@@ -408,7 +408,7 @@ export function ScheduleScreen() {
                           ) : null}
                         </Text>
                         <Text style={styles.when}>
-                          {clock(s.startsAt)} – {clock(s.endsAt)}
+                          {clock(s.startsAt)} to {clock(s.endsAt)}
                         </Text>
                       </View>
                       <Text style={styles.remove}>›</Text>

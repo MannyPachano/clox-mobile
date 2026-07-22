@@ -187,7 +187,7 @@ export function ScheduleBoard({
       <Text style={styles.hint}>
         {draggable
           ? "Hold a shift, then drag it onto a day to move it."
-          : "Offline — connect to move shifts."}
+          : "Offline. Connect to move shifts."}
       </Text>
 
       <ScrollView
@@ -409,7 +409,7 @@ function DraggableShiftCard({
       >
         <View style={styles.cardMain}>
           <Text style={styles.cardTime}>
-            {clock(shift.startsAt)} – {clock(shift.endsAt)}
+            {clock(shift.startsAt)} to {clock(shift.endsAt)}
           </Text>
           {shift.projectName ? (
             <View style={styles.cardProjectRow}>

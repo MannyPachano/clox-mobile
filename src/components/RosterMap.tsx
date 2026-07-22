@@ -223,6 +223,12 @@ export function RosterMap() {
         ))}
       </View>
 
+      {/* Help for the range control, mirroring the web worksites tour copy. */}
+      <Text style={styles.rangeHelp}>
+        Day, Week, Month, or Custom. The map shows the punches that happened
+        inside it.
+      </Text>
+
       <View style={styles.mapWrap}>
         {region ? (
           <MapView
@@ -341,6 +347,13 @@ const styles = StyleSheet.create({
   segmentBtnOn: { backgroundColor: c.surface },
   segmentText: { color: c.textMuted, fontSize: 13, fontWeight: "600" },
   segmentTextOn: { color: c.text, fontWeight: "700" },
+  rangeHelp: {
+    color: c.textMuted,
+    fontSize: 11,
+    paddingHorizontal: 24,
+    paddingTop: 8,
+    lineHeight: 15,
+  },
   mapWrap: {
     flex: 1,
     marginHorizontal: 24,
