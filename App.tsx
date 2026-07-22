@@ -1,11 +1,21 @@
 import { useEffect, useState } from "react";
-import { ActivityIndicator, StyleSheet, View } from "react-native";
+import {
+  ActivityIndicator,
+  InteractionManager,
+  StyleSheet,
+  View,
+} from "react-native";
 import { StatusBar } from "expo-status-bar";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import type { Session } from "@supabase/supabase-js";
 
 import { getStatus } from "./src/api";
+import {
+  clearBootSnapshot,
+  readBootSnapshot,
+  writeBootSnapshot,
+} from "./src/boot-snapshot";
 import { ErrorBoundary } from "./src/components/ErrorBoundary";
 import { installErrorReporting } from "./src/error-reporting";
 import { ManagerTabs } from "./src/navigation/ManagerTabs";
@@ -48,17 +58,39 @@ export default function App() {
     return () => sub.subscription.unsubscribe();
   }, []);
 
-  // Register this device for push once signed in. No-op in Expo Go / without an
-  // EAS dev build (see src/push.ts), so it never affects the current setup.
+  // Register this device for push once signed in. Deferred behind
+  // InteractionManager so it never competes with the first render. No-op in
+  // Expo Go / without an EAS dev build (see src/push.ts).
   useEffect(() => {
     if (!session) return;
-    void getAccessToken().then((t) => {
-      if (t) void registerForPush(t);
+    const task = InteractionManager.runAfterInteractions(() => {
+      void getAccessToken().then((t) => {
+        if (t) void registerForPush(t);
+      });
     });
+    return () => task.cancel();
   }, [session]);
 
-  // Resolve the user's role (manager vs employee) to pick the right shell.
-  // Defaults to "employee" if it can't be fetched (e.g. offline).
+  // Cold-start fast path: seed the role from the last-good snapshot so the
+  // correct shell (ClockScreen vs ManagerTabs) paints from local disk without
+  // waiting on the network getStatus below. Same user only; the functional
+  // update never clobbers a live getStatus result that already arrived.
+  useEffect(() => {
+    if (!session) return;
+    let cancelled = false;
+    void readBootSnapshot().then((snap) => {
+      if (cancelled || !snap || snap.userId !== session.user.id) return;
+      setRole((cur) => (cur === null ? snap.role : cur));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [session]);
+
+  // Resolve the user's role (manager vs employee) authoritatively, and refresh
+  // the snapshot. A failed/offline fetch keeps whatever the snapshot already
+  // seeded (so an offline manager isn't demoted to the employee shell), falling
+  // back to "employee" only when there was no snapshot at all.
   useEffect(() => {
     if (!session) {
       setRole(null);
@@ -67,17 +99,24 @@ export default function App() {
     let cancelled = false;
     void getAccessToken().then(async (t) => {
       if (!t) {
-        if (!cancelled) setRole("employee");
+        if (!cancelled) setRole((cur) => cur ?? "employee");
         return;
       }
       try {
         const res = await getStatus(t);
-        if (!cancelled) {
-          setRole(res.ok ? res.data.user.role : "employee");
-          if (res.ok) setTutorialDone(res.data.tutorialCompleted);
+        if (cancelled) return;
+        if (res.ok) {
+          setRole(res.data.user.role);
+          setTutorialDone(res.data.tutorialCompleted);
+          void writeBootSnapshot({
+            userId: session.user.id,
+            role: res.data.user.role,
+          });
+        } else {
+          setRole((cur) => cur ?? "employee");
         }
       } catch {
-        if (!cancelled) setRole("employee");
+        if (!cancelled) setRole((cur) => cur ?? "employee");
       }
     });
     return () => {
@@ -101,6 +140,7 @@ export default function App() {
       }
     }
     await clearQueue();
+    await clearBootSnapshot();
     await supabase.auth.signOut();
   };
 

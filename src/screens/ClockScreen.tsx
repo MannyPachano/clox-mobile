@@ -1,8 +1,17 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   ActivityIndicator,
   Alert,
   AppState,
+  InteractionManager,
   Modal,
   ScrollView,
   StyleSheet,
@@ -30,7 +39,14 @@ import {
 import { precheckGeofence, type Fence } from "../geofence";
 import { haptics } from "../lib/haptics";
 import { SelectField } from "../components/SelectField";
-import { SelfieCapture } from "../components/SelfieCapture";
+// Lazily loaded: pulls in expo-camera, which is heavy to initialize. Kept off
+// the ClockScreen mount path (Part D) — it evaluates only when a selfie is
+// first opened (the component is mounted only while cameraOpen).
+const SelfieCapture = lazy(() =>
+  import("../components/SelfieCapture").then((m) => ({
+    default: m.SelfieCapture,
+  })),
+);
 import { EditEntryModal } from "../components/EditEntryModal";
 import { RequestEditModal } from "../components/RequestEditModal";
 import { Wordmark } from "../components/Wordmark";
@@ -235,9 +251,14 @@ export function ClockScreen({
 
   useEffect(() => {
     void refresh();
-    void sync();
     // Warm the GPS on open so the first clock-in doesn't wait on a cold fix.
     void warmUpLocation();
+    // Draining the offline punch queue is non-critical boot work — defer it
+    // past the first render (Part D) so it never competes with paint.
+    const task = InteractionManager.runAfterInteractions(() => {
+      void sync();
+    });
+    return () => task.cancel();
   }, [refresh, sync]);
 
   const didFocusMountRef = useRef(false);
@@ -958,11 +979,17 @@ export function ClockScreen({
           </Text>
         </ScrollView>
 
-        <SelfieCapture
-          visible={cameraOpen}
-          onCancel={() => setCameraOpen(false)}
-          onUse={onSelfieUse}
-        />
+        {/* Mounted only while open, so expo-camera is loaded on first selfie,
+            not at ClockScreen mount (Part D). */}
+        {cameraOpen ? (
+          <Suspense fallback={null}>
+            <SelfieCapture
+              visible
+              onCancel={() => setCameraOpen(false)}
+              onUse={onSelfieUse}
+            />
+          </Suspense>
+        ) : null}
 
         <EditEntryModal
           visible={editShift !== null}
