@@ -159,7 +159,18 @@ function colocatedMetres(spanLatDelta: number): number {
     : Math.min(60, Math.max(15, proportional));
 }
 
-type PunchCluster<T> = { lat: number; lng: number; members: T[] };
+type PunchCluster<T> = {
+  /** Stable across renders that do not regroup, so React does not remount a
+   *  cluster (and lose its snapshot) on every idle pan. */
+  key: string;
+  lat: number;
+  lng: number;
+  /** The members' own extent, so tapping can frame the real group rather than
+   *  a fixed box around its centre. */
+  spanLat: number;
+  spanLng: number;
+  members: T[];
+};
 
 /**
  * Decide how punches should be drawn: individual pins, fanned apart when they
@@ -218,20 +229,40 @@ function presentColocated<
     }
     if (spanLatDelta > FAN_MAX_SPAN_LAT) {
       // Zoomed out: one honest counted pin at the group's centre.
-      const lat =
-        group.reduce((sum, q) => sum + q.clockInLatitude, 0) / group.length;
-      const lng =
-        group.reduce((sum, q) => sum + q.clockInLongitude, 0) / group.length;
-      clusters.push({ lat, lng, members: group });
+      const lats = group.map((q) => q.clockInLatitude);
+      const lngs = group.map((q) => q.clockInLongitude);
+      const lat = lats.reduce((a, b) => a + b, 0) / group.length;
+      const lng = lngs.reduce((a, b) => a + b, 0) / group.length;
+      clusters.push({
+        key: `cluster-${lat.toFixed(5)},${lng.toFixed(5)}-${group.length}`,
+        lat,
+        lng,
+        spanLat: Math.max(...lats) - Math.min(...lats),
+        spanLng: Math.max(...lngs) - Math.min(...lngs),
+        members: group,
+      });
       continue;
     }
-    // Zoomed in: fan, in metres, hard capped both ways.
-    const base = Math.min(
+    // Zoomed in: fan, in metres, capped from both ends.
+    //
+    // The floor decays with the span rather than sitting at a fixed 18 m. A
+    // constant floor is a growing lie as you zoom in: at a 50 m view it pushes
+    // a pin a third of the screen off its real spot, and straight out of the
+    // worksite circle drawn on the same map. Nothing may exceed a quarter of
+    // the visible height, so the offset always reads as a nudge.
+    const ceiling = Math.min(
       FAN_RADIUS_CAP_M,
-      Math.max(18, spanLatDelta * M_PER_DEG_LAT * 0.06),
+      spanLatDelta * M_PER_DEG_LAT * 0.25,
+    );
+    const base = Math.min(
+      ceiling,
+      Math.max(
+        Math.min(18, spanLatDelta * M_PER_DEG_LAT * 0.06),
+        spanLatDelta * M_PER_DEG_LAT * 0.06,
+      ),
     );
     const radiusM = Math.min(
-      FAN_RADIUS_CAP_M,
+      ceiling,
       base * Math.min(2, Math.max(1, group.length / 6)),
     );
     group.forEach((q, i) => {
@@ -491,7 +522,11 @@ export function RosterMap() {
       const res = await getManagerMapRange(token, range.fromKey, range.toKey);
       if (res.ok) {
         setData(res.data);
-        setViewSpan(null);
+        // Deliberately NOT clearing viewSpan here. The MapView is uncontrolled
+        // (initialRegion applies at mount only), so a reload leaves the camera
+        // exactly where it was. Clearing it would fall back to the new data's
+        // fit and decide cluster-or-fan from a span nobody is looking at,
+        // drawing counted clusters over a street-level view.
       } else {
         // Drop the old pins. Keeping them would leave the previous range's
         // punches on screen under a line naming the range that just failed,
@@ -552,13 +587,25 @@ export function RosterMap() {
     [data, visiblePunches, region, viewSpan],
   );
 
-  // Re-enable marker snapshotting when the pins change, then turn it off after
-  // they've painted so scroll/zoom stays cheap.
+  /**
+   * Identity of the markers currently drawn. Keyed on this rather than on
+   * `data`, because the drawn set now changes on ZOOM (a group flips between
+   * one counted cluster and several fanned pins) and on the Who filter, not
+   * only when a new range arrives. A marker mounted while tracksViewChanges is
+   * false is never snapshotted and paints blank, which is the bug fd1acce
+   * already fixed once for punch pins and which clusters reintroduced.
+   */
+  const markerIdentity = `${activeWhoId ?? "all"}|${fannedPunches.length}|${clusters
+    .map((cl) => cl.key)
+    .join(",")}`;
+
+  // Re-enable marker snapshotting when the drawn set changes, then turn it off
+  // after they have painted so scroll/zoom stays cheap.
   useEffect(() => {
     setTrackMarkers(true);
     const id = setTimeout(() => setTrackMarkers(false), 1500);
     return () => clearTimeout(id);
-  }, [data]);
+  }, [markerIdentity]);
 
   if (!Maps) {
     return (
@@ -574,11 +621,16 @@ export function RosterMap() {
   const MapView = Maps.default;
   const { Marker, Circle, Callout } = Maps;
 
+  // Both of these describe the RANGE as the server returned it, before the Who
+  // filter narrowed the map. Left unqualified while a person is selected they
+  // read as being about that person, which they are not.
   const noLocationLine =
     data && data.noLocationCount > 0
       ? `${data.noLocationCount} ${
           data.noLocationCount === 1 ? "punch" : "punches"
-        } in this range ${data.noLocationCount === 1 ? "has" : "have"} no location.`
+        } in this range ${
+          data.noLocationCount === 1 ? "has" : "have"
+        } no location${activeWhoId ? ", across the whole team" : ""}.`
       : null;
 
   return (
@@ -678,21 +730,36 @@ export function RosterMap() {
                 truth. */}
             {clusters.map((cl) => (
               <Marker
-                key={`cluster-${cl.lat.toFixed(5)},${cl.lng.toFixed(5)}-${cl.members.length}`}
+                key={cl.key}
                 coordinate={{ latitude: cl.lat, longitude: cl.lng }}
                 anchor={{ x: 0.5, y: 0.5 }}
                 tracksViewChanges={trackMarkers}
-                onPress={() =>
+                onPress={() => {
+                  // Frame the members, not a fixed box around their centre: a
+                  // chained group can be far wider than any constant, and its
+                  // centroid is not where anybody clocked in. Capped just under
+                  // the cluster threshold so the tap always lands in fan mode;
+                  // a group too wide to fit simply breaks into smaller
+                  // clusters, which is the next tap.
+                  const pad = 1.4;
+                  const latDelta = Math.min(
+                    FAN_MAX_SPAN_LAT * 0.9,
+                    Math.max(cl.spanLat * pad, 0.004),
+                  );
+                  const lngDelta = Math.min(
+                    FAN_MAX_SPAN_LAT * 0.9,
+                    Math.max(cl.spanLng * pad, 0.004),
+                  );
                   mapRef.current?.animateToRegion(
                     {
                       latitude: cl.lat,
                       longitude: cl.lng,
-                      latitudeDelta: FAN_MAX_SPAN_LAT / 3,
-                      longitudeDelta: FAN_MAX_SPAN_LAT / 3,
+                      latitudeDelta: latDelta,
+                      longitudeDelta: lngDelta,
                     },
                     300,
-                  )
-                }
+                  );
+                }}
               >
                 <View style={styles.clusterPin}>
                   <Text style={styles.clusterText}>{cl.members.length}</Text>
@@ -785,8 +852,11 @@ export function RosterMap() {
           keeps the FIRST 400. */}
       {data?.truncated ? (
         <Text style={styles.capBanner}>
-          Showing the first 400 located punches in this range. Narrow the range
-          to see the rest.
+          Showing the first 400 located punches in this range.{" "}
+          {activeWhoId
+            ? "That cap is counted across everyone, so some of this person's punches may be missing. "
+            : ""}
+          Narrow the range to see the rest.
         </Text>
       ) : null}
       {noLocationLine ? (
