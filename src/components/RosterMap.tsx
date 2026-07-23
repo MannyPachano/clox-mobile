@@ -13,9 +13,10 @@ import { useFocusEffect } from "@react-navigation/native";
 import DateTimePicker from "@react-native-community/datetimepicker";
 import type { Region } from "react-native-maps";
 
-import { getManagerMapRange, type MapRangeData } from "../api";
+import { getManagerMapRange, type MapRangeData, type Option } from "../api";
 import { getAccessToken } from "../supabase";
 import { lightColors as c, radii, scrim } from "../theme";
+import { SelectField } from "./SelectField";
 
 // react-native-maps is the app's only heavy native map dependency. It is
 // require()d lazily (below, on first render of this component behind the Map
@@ -133,8 +134,19 @@ function metresApart(
   return Math.hypot(dLat, dLng);
 }
 
-/** Two punches this close are "the same spot" for pin purposes. */
-const COLOCATED_M = 15;
+/**
+ * How close two punches have to be to count as the same spot.
+ *
+ * This is a question about pixels, not metres, so it scales with what is on
+ * screen. A fixed metre threshold was the bug behind pins that still stacked:
+ * two people at one worksite land 20 to 40m apart on GPS scatter, which at
+ * month zoom is a few pixels, i.e. plainly overlapping, but any fixed
+ * threshold tight enough to mean "same spot" is far too tight to catch it.
+ * About 4% of the visible height is roughly a pin's width at any zoom.
+ */
+function colocatedMetres(spanLatDelta: number): number {
+  return Math.max(15, spanLatDelta * M_PER_DEG_LAT * 0.04);
+}
 
 /**
  * Spread punches that share a spot so each one stays its own tappable pin.
@@ -156,8 +168,9 @@ const COLOCATED_M = 15;
 function fanColocated<
   T extends { clockInLatitude: number; clockInLongitude: number },
 >(punches: T[], spanLatDelta: number): (T & { fanLat: number; fanLng: number })[] {
-  // Single-link grouping: each punch joins the first group it is within
-  // COLOCATED_M of, so a straddling pair still lands together.
+  // Single-link grouping: each punch joins the first group it is close enough
+  // to, so a straggler on the edge still lands with the rest.
+  const nearM = colocatedMetres(spanLatDelta);
   const groups: T[][] = [];
   for (const p of punches) {
     const hit = groups.find((g) =>
@@ -167,21 +180,18 @@ function fanColocated<
           p.clockInLongitude,
           q.clockInLatitude,
           q.clockInLongitude,
-        ) <= COLOCATED_M,
+        ) <= nearM,
       ),
     );
     if (hit) hit.push(p);
     else groups.push([p]);
   }
 
-  // About 6% of the visible height: far enough apart to read as separate pins
-  // at the zoom `boundsRegion` opens at, and it keeps that proportion as the
-  // range widens. Clamped so a single worksite does not fling pins across the
-  // county, and a very tight span still separates them.
-  const base = Math.min(
-    260,
-    Math.max(18, spanLatDelta * M_PER_DEG_LAT * 0.06),
-  );
+  // About 6% of the visible height: far enough apart to read as separate pins,
+  // and it stays that way at every zoom because the caller re-fans whenever the
+  // region settles. No absolute cap: one would sit below the grouping distance
+  // at wide zooms and put the pins back on top of each other.
+  const base = Math.max(18, spanLatDelta * M_PER_DEG_LAT * 0.06);
 
   const out: (T & { fanLat: number; fanLng: number })[] = [];
   for (const group of groups) {
@@ -321,6 +331,10 @@ function CustomRangeSheet({
                 value={from}
                 mode="date"
                 display="compact"
+                // Pinned, like TimeField. Left to the system it renders white
+                // text on this always-light sheet whenever the phone is in
+                // dark mode.
+                themeVariant="light"
                 onChange={(_e, d) => d && setFrom(d)}
                 style={styles.iosPicker}
               />
@@ -352,6 +366,7 @@ function CustomRangeSheet({
                 value={to}
                 mode="date"
                 display="compact"
+                themeVariant="light"
                 onChange={(_e, d) => d && setTo(d)}
                 style={styles.iosPicker}
               />
@@ -420,6 +435,15 @@ export function RosterMap() {
     toKey: string;
   } | null>(null);
   const [customOpen, setCustomOpen] = useState(false);
+  // The span actually on screen, which is the initial fit until the manager
+  // pans or zooms. The fan is recomputed from it, so pins stay separated when
+  // zoomed out and settle back onto their real spots when zoomed in. Fanning
+  // once from the opening region would leave a pin hundreds of metres from its
+  // punch at street level, which the privacy caption says never happens.
+  const [viewSpan, setViewSpan] = useState<number | null>(null);
+  // Whose pins to show. The web map has the same control; without it a busy
+  // month is a pile of pins with no way to ask "where was Diego?".
+  const [whoId, setWhoId] = useState<string | null>(null);
 
   const range = useMemo(() => computeRange(mode, custom), [mode, custom]);
 
@@ -436,6 +460,7 @@ export function RosterMap() {
       const res = await getManagerMapRange(token, range.fromKey, range.toKey);
       if (res.ok) {
         setData(res.data);
+        setViewSpan(null);
       } else {
         // Drop the old pins. Keeping them would leave the previous range's
         // punches on screen under a line naming the range that just failed,
@@ -461,10 +486,39 @@ export function RosterMap() {
   );
 
   const region = useMemo(() => (data ? boundsRegion(data) : null), [data]);
+  const people = useMemo<Option[]>(() => {
+    if (!data) return [];
+    const byId = new Map<string, string>();
+    for (const p of data.punches) byId.set(p.userId, p.displayName);
+    return [...byId.entries()]
+      .map(([id, name]) => ({ id, name }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [data]);
+
+  // A name that leaves the range (or a range with no punches for them) must not
+  // strand the map on an empty filter.
+  const activeWhoId =
+    whoId && people.some((o) => o.id === whoId) ? whoId : null;
+
+  const visiblePunches = useMemo(
+    () =>
+      data
+        ? activeWhoId
+          ? data.punches.filter((p) => p.userId === activeWhoId)
+          : data.punches
+        : [],
+    [data, activeWhoId],
+  );
+
   const fannedPunches = useMemo(
     () =>
-      data ? fanColocated(data.punches, region?.latitudeDelta ?? 0.01) : [],
-    [data, region],
+      data
+        ? fanColocated(
+            visiblePunches,
+            viewSpan ?? region?.latitudeDelta ?? 0.01,
+          )
+        : [],
+    [data, visiblePunches, region, viewSpan],
   );
 
   // Re-enable marker snapshotting when the pins change, then turn it off after
@@ -531,6 +585,21 @@ export function RosterMap() {
         inside it.
       </Text>
 
+      {/* Whose punches. Only worth showing once more than one person has any:
+          a one-person list is a control with no choice in it. */}
+      {people.length > 1 ? (
+        <View style={styles.whoWrap}>
+          <SelectField
+            label="Who"
+            value={activeWhoId}
+            options={people}
+            placeholder="Everyone"
+            noneLabel="Everyone"
+            onSelect={setWhoId}
+          />
+        </View>
+      ) : null}
+
       {/* Which range is actually on screen. A pill alone cannot say "Jul 1 to
           Jul 22", and Custom is meaningless without it. */}
       <Text style={styles.rangeActive}>
@@ -546,6 +615,7 @@ export function RosterMap() {
             initialRegion={region}
             showsUserLocation={false}
             toolbarEnabled={false}
+            onRegionChangeComplete={(r) => setViewSpan(r.latitudeDelta)}
             // The map is context; the punches are the content. These props do
             // NOT overlap: Android's MapManager.setMapType looks the string up
             // in a five-entry map with no "mutedStandard" key and unboxes the
@@ -791,6 +861,7 @@ const styles = StyleSheet.create({
   },
   fallback: { flex: 1, alignItems: "center", justifyContent: "center", padding: 32 },
   fallbackText: { color: c.textMuted, fontSize: 15, textAlign: "center", lineHeight: 22 },
+  whoWrap: { paddingHorizontal: 24, paddingTop: 10 },
   rangeActive: {
     color: c.text,
     fontSize: 13,

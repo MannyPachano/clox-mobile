@@ -45,6 +45,23 @@ function clock(iso: string): string {
   return `${h}:${pad(m)} ${ap}`;
 }
 
+/**
+ * The end time, carrying its date when the shift did not end on the day it
+ * started. "6:09 PM to 4:19 PM · 213h 10m" reads as a typo; the day is what
+ * makes the hours make sense. Overnight crews hit this every shift, and a
+ * missed clock-out turns it into a week.
+ */
+function endLabel(startIso: string, endIso: string): string {
+  const a = new Date(startIso);
+  const b = new Date(endIso);
+  const sameDay =
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate();
+  if (sameDay) return clock(endIso);
+  return `${MONTHS[b.getMonth()]} ${b.getDate()}, ${clock(endIso)}`;
+}
+
 function dur(ms: number): string {
   const min = Math.floor((ms > 0 ? ms : 0) / 60000);
   const h = Math.floor(min / 60);
@@ -152,8 +169,9 @@ export function EmployeeShiftsSheet({ visible, employee, onClose }: Props) {
                 >
                   <View style={styles.rowText}>
                     <Text style={styles.date}>{fmtDate(e.start)}</Text>
-                    <Text style={styles.times} numberOfLines={1}>
-                      {clock(e.start)} to {clock(e.end)} · {dur(e.durationMs)}
+                    <Text style={styles.times} numberOfLines={2}>
+                      {clock(e.start)} to {endLabel(e.start, e.end)} ·{" "}
+                      {dur(e.durationMs)}
                       {e.project ? ` · ${e.project}` : ""}
                     </Text>
                   </View>

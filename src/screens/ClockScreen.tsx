@@ -82,6 +82,22 @@ function formatElapsed(ms: number): string {
   )}:${pad(total % 60)}`;
 }
 
+/**
+ * End time plus its date when the shift crossed midnight. A night crew's
+ * "6:00 PM to 2:30 AM" is otherwise indistinguishable from a shift that
+ * somehow ran backwards.
+ */
+function formatEnd(startMs: number, endMs: number): string {
+  const a = new Date(startMs);
+  const b = new Date(endMs);
+  const sameDay =
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate();
+  if (sameDay) return formatClock(endMs);
+  return `${MONTHS[b.getMonth()]} ${b.getDate()}, ${formatClock(endMs)}`;
+}
+
 function formatClock(ms: number): string {
   const d = new Date(ms);
   if (Number.isNaN(d.getTime())) return "—:—";
@@ -895,7 +911,7 @@ export function ClockScreen({
                     </Text>
                     <Text style={styles.historySub} numberOfLines={1}>
                       {formatClock(Date.parse(s.startsAt))} to{" "}
-                      {formatClock(Date.parse(s.endsAt))}
+                      {formatEnd(Date.parse(s.startsAt), Date.parse(s.endsAt))}
                     </Text>
                   </View>
                 </View>
@@ -933,7 +949,7 @@ export function ClockScreen({
                     </View>
                     <Text style={styles.historySub} numberOfLines={1}>
                       {formatClock(Date.parse(s.start))} to{" "}
-                      {formatClock(Date.parse(s.end))}
+                      {formatEnd(Date.parse(s.start), Date.parse(s.end))}
                       {s.project ? ` · ${s.project}` : ""}
                     </Text>
                     {s.rejected ? (
