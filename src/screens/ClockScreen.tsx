@@ -894,7 +894,7 @@ export function ClockScreen({
                       {formatDate(Date.parse(s.startsAt))}
                     </Text>
                     <Text style={styles.historySub} numberOfLines={1}>
-                      {formatClock(Date.parse(s.startsAt))} –{" "}
+                      {formatClock(Date.parse(s.startsAt))} to{" "}
                       {formatClock(Date.parse(s.endsAt))}
                     </Text>
                   </View>
@@ -932,7 +932,7 @@ export function ClockScreen({
                       ) : null}
                     </View>
                     <Text style={styles.historySub} numberOfLines={1}>
-                      {formatClock(Date.parse(s.start))} –{" "}
+                      {formatClock(Date.parse(s.start))} to{" "}
                       {formatClock(Date.parse(s.end))}
                       {s.project ? ` · ${s.project}` : ""}
                     </Text>

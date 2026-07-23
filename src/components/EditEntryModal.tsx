@@ -21,6 +21,7 @@ import {
   buildEditDays,
   buildRunningStart,
   buildShiftRange,
+  endsNextDay,
   withDay,
   ymdOf,
 } from "../lib/edit-time";
@@ -159,6 +160,9 @@ export function EditEntryModal({
             {!startOnly ? (
               <>
                 <TimeField label="End" value={endTime} onChange={setEndTime} />
+                {endsNextDay(startTime, endTime) ? (
+                  <Text style={styles.overnight}>Ends the next day.</Text>
+                ) : null}
                 <SelectField
                   label="Project"
                   value={projectId}
@@ -245,6 +249,9 @@ const styles = StyleSheet.create({
     fontSize: 16,
     marginBottom: 10,
   },
+  /** Says out loud what buildShiftRange does silently when the end time is at
+   *  or before the start. */
+  overnight: { color: c.textMuted, fontSize: 13, marginTop: -6, marginBottom: 10 },
   hint: { color: c.textMuted, fontSize: 12, marginBottom: 8 },
   error: { color: c.danger, fontSize: 14, marginBottom: 8 },
   actions: {

@@ -153,7 +153,7 @@ export function EmployeeShiftsSheet({ visible, employee, onClose }: Props) {
                   <View style={styles.rowText}>
                     <Text style={styles.date}>{fmtDate(e.start)}</Text>
                     <Text style={styles.times} numberOfLines={1}>
-                      {clock(e.start)} – {clock(e.end)} · {dur(e.durationMs)}
+                      {clock(e.start)} to {clock(e.end)} · {dur(e.durationMs)}
                       {e.project ? ` · ${e.project}` : ""}
                     </Text>
                   </View>

@@ -18,6 +18,7 @@ import {
 } from "../api";
 import { getAccessToken } from "../supabase";
 import { lightColors as c, scrim } from "../theme";
+import { hhmmEndsNextDay } from "../lib/edit-time";
 import { SelectField } from "./SelectField";
 
 const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -238,6 +239,9 @@ export function AddShiftModal({
               placeholder="End time"
               onSelect={setEndId}
             />
+            {hhmmEndsNextDay(startId, endId) ? (
+              <Text style={styles.overnight}>Ends the next day.</Text>
+            ) : null}
             <Text style={styles.hint}>
               {shift?.isSeries
                 ? "This edits only this one shift. Change the repeating series on the web."
@@ -301,6 +305,10 @@ const styles = StyleSheet.create({
   },
   scroll: { paddingHorizontal: 20 },
   hint: { color: c.textMuted, fontSize: 13, marginTop: 2, marginBottom: 8 },
+  /** Says out loud what buildShiftRange does silently when the end time is at
+   *  or before the start. */
+  overnight: { color: c.textMuted, fontSize: 13, marginTop: -6, marginBottom: 10 },
+
   error: { color: c.danger, fontSize: 14, marginBottom: 8 },
   remove: { alignItems: "center", paddingVertical: 10, marginBottom: 2 },
   removeText: { color: c.danger, fontSize: 15, fontWeight: "600" },

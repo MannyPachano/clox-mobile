@@ -118,3 +118,26 @@ export function buildShiftRange(
   }
   return { ok: true, startIso, endIso };
 }
+
+/**
+ * True when the chosen end is at or before the start.
+ *
+ * Every writer in the app resolves that by rolling the end into the next day
+ * (see `buildShiftRange` above), which is right but silent: a 6:00 PM to
+ * 2:30 AM shift looks like a typo until the sheet says otherwise.
+ */
+export function endsNextDay(start: Date, end: Date): boolean {
+  const s = start.getHours() * 60 + start.getMinutes();
+  const e = end.getHours() * 60 + end.getMinutes();
+  return e <= s;
+}
+
+/** The same question for the zero-padded "HH:MM" option ids the schedule and
+ *  add-entry sheets pick from, where a string compare is the time compare. */
+export function hhmmEndsNextDay(
+  startId: string | null,
+  endId: string | null,
+): boolean {
+  if (!startId || !endId) return false;
+  return endId <= startId;
+}

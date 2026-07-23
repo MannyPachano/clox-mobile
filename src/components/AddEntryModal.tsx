@@ -14,6 +14,7 @@ import {
 import { createManagerEntry, getStatus, type Option } from "../api";
 import { getAccessToken } from "../supabase";
 import { lightColors as c, scrim } from "../theme";
+import { hhmmEndsNextDay } from "../lib/edit-time";
 import { SelectField } from "./SelectField";
 
 const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -192,6 +193,9 @@ export function AddEntryModal({ visible, employees, onClose, onCreated }: Props)
               placeholder="End time"
               onSelect={setEndId}
             />
+            {hhmmEndsNextDay(startId, endId) ? (
+              <Text style={styles.overnight}>Ends the next day.</Text>
+            ) : null}
             <SelectField
               label="Project"
               value={projectId}
@@ -254,6 +258,10 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   scroll: { paddingHorizontal: 20 },
+  /** Says out loud what buildShiftRange does silently when the end time is at
+   *  or before the start. */
+  overnight: { color: c.textMuted, fontSize: 13, marginTop: -6, marginBottom: 10 },
+
   note: {
     backgroundColor: c.surface,
     borderColor: c.border,

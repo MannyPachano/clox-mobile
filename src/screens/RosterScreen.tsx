@@ -48,6 +48,27 @@ function dur(ms: number): string {
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
 
+const MONTHS = [
+  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/**
+ * "6:18 PM" for a shift that started today, "Jul 14, 6:18 PM" for one that did
+ * not. A shift running for eight days used to show a bare clock time, which
+ * reads as this morning until you notice the 195h sitting next to it.
+ */
+function startedAt(sinceMs: number, nowMs: number): string {
+  const s = new Date(sinceMs);
+  const n = new Date(nowMs);
+  const sameDay =
+    s.getFullYear() === n.getFullYear() &&
+    s.getMonth() === n.getMonth() &&
+    s.getDate() === n.getDate();
+  if (sameDay) return clock(sinceMs);
+  return `${MONTHS[s.getMonth()]} ${s.getDate()}, ${clock(sinceMs)}`;
+}
+
 /** Cents → "$1,234.56" without Intl (Hermes support is spotty). */
 function money(cents: number): string {
   const [whole, frac] = (Math.round(cents) / 100).toFixed(2).split(".");
@@ -224,8 +245,10 @@ export function RosterScreen() {
               ) : null}
             </Text>
             {item.onShift && since ? (
-              <Text style={styles.sub} numberOfLines={1}>
-                On since {clock(since)} · {dur(now - since)}
+              // Two lines, because the alternative is "On since 6:18 P..."
+              // squeezed against the Adjust start and Clock out buttons.
+              <Text style={styles.sub} numberOfLines={2}>
+                On since {startedAt(since, now)} · {dur(now - since)}
                 {item.project ? ` · ${item.project}` : ""}
               </Text>
             ) : (
@@ -419,7 +442,9 @@ const styles = StyleSheet.create({
   list: { paddingHorizontal: 24, paddingBottom: 24 },
   row: {
     flexDirection: "row",
-    alignItems: "center",
+    // flex-start, not center: an on-shift subtitle can wrap to a second line
+    // and the action buttons should stay put rather than drift down with it.
+    alignItems: "flex-start",
     paddingVertical: 14,
     borderTopWidth: 1,
     borderTopColor: c.border,

@@ -52,7 +52,10 @@ function dateShort(iso: string): string {
 function ymd(s: string): string {
   const [y, mo, d] = s.split("-").map(Number);
   if (!y || !mo || !d || mo < 1 || mo > 12) return s;
-  return `${MONTHS[mo - 1]} ${d}`;
+  // The year is noise on a request for next week and essential on one from
+  // last December, so it shows up only when it is not the current year.
+  const thisYear = new Date().getFullYear();
+  return `${MONTHS[mo - 1]} ${d}${y === thisYear ? "" : `, ${y}`}`;
 }
 
 function dur(ms: number): string {
@@ -291,7 +294,7 @@ export function ApprovalsScreen() {
                   ) : null}
                 </Text>
                 <Text style={styles.meta} numberOfLines={1}>
-                  {dateShort(t.start)} · {clock(t.start)}–{clock(t.end)} ·{" "}
+                  {dateShort(t.start)} · {clock(t.start)} to {clock(t.end)} ·{" "}
                   {dur(t.durationMs)}
                   {t.project ? ` · ${t.project}` : ""}
                 </Text>
@@ -336,7 +339,7 @@ export function ApprovalsScreen() {
                 </Text>
                 <Text style={styles.meta} numberOfLines={1}>
                   {l.kind} · {ymd(l.startsOn)}
-                  {l.endsOn !== l.startsOn ? `–${ymd(l.endsOn)}` : ""}
+                  {l.endsOn !== l.startsOn ? ` to ${ymd(l.endsOn)}` : ""}
                 </Text>
                 {l.notes ? (
                   <Text style={styles.notes} numberOfLines={3}>
@@ -373,11 +376,11 @@ export function ApprovalsScreen() {
                   {r.employee}
                 </Text>
                 <Text style={styles.meta} numberOfLines={1}>
-                  {dateShort(r.originalStart)} · was {clock(r.originalStart)}–
+                  {dateShort(r.originalStart)} · was {clock(r.originalStart)} to{" "}
                   {clock(r.originalEnd)}
                 </Text>
                 <Text style={styles.reqNew} numberOfLines={1}>
-                  Requested: {clock(r.requestedStart)}–{clock(r.requestedEnd)}
+                  Requested: {clock(r.requestedStart)} to {clock(r.requestedEnd)}
                   {r.project ? ` · ${r.project}` : ""}
                 </Text>
                 {r.reason ? (

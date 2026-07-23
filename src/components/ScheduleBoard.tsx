@@ -65,6 +65,17 @@ function dotColor(color: BoardColor | null): string | null {
 
 type TargetRect = { key: string; x: number; y: number; w: number; h: number };
 
+/** A lifted card: which shift, and where it sat when the finger picked it up
+ *  (window coordinates, so the overlay can be placed anywhere on screen). */
+type Drag = {
+  shift: ScheduledShiftDto;
+  /** The source card's rect at lift, in window coordinates. */
+  rect: { x: number; y: number; w: number; h: number };
+  /** The board root's origin at lift, so window coordinates convert to the
+   *  overlay's local coordinate space. */
+  origin: { x: number; y: number };
+};
+
 type Props = {
   /** The 7 day keys of the visible week, Monday first. */
   dayKeys: string[];
@@ -95,8 +106,15 @@ export function ScheduleBoard({
   // not move during a drag, so one measurement per lift is enough).
   const targetRefs = useRef<(View | null)[]>([]);
   const targetRectsRef = useRef<TargetRect[]>([]);
-  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [drag, setDrag] = useState<Drag | null>(null);
   const [hoverKey, setHoverKey] = useState<string | null>(null);
+  // The board root, so a card's window rect converts into overlay coordinates.
+  const wrapRef = useRef<View | null>(null);
+  // The finger offset. It lives HERE, not in the card, because the thing that
+  // moves is the overlay copy at the board root — the card itself must stay
+  // put. Transforming the card in place is what used to clip it against the
+  // ScrollView and slide it under its siblings.
+  const pan = useRef(new Animated.ValueXY({ x: 0, y: 0 })).current;
 
   const measureTargets = () => {
     const rects: TargetRect[] = [];
@@ -120,6 +138,30 @@ export function ScheduleBoard({
     return r ? r.key : null;
   };
 
+  /** Drop the overlay at once. For a move that lands: the card is about to
+   *  reappear under a different day, so animating it home would be a lie. */
+  const endDragNow = () => {
+    pan.setValue({ x: 0, y: 0 });
+    setDrag(null);
+    setHoverKey(null);
+  };
+
+  /** Float the overlay back to where the card came from, then drop it. For a
+   *  release that hit no day: the card is staying put, and it should look
+   *  like it went back rather than vanished. */
+  const endDragSpringingBack = () => {
+    setHoverKey(null);
+    Animated.spring(pan, {
+      toValue: { x: 0, y: 0 },
+      useNativeDriver: false,
+      bounciness: 6,
+      speed: 20,
+    }).start(() => {
+      pan.setValue({ x: 0, y: 0 });
+      setDrag(null);
+    });
+  };
+
   const groups = useMemo(() => {
     const list = byDay.get(selectedDayKey) ?? [];
     const m = new Map<string, ScheduledShiftDto[]>();
@@ -136,7 +178,13 @@ export function ScheduleBoard({
   }, [byDay, selectedDayKey]);
 
   return (
-    <View style={styles.wrap}>
+    <View
+      style={styles.wrap}
+      ref={(el) => {
+        wrapRef.current = el;
+      }}
+      collapsable={false}
+    >
       {/* Day-target strip. Each cell is a drop target during a drag. */}
       <View style={styles.strip}>
         {dayKeys.map((key, i) => {
@@ -163,7 +211,7 @@ export function ScheduleBoard({
                 onPress={() => onSelectDay(key)}
                 style={styles.targetPress}
                 accessibilityRole="button"
-                accessibilityLabel={`${DOW[d.getDay()]} ${d.getDate()}, ${count} scheduled`}
+                accessibilityLabel={`${DOW[d.getDay()]} ${d.getDate()}, ${count} ${count === 1 ? "shift" : "shifts"} scheduled`}
               >
                 <Text
                   style={[styles.targetDow, isSelected && styles.targetDowSel]}
@@ -175,13 +223,27 @@ export function ScheduleBoard({
                 >
                   {d.getDate()}
                 </Text>
-                <View
-                  style={[
-                    styles.targetPip,
-                    count > 0 && styles.targetPipOn,
-                    isSelected && count > 0 && styles.targetPipSel,
-                  ]}
-                />
+                {/* How many shifts that day, not merely whether any. A dot
+                    answered a question nobody was asking. */}
+                {count > 0 ? (
+                  <View
+                    style={[
+                      styles.targetCount,
+                      isSelected && styles.targetCountSel,
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.targetCountText,
+                        isSelected && styles.targetCountTextSel,
+                      ]}
+                    >
+                      {count}
+                    </Text>
+                  </View>
+                ) : (
+                  <View style={styles.targetCountSpacer} />
+                )}
               </Pressable>
             </View>
           );
@@ -197,9 +259,14 @@ export function ScheduleBoard({
       <ScrollView
         contentContainerStyle={styles.dayBody}
         showsVerticalScrollIndicator={false}
+        // A lifted card owns the gesture. Without this the list scrolls under
+        // the finger while the card is being dragged.
+        scrollEnabled={drag === null}
       >
         {groups.length === 0 ? (
-          <Text style={styles.none}>Nobody scheduled this day</Text>
+          <Text style={styles.none}>
+            No shifts this day. Drag one onto the day above or tap + Add.
+          </Text>
         ) : (
           groups.map((g) => (
             <View key={g.uid} style={styles.group}>
@@ -208,28 +275,36 @@ export function ScheduleBoard({
                 <DraggableShiftCard
                   key={s.id}
                   shift={s}
-                  dragging={draggingId === s.id}
+                  pan={pan}
+                  dragging={drag?.shift.id === s.id}
                   draggable={draggable}
-                  onLift={() => {
+                  onLift={(rect) => {
                     measureTargets();
-                    setDraggingId(s.id);
+                    // The overlay is positioned inside the board, so convert
+                    // the card's window rect through the board's own origin.
+                    wrapRef.current?.measureInWindow((wx, wy) => {
+                      setDrag({ shift: s, rect, origin: { x: wx, y: wy } });
+                    });
                     haptics.medium();
                   }}
                   onBlocked={onOfflineBlocked}
                   onMove={(x, y) => setHoverKey(hitKey(x, y))}
                   onDrop={(x, y) => {
                     const target = hitKey(x, y);
-                    setDraggingId(null);
-                    setHoverKey(null);
-                    if (!target) return;
                     const currentKey = dayKeyOf(s.startsAt);
-                    if (target === currentKey) return;
+                    // Landed nowhere, or back on the day it came from: the
+                    // card stays, so float it home.
+                    if (!target || target === currentKey) {
+                      endDragSpringingBack();
+                      return;
+                    }
+                    endDragNow();
+                    // Confirm the drop landed, since the card reappears under
+                    // a different day and the eye may not follow it.
+                    haptics.success();
                     onMoveShift(s, target);
                   }}
-                  onCancel={() => {
-                    setDraggingId(null);
-                    setHoverKey(null);
-                  }}
+                  onCancel={endDragSpringingBack}
                   onPress={() => onEditShift(s)}
                 />
               ))}
@@ -237,6 +312,50 @@ export function ScheduleBoard({
           ))
         )}
       </ScrollView>
+
+      {/* The dragging card, drawn at the board ROOT above everything else.
+          Nothing clips it and nothing z-fights it, which is the whole reason
+          it is not simply the source card moved. `pointerEvents="none"` keeps
+          the gesture with the source card, which already holds the responder. */}
+      {drag ? (
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.card,
+            styles.cardDragging,
+            styles.dragOverlay,
+            {
+              left: drag.rect.x - drag.origin.x,
+              top: drag.rect.y - drag.origin.y,
+              width: drag.rect.w,
+              transform: pan.getTranslateTransform(),
+            },
+          ]}
+        >
+          <View style={styles.cardPress}>
+            <View style={styles.cardMain}>
+              <Text style={styles.cardTime}>
+                {clock(drag.shift.startsAt)} to {clock(drag.shift.endsAt)}
+              </Text>
+              {drag.shift.projectName ? (
+                <View style={styles.cardProjectRow}>
+                  {dotColor(drag.shift.projectColor) ? (
+                    <View
+                      style={[
+                        styles.cardDot,
+                        { backgroundColor: dotColor(drag.shift.projectColor)! },
+                      ]}
+                    />
+                  ) : null}
+                  <Text style={styles.cardProject} numberOfLines={1}>
+                    {drag.shift.projectName}
+                  </Text>
+                </View>
+              ) : null}
+            </View>
+          </View>
+        </Animated.View>
+      ) : null}
     </View>
   );
 }
@@ -249,9 +368,13 @@ function dayKeyOf(iso: string): string {
 
 type CardProps = {
   shift: ScheduledShiftDto;
+  /** The board's shared finger offset. The card writes to it; the board's
+   *  overlay copy is what actually moves. */
+  pan: Animated.ValueXY;
   dragging: boolean;
   draggable: boolean;
-  onLift: () => void;
+  /** Called with this card's window rect once the long-press arms. */
+  onLift: (rect: { x: number; y: number; w: number; h: number }) => void;
   onBlocked: () => void;
   onMove: (x: number, y: number) => void;
   onDrop: (x: number, y: number) => void;
@@ -264,6 +387,7 @@ const MOVE_CANCEL_PX = 8;
 
 function DraggableShiftCard({
   shift,
+  pan,
   dragging,
   draggable,
   onLift,
@@ -277,13 +401,24 @@ function DraggableShiftCard({
   // below — see the file-level note on react-hooks/refs). `cb` carries the
   // latest parent callbacks so the once-created responder never calls a stale
   // closure after a mid-drag re-render.
-  const pan = useRef(new Animated.ValueXY({ x: 0, y: 0 })).current;
+  const selfRef = useRef<View | null>(null);
   const armed = useRef(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const cb = useRef({ draggable, onLift, onBlocked, onMove, onDrop, onCancel });
   useEffect(() => {
     cb.current = { draggable, onLift, onBlocked, onMove, onDrop, onCancel };
   });
+
+  /** Hand the parent this card's window rect so the overlay can start exactly
+   *  on top of it, then the drag reads as picking the card up rather than a
+   *  copy appearing somewhere else. */
+  const liftWithRect = () => {
+    const node = selfRef.current;
+    if (!node) return;
+    node.measureInWindow((x, y, w, h) => {
+      cb.current.onLift({ x, y, w, h });
+    });
+  };
 
   const clearTimer = () => {
     if (timer.current) {
@@ -296,14 +431,10 @@ function DraggableShiftCard({
   // re-renders the day list), so a leaked timeout never lifts a gone card.
   useEffect(() => () => clearTimer(), []);
 
-  const reset = () => {
-    Animated.spring(pan, {
-      toValue: { x: 0, y: 0 },
-      useNativeDriver: false,
-      bounciness: 6,
-      speed: 20,
-    }).start();
-  };
+  // The overlay is unmounted the moment the drag ends, so there is nothing
+  // left to spring back — the parent zeroes `pan` in endDrag(). Animating a
+  // shared value here would fight the next lift.
+
 
   const responder = useRef(
     PanResponder.create({
@@ -320,7 +451,7 @@ function DraggableShiftCard({
             return;
           }
           armed.current = true;
-          cb.current.onLift();
+          liftWithRect();
         }, LONG_PRESS_MS);
         return false;
       },
@@ -340,6 +471,11 @@ function DraggableShiftCard({
         return false;
       },
       onMoveShouldSetPanResponderCapture: () => armed.current,
+      // An armed drag refuses to hand the gesture back. Without this the
+      // parent ScrollView claims the responder the moment the finger travels
+      // vertically, onPanResponderTerminate fires, and the drag dies mid-air,
+      // which is what "long-press does nothing" actually was.
+      onPanResponderTerminationRequest: () => !armed.current,
       onPanResponderMove: (
         _e: GestureResponderEvent,
         gs: PanResponderGestureState,
@@ -356,7 +492,6 @@ function DraggableShiftCard({
           armed.current = false;
           cb.current.onDrop(gs.moveX, gs.moveY);
         }
-        reset();
       },
       onPanResponderTerminate: () => {
         clearTimer();
@@ -364,7 +499,6 @@ function DraggableShiftCard({
           armed.current = false;
           cb.current.onCancel();
         }
-        reset();
       },
     }),
   ).current;
@@ -372,8 +506,12 @@ function DraggableShiftCard({
   const dot = dotColor(shift.projectColor);
 
   return (
-    <Animated.View
+    <View
       {...responder.panHandlers}
+      ref={(el) => {
+        selfRef.current = el;
+      }}
+      collapsable={false}
       // A quick tap never arms the timer's lift; clear it on release so a
       // pending lift can't fire after the finger is gone.
       onTouchEnd={() => {
@@ -383,13 +521,10 @@ function DraggableShiftCard({
         clearTimer();
         armed.current = false;
       }}
-      style={[
-        styles.card,
-        {
-          transform: pan.getTranslateTransform(),
-        },
-        dragging && styles.cardDragging,
-      ]}
+      // While lifted this card stays exactly where it is and just dims: it is
+      // the hole the card came out of. The board's overlay copy is the thing
+      // that follows the finger.
+      style={[styles.card, dragging && styles.cardSource]}
     >
       <Pressable
         onPress={() => {
@@ -432,7 +567,7 @@ function DraggableShiftCard({
           </Text>
         ) : null}
       </Pressable>
-    </Animated.View>
+    </View>
   );
 }
 
@@ -476,15 +611,26 @@ const styles = StyleSheet.create({
     marginTop: 1,
   },
   targetDateSel: { color: c.accentText },
-  targetPip: {
-    width: 5,
-    height: 5,
-    borderRadius: 3,
-    marginTop: 4,
-    backgroundColor: "transparent",
+  targetCount: {
+    minWidth: 16,
+    height: 16,
+    borderRadius: 8,
+    marginTop: 3,
+    paddingHorizontal: 4,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: c.surfaceAlt,
   },
-  targetPipOn: { backgroundColor: c.textMuted },
-  targetPipSel: { backgroundColor: c.accentText },
+  targetCountSel: { backgroundColor: "rgba(255,255,255,0.22)" },
+  targetCountText: {
+    color: c.textMuted,
+    fontSize: 10,
+    fontWeight: "800",
+    lineHeight: 13,
+  },
+  targetCountTextSel: { color: c.accentText },
+  /** Keeps every cell the same height on a day with nothing scheduled. */
+  targetCountSpacer: { height: 16, marginTop: 3 },
   hint: {
     color: c.textMuted,
     fontSize: 12,
@@ -514,15 +660,21 @@ const styles = StyleSheet.create({
     borderRadius: radii.md,
     marginBottom: 8,
   },
+  /** The card left behind: the gap the dragged card came out of. */
+  cardSource: { opacity: 0.35, borderColor: c.accent },
   cardDragging: {
     borderColor: c.accent,
-    // Lift above the strip and neighbours while dragging.
-    zIndex: 20,
-    elevation: 8,
     shadowColor: "#000",
     shadowOpacity: 0.18,
     shadowRadius: 10,
     shadowOffset: { width: 0, height: 4 },
+    elevation: 8,
+  },
+  /** The dragged copy, free of the ScrollView that used to clip it. */
+  dragOverlay: {
+    position: "absolute",
+    marginBottom: 0,
+    zIndex: 30,
   },
   cardPress: {
     flexDirection: "row",

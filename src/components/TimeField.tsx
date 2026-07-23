@@ -34,7 +34,11 @@ export function TimeField({
 
   if (Platform.OS === "ios") {
     return (
-      <View style={styles.row}>
+      // Label above, control below — the same shape as the Date and Project
+      // selects sitting in the same sheet. This used to be label-left /
+      // chip-right, which made Start and End read as a different kind of
+      // control than every other field in the form.
+      <View style={styles.wrap}>
         <Text style={styles.label}>{label}</Text>
         <DateTimePicker
           value={value}
@@ -42,6 +46,7 @@ export function TimeField({
           minuteInterval={1}
           display="compact"
           themeVariant="light"
+          style={styles.iosCompact}
           onChange={(_event, picked) => {
             if (picked) onChange(picked);
           }}
@@ -77,12 +82,9 @@ export function TimeField({
 
 const styles = StyleSheet.create({
   wrap: { marginBottom: 12 },
-  row: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: 12,
-  },
+  /** The native compact picker carries its own pill, so it only needs to be
+   *  pulled back into the form's left margin. */
+  iosCompact: { alignSelf: "flex-start", marginLeft: -10 },
   label: {
     color: c.textMuted,
     fontSize: 12,
