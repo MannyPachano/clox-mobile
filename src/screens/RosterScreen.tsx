@@ -442,9 +442,10 @@ const styles = StyleSheet.create({
   list: { paddingHorizontal: 24, paddingBottom: 24 },
   row: {
     flexDirection: "row",
-    // flex-start, not center: an on-shift subtitle can wrap to a second line
-    // and the action buttons should stay put rather than drift down with it.
-    alignItems: "flex-start",
+    // Centred. A wrapped on-shift subtitle simply makes the row taller and the
+    // controls stay centred in it; flex-start fixed nothing and top-aligned
+    // the chevron on every off-the-clock row.
+    alignItems: "center",
     paddingVertical: 14,
     borderTopWidth: 1,
     borderTopColor: c.border,

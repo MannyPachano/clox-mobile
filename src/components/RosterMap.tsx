@@ -118,29 +118,73 @@ const ANDROID_MUTED_STYLE = [
 /** Metres per degree of latitude. Good to a fraction of a percent anywhere. */
 const M_PER_DEG_LAT = 111_320;
 
+/** Metres between two coordinates, flat-earth approximation. Fine at the tens
+ *  of metres this is used for. */
+function metresApart(
+  aLat: number,
+  aLng: number,
+  bLat: number,
+  bLng: number,
+): number {
+  const dLat = (aLat - bLat) * M_PER_DEG_LAT;
+  const lngScale =
+    M_PER_DEG_LAT * Math.max(0.15, Math.cos((aLat * Math.PI) / 180));
+  const dLng = (aLng - bLng) * lngScale;
+  return Math.hypot(dLat, dLng);
+}
+
+/** Two punches this close are "the same spot" for pin purposes. */
+const COLOCATED_M = 15;
+
 /**
  * Spread punches that share a spot so each one stays its own tappable pin.
  *
- * Two people clocking in at the same trailer land on identical coordinates, and
- * an on-shift avatar drawn over a completed dot reads as one broken pin rather
- * than two workers. Punches are bucketed by their coordinates rounded to four
- * decimals (about 11m, which is inside any worksite) and each bucket's members
- * are pushed out around a small circle. The offsets are metres, so the fan
- * holds its shape at worksite zoom instead of scaling with latitude.
+ * Two people clocking in at the same trailer land on all but identical
+ * coordinates, and an on-shift avatar drawn over a completed dot reads as one
+ * broken pin rather than two workers.
+ *
+ * Grouping is a proximity sweep, not a rounded-coordinate grid: a grid puts two
+ * punches a few centimetres apart into different cells whenever they straddle a
+ * cell edge, which is exactly the case this exists to fix. The fan radius comes
+ * from the visible span rather than being a fixed number of metres, because a
+ * 10m offset is a couple of pixels at worksite zoom, i.e. invisible, and the
+ * pins would still overlap.
+ *
+ * The offset is display only. The callout still reports the real punch, and
+ * the privacy caption still describes what a pin means.
  */
-function fanColocated<T extends { clockInLatitude: number; clockInLongitude: number }>(
-  punches: T[],
-): (T & { fanLat: number; fanLng: number })[] {
-  const buckets = new Map<string, T[]>();
+function fanColocated<
+  T extends { clockInLatitude: number; clockInLongitude: number },
+>(punches: T[], spanLatDelta: number): (T & { fanLat: number; fanLng: number })[] {
+  // Single-link grouping: each punch joins the first group it is within
+  // COLOCATED_M of, so a straddling pair still lands together.
+  const groups: T[][] = [];
   for (const p of punches) {
-    const key = `${p.clockInLatitude.toFixed(4)},${p.clockInLongitude.toFixed(4)}`;
-    const arr = buckets.get(key);
-    if (arr) arr.push(p);
-    else buckets.set(key, [p]);
+    const hit = groups.find((g) =>
+      g.some((q) =>
+        metresApart(
+          p.clockInLatitude,
+          p.clockInLongitude,
+          q.clockInLatitude,
+          q.clockInLongitude,
+        ) <= COLOCATED_M,
+      ),
+    );
+    if (hit) hit.push(p);
+    else groups.push([p]);
   }
 
+  // About 6% of the visible height: far enough apart to read as separate pins
+  // at the zoom `boundsRegion` opens at, and it keeps that proportion as the
+  // range widens. Clamped so a single worksite does not fling pins across the
+  // county, and a very tight span still separates them.
+  const base = Math.min(
+    260,
+    Math.max(18, spanLatDelta * M_PER_DEG_LAT * 0.06),
+  );
+
   const out: (T & { fanLat: number; fanLng: number })[] = [];
-  for (const group of buckets.values()) {
+  for (const group of groups) {
     if (group.length === 1) {
       const only = group[0]!;
       out.push({
@@ -150,12 +194,15 @@ function fanColocated<T extends { clockInLatitude: number; clockInLongitude: num
       });
       continue;
     }
+    // A busy site needs a bigger ring, or a dozen pins land on top of each
+    // other again at the same radius.
+    const radiusM = base * Math.max(1, group.length / 6);
     group.forEach((p, i) => {
       const angle = (2 * Math.PI * i) / group.length;
-      const radiusM = 8 + (i % 4) * 2; // 8, 10, 12, 14
       const dLat = (radiusM * Math.cos(angle)) / M_PER_DEG_LAT;
       const lngScale =
-        M_PER_DEG_LAT * Math.max(0.15, Math.cos((p.clockInLatitude * Math.PI) / 180));
+        M_PER_DEG_LAT *
+        Math.max(0.15, Math.cos((p.clockInLatitude * Math.PI) / 180));
       const dLng = (radiusM * Math.sin(angle)) / lngScale;
       out.push({
         ...p,
@@ -387,9 +434,17 @@ export function RosterMap() {
     }
     try {
       const res = await getManagerMapRange(token, range.fromKey, range.toKey);
-      if (res.ok) setData(res.data);
-      else setError(true);
+      if (res.ok) {
+        setData(res.data);
+      } else {
+        // Drop the old pins. Keeping them would leave the previous range's
+        // punches on screen under a line naming the range that just failed,
+        // and would hide the Try again button behind a map that looks fine.
+        setData(null);
+        setError(true);
+      }
     } catch {
+      setData(null);
       setError(true);
     } finally {
       setLoading(false);
@@ -407,8 +462,9 @@ export function RosterMap() {
 
   const region = useMemo(() => (data ? boundsRegion(data) : null), [data]);
   const fannedPunches = useMemo(
-    () => (data ? fanColocated(data.punches) : []),
-    [data],
+    () =>
+      data ? fanColocated(data.punches, region?.latitudeDelta ?? 0.01) : [],
+    [data, region],
   );
 
   // Re-enable marker snapshotting when the pins change, then turn it off after
@@ -448,10 +504,15 @@ export function RosterMap() {
             key={m}
             style={[styles.segmentBtn, mode === m && styles.segmentBtnOn]}
             onPress={() => {
+              // Custom asks a question before it changes anything. Committing
+              // the mode here and cancelling the sheet would drop the manager
+              // on a today-only map with the Custom pill lit, having silently
+              // thrown away the Week or Month they were looking at.
+              if (m === "custom") {
+                setCustomOpen(true);
+                return;
+              }
               setMode(m);
-              // Custom is a control, not just a label: tapping it asks which
-              // range, and tapping it again lets you change your answer.
-              if (m === "custom") setCustomOpen(true);
             }}
             activeOpacity={0.85}
             accessibilityRole="button"
@@ -485,13 +546,20 @@ export function RosterMap() {
             initialRegion={region}
             showsUserLocation={false}
             toolbarEnabled={false}
-            // The map is context; the punches are the content. Muted on iOS,
-            // and pinned to light because the rest of this screen is paper
-            // even when the phone is in dark mode: an unpinned MapView goes
-            // navy underneath a light UI.
-            mapType="mutedStandard"
-            userInterfaceStyle="light"
-            customMapStyle={ANDROID_MUTED_STYLE}
+            // The map is context; the punches are the content. These props do
+            // NOT overlap: Android's MapManager.setMapType looks the string up
+            // in a five-entry map with no "mutedStandard" key and unboxes the
+            // null into an int, so passing the iOS value there is a hard
+            // NullPointerException on every render. Each platform gets only
+            // what it understands.
+            {...(Platform.OS === "ios"
+              ? {
+                  mapType: "mutedStandard" as const,
+                  // The rest of this screen is paper even when the phone is in
+                  // dark mode; an unpinned MapView goes navy underneath it.
+                  userInterfaceStyle: "light" as const,
+                }
+              : { customMapStyle: ANDROID_MUTED_STYLE })}
           >
             {data?.worksites.map((w) => (
               <Circle
@@ -607,6 +675,7 @@ export function RosterMap() {
           onCancel={() => setCustomOpen(false)}
           onApply={(r) => {
             setCustom(r);
+            setMode("custom");
             setCustomOpen(false);
           }}
         />

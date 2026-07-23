@@ -132,12 +132,25 @@ export function endsNextDay(start: Date, end: Date): boolean {
   return e <= s;
 }
 
-/** The same question for the zero-padded "HH:MM" option ids the schedule and
- *  add-entry sheets pick from, where a string compare is the time compare. */
-export function hhmmEndsNextDay(
-  startId: string | null,
-  endId: string | null,
-): boolean {
-  if (!startId || !endId) return false;
-  return endId <= startId;
+/**
+ * What to tell someone about an end time at or before the start:
+ *   null        the shift ends the same day, nothing to say
+ *   "next-day"  it rolls over and buildShiftRange will accept it
+ *   "too-long"  it rolls over into a span past the 18-hour ceiling, so the
+ *               save is going to fail
+ *
+ * The third case is why this is not just `endsNextDay`. An end in the six
+ * hours before the start rolls to a 19-to-24 hour shift, and a bare "Ends the
+ * next day." there is a promise the writer then breaks with an unrelated
+ * "over 18 hours" error.
+ */
+export function overnightState(
+  start: Date,
+  end: Date,
+): "next-day" | "too-long" | null {
+  if (!endsNextDay(start, end)) return null;
+  const s = start.getHours() * 60 + start.getMinutes();
+  const e = end.getHours() * 60 + end.getMinutes();
+  const rolledMinutes = e + 24 * 60 - s;
+  return rolledMinutes * 60_000 > MAX_SHIFT_MS ? "too-long" : "next-day";
 }

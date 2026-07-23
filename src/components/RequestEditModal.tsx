@@ -20,6 +20,7 @@ import {
   buildEditDays,
   buildRunningStart,
   buildShiftRange,
+  overnightState,
   withDay,
   ymdOf,
 } from "../lib/edit-time";
@@ -178,6 +179,13 @@ export function RequestEditModal({
             {!startOnly ? (
               <>
                 <TimeField label="End" value={endTime} onChange={setEndTime} />
+                {overnightState(startTime, endTime) === "next-day" ? (
+                  <Text style={styles.overnight}>Ends the next day.</Text>
+                ) : overnightState(startTime, endTime) === "too-long" ? (
+                  <Text style={styles.overnightBad}>
+                    That would run past 18 hours. Check the end time.
+                  </Text>
+                ) : null}
                 <SelectField
                   label="Project"
                   value={projectId}
@@ -261,6 +269,10 @@ const styles = StyleSheet.create({
     minHeight: 60,
     marginBottom: 10,
   },
+  /** Says out loud what buildShiftRange does silently when the end time is
+   *  at or before the start. */
+  overnight: { color: c.textMuted, fontSize: 13, marginTop: -6, marginBottom: 10 },
+  overnightBad: { color: c.danger, fontSize: 13, marginTop: -6, marginBottom: 10 },
   error: { color: c.danger, fontSize: 14, marginBottom: 8 },
   actions: {
     flexDirection: "row",

@@ -18,7 +18,6 @@ import {
 } from "../api";
 import { getAccessToken } from "../supabase";
 import { lightColors as c, scrim } from "../theme";
-import { hhmmEndsNextDay } from "../lib/edit-time";
 import { SelectField } from "./SelectField";
 
 const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -129,6 +128,17 @@ export function AddShiftModal({
   const [dateId, setDateId] = useState<string>(initialDateId ?? "");
   const [startId, setStartId] = useState<string | null>("09:00");
   const [endId, setEndId] = useState<string | null>("17:00");
+
+  // Exactly save()'s test, run on the same values: a string compare of the
+  // option ids drifts from the timestamps on a spring-forward date, where a
+  // non-existent local hour normalises forward.
+  const rollsToNextDay = useMemo(() => {
+    if (!startId || !endId) return false;
+    const a = toIso(dateId, startId);
+    const b = toIso(dateId, endId);
+    if (!a || !b) return false;
+    return Date.parse(b) <= Date.parse(a);
+  }, [dateId, startId, endId]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -239,7 +249,7 @@ export function AddShiftModal({
               placeholder="End time"
               onSelect={setEndId}
             />
-            {hhmmEndsNextDay(startId, endId) ? (
+            {rollsToNextDay ? (
               <Text style={styles.overnight}>Ends the next day.</Text>
             ) : null}
             <Text style={styles.hint}>

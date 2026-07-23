@@ -115,6 +115,11 @@ export function ScheduleBoard({
   // put. Transforming the card in place is what used to clip it against the
   // ScrollView and slide it under its siblings.
   const pan = useRef(new Animated.ValueXY({ x: 0, y: 0 })).current;
+  // Which lift the current spring-back belongs to, and the spring itself. One
+  // shared `pan` serves every card, so a spring left running from card A must
+  // never be allowed to tear down card B's drag when it lands.
+  const dragSeq = useRef(0);
+  const springRef = useRef<Animated.CompositeAnimation | null>(null);
 
   const measureTargets = () => {
     const rects: TargetRect[] = [];
@@ -148,15 +153,25 @@ export function ScheduleBoard({
 
   /** Float the overlay back to where the card came from, then drop it. For a
    *  release that hit no day: the card is staying put, and it should look
-   *  like it went back rather than vanished. */
+   *  like it went back rather than vanished.
+   *
+   *  The spring runs for the better part of a second, which is long enough to
+   *  lift a second card. So it tears down only the drag it was started for:
+   *  `finished` is false when a new lift stopped it, and the sequence check
+   *  covers the case where it lands naturally after another card took over. */
   const endDragSpringingBack = () => {
     setHoverKey(null);
-    Animated.spring(pan, {
+    const seq = dragSeq.current;
+    const anim = Animated.spring(pan, {
       toValue: { x: 0, y: 0 },
       useNativeDriver: false,
       bounciness: 6,
       speed: 20,
-    }).start(() => {
+    });
+    springRef.current = anim;
+    anim.start(({ finished }) => {
+      springRef.current = null;
+      if (!finished || dragSeq.current !== seq) return;
       pan.setValue({ x: 0, y: 0 });
       setDrag(null);
     });
@@ -279,6 +294,14 @@ export function ScheduleBoard({
                   dragging={drag?.shift.id === s.id}
                   draggable={draggable}
                   onLift={(rect) => {
+                    // Claim the shared pan: stop any spring still carrying the
+                    // last card home, and zero the residual offset so this
+                    // card lifts from under the finger rather than from
+                    // wherever that spring had got to.
+                    dragSeq.current += 1;
+                    springRef.current?.stop();
+                    springRef.current = null;
+                    pan.setValue({ x: 0, y: 0 });
                     measureTargets();
                     // The overlay is positioned inside the board, so convert
                     // the card's window rect through the board's own origin.
@@ -299,9 +322,9 @@ export function ScheduleBoard({
                       return;
                     }
                     endDragNow();
-                    // Confirm the drop landed, since the card reappears under
-                    // a different day and the eye may not follow it.
-                    haptics.success();
+                    // No haptic here: moveShiftToDay already fires success on
+                    // the optimistic move, and two ticks for one drop reads as
+                    // a stutter.
                     onMoveShift(s, target);
                   }}
                   onCancel={endDragSpringingBack}
