@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Modal,
@@ -135,93 +135,120 @@ function metresApart(
 }
 
 /**
- * How close two punches have to be to count as the same spot.
- *
- * This is a question about pixels, not metres, so it scales with what is on
- * screen. A fixed metre threshold was the bug behind pins that still stacked:
- * two people at one worksite land 20 to 40m apart on GPS scatter, which at
- * month zoom is a few pixels, i.e. plainly overlapping, but any fixed
- * threshold tight enough to mean "same spot" is far too tight to catch it.
- * About 4% of the visible height is roughly a pin's width at any zoom.
+ * Above this visible span, a group of punches is drawn as one counted pin
+ * instead of a fan. About 9 km of map height: wider than any worksite, so a
+ * fan only ever happens when you are actually looking at a site.
  */
-function colocatedMetres(spanLatDelta: number): number {
-  return Math.max(15, spanLatDelta * M_PER_DEG_LAT * 0.04);
-}
+const FAN_MAX_SPAN_LAT = 0.08;
+
+/** A fan ring can never outgrow a worksite, whatever the arithmetic says. */
+const FAN_RADIUS_CAP_M = 120;
 
 /**
- * Spread punches that share a spot so each one stays its own tappable pin.
+ * How close two punches have to be to count as the same spot.
  *
- * Two people clocking in at the same trailer land on all but identical
- * coordinates, and an on-shift avatar drawn over a completed dot reads as one
- * broken pin rather than two workers.
- *
- * Grouping is a proximity sweep, not a rounded-coordinate grid: a grid puts two
- * punches a few centimetres apart into different cells whenever they straddle a
- * cell edge, which is exactly the case this exists to fix. The fan radius comes
- * from the visible span rather than being a fixed number of metres, because a
- * 10m offset is a couple of pixels at worksite zoom, i.e. invisible, and the
- * pins would still overlap.
- *
- * The offset is display only. The callout still reports the real punch, and
- * the privacy caption still describes what a pin means.
+ * It scales with the visible span, because "do these overlap" is a question
+ * about pixels, not metres. At cluster zooms the net stays proportional so a
+ * whole metro area folds into one counted pin; at fan zooms it is capped at
+ * 60 m so two genuinely separate nearby sites never merge into one ring.
  */
-function fanColocated<
+function colocatedMetres(spanLatDelta: number): number {
+  const proportional = spanLatDelta * M_PER_DEG_LAT * 0.04;
+  return spanLatDelta > FAN_MAX_SPAN_LAT
+    ? Math.max(15, proportional)
+    : Math.min(60, Math.max(15, proportional));
+}
+
+type PunchCluster<T> = { lat: number; lng: number; members: T[] };
+
+/**
+ * Decide how punches should be drawn: individual pins, fanned apart when they
+ * share a spot, plus counted clusters for groups being viewed from too far
+ * away to fan honestly.
+ *
+ * The previous version fanned at every zoom with a span-proportional radius
+ * and no cap. At a continental span that arithmetic came to a 1,100 km ring
+ * of pins across North America. Proportional was the right idea and wrong
+ * without a ceiling: fanning only tells the truth while the offset is small
+ * against the ground, and past a certain zoom the honest answer is not
+ * "spread them out" but "there are 25 punches here".
+ *
+ * Offsets are display only. Callouts report the real punch, and the region fit
+ * is computed from RAW coordinates so a fan can never inflate it.
+ */
+function presentColocated<
   T extends { clockInLatitude: number; clockInLongitude: number },
->(punches: T[], spanLatDelta: number): (T & { fanLat: number; fanLng: number })[] {
-  // Single-link grouping: each punch joins the first group it is close enough
-  // to, so a straggler on the edge still lands with the rest.
+>(
+  punches: T[],
+  spanLatDelta: number,
+): {
+  pins: (T & { fanLat: number; fanLng: number })[];
+  clusters: PunchCluster<T>[];
+} {
   const nearM = colocatedMetres(spanLatDelta);
   const groups: T[][] = [];
   for (const p of punches) {
     const hit = groups.find((g) =>
-      g.some((q) =>
-        metresApart(
-          p.clockInLatitude,
-          p.clockInLongitude,
-          q.clockInLatitude,
-          q.clockInLongitude,
-        ) <= nearM,
+      g.some(
+        (q) =>
+          metresApart(
+            p.clockInLatitude,
+            p.clockInLongitude,
+            q.clockInLatitude,
+            q.clockInLongitude,
+          ) <= nearM,
       ),
     );
     if (hit) hit.push(p);
     else groups.push([p]);
   }
 
-  // About 6% of the visible height: far enough apart to read as separate pins,
-  // and it stays that way at every zoom because the caller re-fans whenever the
-  // region settles. No absolute cap: one would sit below the grouping distance
-  // at wide zooms and put the pins back on top of each other.
-  const base = Math.max(18, spanLatDelta * M_PER_DEG_LAT * 0.06);
+  const pins: (T & { fanLat: number; fanLng: number })[] = [];
+  const clusters: PunchCluster<T>[] = [];
 
-  const out: (T & { fanLat: number; fanLng: number })[] = [];
   for (const group of groups) {
     if (group.length === 1) {
       const only = group[0]!;
-      out.push({
+      pins.push({
         ...only,
         fanLat: only.clockInLatitude,
         fanLng: only.clockInLongitude,
       });
       continue;
     }
-    // A busy site needs a bigger ring, or a dozen pins land on top of each
-    // other again at the same radius.
-    const radiusM = base * Math.max(1, group.length / 6);
-    group.forEach((p, i) => {
+    if (spanLatDelta > FAN_MAX_SPAN_LAT) {
+      // Zoomed out: one honest counted pin at the group's centre.
+      const lat =
+        group.reduce((sum, q) => sum + q.clockInLatitude, 0) / group.length;
+      const lng =
+        group.reduce((sum, q) => sum + q.clockInLongitude, 0) / group.length;
+      clusters.push({ lat, lng, members: group });
+      continue;
+    }
+    // Zoomed in: fan, in metres, hard capped both ways.
+    const base = Math.min(
+      FAN_RADIUS_CAP_M,
+      Math.max(18, spanLatDelta * M_PER_DEG_LAT * 0.06),
+    );
+    const radiusM = Math.min(
+      FAN_RADIUS_CAP_M,
+      base * Math.min(2, Math.max(1, group.length / 6)),
+    );
+    group.forEach((q, i) => {
       const angle = (2 * Math.PI * i) / group.length;
       const dLat = (radiusM * Math.cos(angle)) / M_PER_DEG_LAT;
       const lngScale =
         M_PER_DEG_LAT *
-        Math.max(0.15, Math.cos((p.clockInLatitude * Math.PI) / 180));
+        Math.max(0.15, Math.cos((q.clockInLatitude * Math.PI) / 180));
       const dLng = (radiusM * Math.sin(angle)) / lngScale;
-      out.push({
-        ...p,
-        fanLat: p.clockInLatitude + dLat,
-        fanLng: p.clockInLongitude + dLng,
+      pins.push({
+        ...q,
+        fanLat: q.clockInLatitude + dLat,
+        fanLng: q.clockInLongitude + dLng,
       });
     });
   }
-  return out;
+  return { pins, clusters };
 }
 
 function clock(ms: number): string {
@@ -435,6 +462,10 @@ export function RosterMap() {
     toKey: string;
   } | null>(null);
   const [customOpen, setCustomOpen] = useState(false);
+  // Typed off the lazily-required module's own type, so this stays a
+  // type-only reference and never pulls react-native-maps into the bundle
+  // ahead of the Map toggle.
+  const mapRef = useRef<InstanceType<MapsModule["default"]> | null>(null);
   // The span actually on screen, which is the initial fit until the manager
   // pans or zooms. The fan is recomputed from it, so pins stay separated when
   // zoomed out and settle back onto their real spots when zoomed in. Fanning
@@ -510,14 +541,14 @@ export function RosterMap() {
     [data, activeWhoId],
   );
 
-  const fannedPunches = useMemo(
+  const { pins: fannedPunches, clusters } = useMemo(
     () =>
       data
-        ? fanColocated(
+        ? presentColocated(
             visiblePunches,
             viewSpan ?? region?.latitudeDelta ?? 0.01,
           )
-        : [],
+        : { pins: [], clusters: [] },
     [data, visiblePunches, region, viewSpan],
   );
 
@@ -611,6 +642,7 @@ export function RosterMap() {
       <View style={styles.mapWrap}>
         {region ? (
           <MapView
+            ref={mapRef}
             style={StyleSheet.absoluteFill}
             initialRegion={region}
             showsUserLocation={false}
@@ -640,6 +672,32 @@ export function RosterMap() {
                 strokeWidth={1.5}
                 fillColor="rgba(184,74,44,0.10)"
               />
+            ))}
+            {/* Groups seen from too far out to fan. One pin, the real
+                count, and a tap that flies you in to where fanning tells the
+                truth. */}
+            {clusters.map((cl) => (
+              <Marker
+                key={`cluster-${cl.lat.toFixed(5)},${cl.lng.toFixed(5)}-${cl.members.length}`}
+                coordinate={{ latitude: cl.lat, longitude: cl.lng }}
+                anchor={{ x: 0.5, y: 0.5 }}
+                tracksViewChanges={trackMarkers}
+                onPress={() =>
+                  mapRef.current?.animateToRegion(
+                    {
+                      latitude: cl.lat,
+                      longitude: cl.lng,
+                      latitudeDelta: FAN_MAX_SPAN_LAT / 3,
+                      longitudeDelta: FAN_MAX_SPAN_LAT / 3,
+                    },
+                    300,
+                  )
+                }
+              >
+                <View style={styles.clusterPin}>
+                  <Text style={styles.clusterText}>{cl.members.length}</Text>
+                </View>
+              </Marker>
             ))}
             {fannedPunches.map((p) => {
               const onClock = p.clockOutMs == null;
@@ -833,6 +891,25 @@ const styles = StyleSheet.create({
     elevation: 4,
   },
   initialsText: { color: c.accentText, fontSize: 12, fontWeight: "800" },
+  /** A counted group at cluster zoom. Same accent fill and paper ring as a
+   *  single punch dot, so it reads as "these pins" rather than a new concept. */
+  clusterPin: {
+    minWidth: 28,
+    height: 28,
+    borderRadius: 14,
+    paddingHorizontal: 6,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: c.accent,
+    borderWidth: 2.5,
+    borderColor: c.accentText,
+    shadowColor: "#000",
+    shadowOpacity: 0.25,
+    shadowRadius: 3,
+    shadowOffset: { width: 0, height: 1 },
+    elevation: 3,
+  },
+  clusterText: { color: c.accentText, fontSize: 12, fontWeight: "700" },
   // Wide enough that a real worksite name ("Riverside Heights Rough-In") wraps
   // between words instead of splitting one.
   callout: { minWidth: 210, padding: 2 },
