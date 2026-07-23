@@ -40,8 +40,16 @@
         "ACCESS_WIFI_STATE",
         "android.permission.ACCESS_COARSE_LOCATION",
         "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.CAMERA",
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_NETWORK_STATE",
+        "ACCESS_WIFI_STATE",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION",
         "android.permission.CAMERA"
-      ]
+      ],
+      "config": {}
     },
     "plugins": [
       "expo-secure-store",
@@ -73,6 +81,12 @@
         "projectId": "2dcdc983-13fa-4199-8a2d-362e610d7d80"
       }
     },
-    "owner": "cloxlabs"
+    "owner": "cloxlabs",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/2dcdc983-13fa-4199-8a2d-362e610d7d80"
+    }
   }
 }
