@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AccessibilityInfo,
   ActivityIndicator,
@@ -620,6 +620,95 @@ function CustomRangeSheet({
   );
 }
 
+/**
+ * One punch row in the bottom sheet, memoized. The list is a plain ScrollView
+ * with up to 400 rows and no virtualization, so without this every render of
+ * the map — a snap, a selection change, a data reload — reconciled all 400
+ * rows. That reconciliation used to run on the UI thread's spare time; now
+ * that the sheet spring is JS-driven (so its position can be read
+ * synchronously on grant), a 400-row burst racing the spring's first frames
+ * would hitch the start of a snap. Memoizing keys each row to its own punch,
+ * site, selected flag, and zone: a snap changes none of those, so no row
+ * re-renders; a selection change flips `selected` on exactly two rows. The
+ * parent must pass STABLE onPress/onMeasureY (useCallback) or the shallow
+ * compare never skips. Punch objects are stable references between renders
+ * (the list filters/sorts data.punches, never re-spreads it), which is what
+ * makes the compare hold.
+ */
+type SheetRowProps = {
+  punch: MapRangeData["punches"][number];
+  site: string | undefined;
+  selected: boolean;
+  orgTz: string | undefined;
+  onPress: (p: MapRangeData["punches"][number]) => void;
+  onMeasureY: (id: string, y: number) => void;
+};
+const SheetRow = memo(function SheetRow({
+  punch: p,
+  site,
+  selected,
+  orgTz,
+  onPress,
+  onMeasureY,
+}: SheetRowProps) {
+  const onClock = p.clockOutMs == null;
+  // Same date-truth rule as the callouts: an out on another day says so.
+  const outOnAnotherDay =
+    p.clockOutMs != null &&
+    shortDate(p.clockOutMs, orgTz) !== shortDate(p.clockInMs, orgTz);
+  const time = onClock
+    ? `On shift since ${clock(p.clockInMs, orgTz)}`
+    : `${clock(p.clockInMs, orgTz)} to ${clock(p.clockOutMs!, orgTz)}${
+        outOnAnotherDay ? ` · ${shortDate(p.clockOutMs!, orgTz)}` : ""
+      }`;
+  const timeLine = site ? `${time} · ${site}` : time;
+  const dotColor = projectDotColor(p.projectColor);
+  return (
+    <Pressable
+      onLayout={(e) => onMeasureY(p.id, e.nativeEvent.layout.y)}
+      onPress={() => onPress(p)}
+      style={[styles.sheetRow, selected && styles.sheetRowSelected]}
+      accessibilityRole="button"
+      accessibilityLabel={`${p.displayName}, ${time}${site ? `, ${site}` : ""}${p.projectName ? `, ${p.projectName}` : ""}`}
+      accessibilityState={{ selected }}
+    >
+      <View
+        style={[
+          styles.sheetDisc,
+          onClock ? styles.sheetDiscOn : styles.sheetDiscDone,
+        ]}
+      >
+        <Text style={styles.sheetDiscText}>{initials(p.displayName)}</Text>
+      </View>
+      {/* Three fixed lines, never a wrap: name, then time and place, then
+          the project only when one exists (§7b item 5 — one Text block
+          wrapping all three ran together and stuttered whenever the
+          project name echoed the site name, e.g. "Riverside Heights" next
+          to "Riverside Heights Rough-In"). */}
+      <View style={styles.sheetRowBody}>
+        <Text style={styles.sheetRowName} numberOfLines={1}>
+          {p.displayName}
+        </Text>
+        <Text style={styles.sheetRowMeta} numberOfLines={1}>
+          {timeLine}
+        </Text>
+        {p.projectName ? (
+          <View style={styles.sheetRowProjectLine}>
+            {dotColor ? (
+              <View
+                style={[styles.sheetProjectDot, { backgroundColor: dotColor }]}
+              />
+            ) : null}
+            <Text style={styles.sheetRowProject} numberOfLines={1}>
+              {p.projectName}
+            </Text>
+          </View>
+        ) : null}
+      </View>
+    </Pressable>
+  );
+});
+
 export function RosterMap() {
   const Maps = useMemo(() => loadMaps(), []);
   const [mode, setMode] = useState<RangeMode>("day");
@@ -818,22 +907,20 @@ export function RosterMap() {
   const [currentSnap, setCurrentSnap] = useState<SheetSnap>("peek");
   // Lazily-initialized state, not useRef().current: the instance is created
   // once and reading state during render is legal where reading a ref is not.
+  //
+  // Every animation on sheetY runs on the JS thread (useNativeDriver:false,
+  // below). The point is that onPanResponderGrant can read the sheet's
+  // CURRENT position synchronously, on the same thread the gesture arrives
+  // on. A native-driven value cannot: its JS-side value refreshes only from
+  // asynchronous onAnimatedValueUpdate events, which under the New
+  // Architecture (Expo SDK 54 turns it on) do not reliably land before a
+  // fresh grant reads them. That staleness is what snapped the sheet back to
+  // its opening position on every second gesture on device — the drag seeded
+  // from the peek value setValue wrote at mount, not the half/full the sheet
+  // had since sprung to. A single translateY on one panel is cheap on the JS
+  // thread (the list rows do not re-render as it slides), so running it there
+  // buys a synchronously-readable position for no real smoothness cost.
   const [sheetY] = useState(() => new Animated.Value(0));
-  // A JS-side shadow of sheetY's live value, so the gesture can read it
-  // SYNCHRONOUSLY. Once any useNativeDriver spring has run, sheetY is
-  // native-driven and stopAnimation(cb) resolves through an async native
-  // round-trip — seeding the drag base in that callback means the first
-  // move events of the NEXT drag (or a whole quick flick) compute against
-  // the previous gesture's base. The listener fires synchronously on
-  // setValue and once per frame during native springs, so this ref is
-  // never more than a frame behind the truth.
-  const sheetYLive = useRef(0);
-  useEffect(() => {
-    const id = sheetY.addListener(({ value }) => {
-      sheetYLive.current = value;
-    });
-    return () => sheetY.removeListener(id);
-  }, [sheetY]);
   const sheetGeo = useRef({ fullOffset: 0, halfOffset: 0, peekOffset: 0 });
   useEffect(() => {
     sheetGeo.current = { fullOffset, halfOffset, peekOffset };
@@ -852,7 +939,7 @@ export function RosterMap() {
       if (animated) {
         Animated.spring(sheetY, {
           toValue: to,
-          useNativeDriver: true,
+          useNativeDriver: false,
           friction: 10,
           tension: 70,
         }).start();
@@ -882,16 +969,20 @@ export function RosterMap() {
       onStartShouldSetPanResponder: () => false,
       onMoveShouldSetPanResponder: (_e, gs) => Math.abs(gs.dy) > 6,
       onPanResponderGrant: () => {
-        // Halt any in-flight spring, then seed the base from the LIVE
-        // value, synchronously via sheetYLive. Two wrong ways to do this:
-        // offsetFor(sheetSnapRef.current) is the animation's TARGET, so a
-        // drag that interrupts a spring teleports the sheet to the
-        // destination on its first move event; stopAnimation's own callback
-        // is asynchronous once sheetY is native-driven (a native getValue
-        // round-trip), so seeding there hands the first move events — or a
-        // whole quick flick — the PREVIOUS gesture's base instead.
-        sheetY.stopAnimation();
-        sheetDragBase.current = sheetYLive.current;
+        // Seed the drag from the sheet's CURRENT position, halting any spring
+        // still in flight. sheetY is JS-driven, so stopAnimation's callback
+        // runs SYNCHRONOUSLY with the exact value the sheet sits at right now
+        // (RN calls it inline for a non-native value; for a native value it
+        // would be an async native round-trip that lands after the first
+        // move events, which would then drag from a stale base). This is the
+        // whole fix for both faults: the snap-back-to-peek reset (base was
+        // the mount-time value, not where the sheet had sprung to) and a grab
+        // that interrupts a spring mid-flight (base is where the finger is,
+        // not the spring's target). offsetFor(sheetSnapRef.current) would be
+        // that target — wrong for a mid-flight grab.
+        sheetY.stopAnimation((v) => {
+          sheetDragBase.current = v;
+        });
       },
       onPanResponderMove: (_e, gs) => {
         const min = sheetGeo.current.fullOffset;
@@ -918,7 +1009,7 @@ export function RosterMap() {
         setCurrentSnap(snap);
         Animated.spring(sheetY, {
           toValue: snap === "full" ? full : snap === "half" ? half : peek,
-          useNativeDriver: true,
+          useNativeDriver: false,
           friction: 10,
           tension: 70,
         }).start();
@@ -927,7 +1018,7 @@ export function RosterMap() {
         // Something else claimed the gesture; settle back to the last snap.
         Animated.spring(sheetY, {
           toValue: offsetFor(sheetSnapRef.current),
-          useNativeDriver: true,
+          useNativeDriver: false,
           friction: 10,
           tension: 70,
         }).start();
@@ -1087,6 +1178,14 @@ export function RosterMap() {
     }
   }, []);
 
+  // Stable across renders so the memoized SheetRow's shallow compare can skip
+  // rows that did not change (see SheetRow). rowYs is a ref, so writing it
+  // here never triggers a render. Declared here, above the Maps early return,
+  // to keep the hook order fixed.
+  const onMeasureRowY = useCallback((id: string, y: number) => {
+    rowYs.current.set(id, y);
+  }, []);
+
   if (!Maps) {
     return (
       <View style={styles.fallback}>
@@ -1139,67 +1238,17 @@ export function RosterMap() {
           visiblePunches.length === 1 ? "punch" : "punches"
         }`;
 
-  const renderSheetRow = (p: MapRangeData["punches"][number]) => {
-    const onClock = p.clockOutMs == null;
-    // Same date-truth rule as the callouts: an out on another day says so.
-    const outOnAnotherDay =
-      p.clockOutMs != null &&
-      shortDate(p.clockOutMs, orgTz) !== shortDate(p.clockInMs, orgTz);
-    const time = onClock
-      ? `On shift since ${clock(p.clockInMs, orgTz)}`
-      : `${clock(p.clockInMs, orgTz)} to ${clock(p.clockOutMs!, orgTz)}${
-          outOnAnotherDay ? ` · ${shortDate(p.clockOutMs!, orgTz)}` : ""
-        }`;
-    const site = worksiteNameById.get(p.id);
-    const timeLine = site ? `${time} · ${site}` : time;
-    const dotColor = projectDotColor(p.projectColor);
-    const selected = selectedPunchId === p.id;
-    return (
-      <Pressable
-        key={p.id}
-        onLayout={(e) => rowYs.current.set(p.id, e.nativeEvent.layout.y)}
-        onPress={() => onRowPress(p)}
-        style={[styles.sheetRow, selected && styles.sheetRowSelected]}
-        accessibilityRole="button"
-        accessibilityLabel={`${p.displayName}, ${time}${site ? `, ${site}` : ""}${p.projectName ? `, ${p.projectName}` : ""}`}
-        accessibilityState={{ selected }}
-      >
-        <View
-          style={[
-            styles.sheetDisc,
-            onClock ? styles.sheetDiscOn : styles.sheetDiscDone,
-          ]}
-        >
-          <Text style={styles.sheetDiscText}>{initials(p.displayName)}</Text>
-        </View>
-        {/* Three fixed lines, never a wrap: name, then time and place, then
-            the project only when one exists (§7b item 5 — one Text block
-            wrapping all three ran together and stuttered whenever the
-            project name echoed the site name, e.g. "Riverside Heights" next
-            to "Riverside Heights Rough-In"). */}
-        <View style={styles.sheetRowBody}>
-          <Text style={styles.sheetRowName} numberOfLines={1}>
-            {p.displayName}
-          </Text>
-          <Text style={styles.sheetRowMeta} numberOfLines={1}>
-            {timeLine}
-          </Text>
-          {p.projectName ? (
-            <View style={styles.sheetRowProjectLine}>
-              {dotColor ? (
-                <View
-                  style={[styles.sheetProjectDot, { backgroundColor: dotColor }]}
-                />
-              ) : null}
-              <Text style={styles.sheetRowProject} numberOfLines={1}>
-                {p.projectName}
-              </Text>
-            </View>
-          ) : null}
-        </View>
-      </Pressable>
-    );
-  };
+  const renderSheetRow = (p: MapRangeData["punches"][number]) => (
+    <SheetRow
+      key={p.id}
+      punch={p}
+      site={worksiteNameById.get(p.id)}
+      selected={selectedPunchId === p.id}
+      orgTz={orgTz}
+      onPress={onRowPress}
+      onMeasureY={onMeasureRowY}
+    />
+  );
 
   return (
     <View style={styles.wrap}>
