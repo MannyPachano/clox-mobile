@@ -26,6 +26,8 @@ import {
 } from "../api";
 import { EditEntryModal } from "../components/EditEntryModal";
 import { haptics } from "../lib/haptics";
+import { getOrgTz } from "../lib/org-tz";
+import { clockInZone, shortDateInZone } from "../lib/zoned-time";
 import { getAccessToken } from "../supabase";
 import { lightColors as c, scrim } from "../theme";
 
@@ -34,20 +36,14 @@ const MONTHS = [
   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
+// Card times render in the ORG's zone, matching the Edit modal each card
+// opens (which seeds its pickers in that zone) and the web approvals queue.
 function clock(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "—:—";
-  let h = d.getHours();
-  const m = d.getMinutes();
-  const ampm = h >= 12 ? "PM" : "AM";
-  h = h % 12 || 12;
-  return `${h}:${m.toString().padStart(2, "0")} ${ampm}`;
+  return clockInZone(Date.parse(iso), getOrgTz());
 }
 
 function dateShort(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "—";
-  return `${MONTHS[d.getMonth()]} ${d.getDate()}`;
+  return shortDateInZone(Date.parse(iso), getOrgTz());
 }
 
 function ymd(s: string): string {

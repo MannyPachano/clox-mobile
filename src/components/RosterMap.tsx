@@ -19,7 +19,19 @@ import DateTimePicker from "@react-native-community/datetimepicker";
 import type { Region } from "react-native-maps";
 
 import { getManagerMapRange, type MapRangeData, type Option } from "../api";
-import { zonedFormat } from "../lib/zoned-time";
+import { getOrgTz } from "../lib/org-tz";
+// Every punch time, date, day key, and day header on this screen renders in
+// the ORG's zone (data.timeZone) — the zone the server resolved the range in
+// and the zone the web sidebar shows. Mixing zones on one screen is the
+// failure mode: a device-local "2:30 AM" under an org-day "Jul 23" header
+// reads as the wrong day. The aliases keep this file's shorter local names.
+import {
+  clockInZone as clock,
+  shortDateInZone as shortDate,
+  wallPartsInZone,
+  weekdayDateInZone as dayHeadingInZone,
+  ymdInZone as dayKeyInZone,
+} from "../lib/zoned-time";
 import { getAccessToken } from "../supabase";
 import { lightColors as c, radii, scrim } from "../theme";
 import { SelectField } from "./SelectField";
@@ -55,36 +67,38 @@ function pad(n: number): string {
 function dayKey(d: Date): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
-function addDays(d: Date, n: number): Date {
-  const x = new Date(d);
-  x.setDate(x.getDate() + n);
-  return x;
-}
-function mondayOf(d: Date): Date {
-  const x = new Date(d);
-  x.setHours(0, 0, 0, 0);
-  const day = x.getDay();
-  x.setDate(x.getDate() + (day === 0 ? -6 : 1 - day));
-  return x;
+
+/** "YYYY-MM-DD" from a UTC-calendar carrier Date (see computeRange). */
+function keyOfUtc(ms: number): string {
+  const d = new Date(ms);
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
 }
 
+/** The presets anchor on the ORG's today — the server resolves these keys as
+ *  org calendar days, so "Day" must mean the day the SITE is living, not the
+ *  manager's phone. Near midnight across zones the two differ, and the wrong
+ *  anchor shows yesterday's (or tomorrow's) punches under a "today" label.
+ *  Calendar arithmetic runs in UTC space, where adding whole days is exact. */
 function computeRange(
   mode: RangeMode,
   custom: { fromKey: string; toKey: string } | null,
+  tz: string | undefined,
 ): { fromKey: string; toKey: string } {
-  const today = new Date();
+  const w = wallPartsInZone(Date.now(), tz);
+  const todayUtc = Date.UTC(w.y, w.mo - 1, w.d);
   if (mode === "week") {
-    const mon = mondayOf(today);
-    return { fromKey: dayKey(mon), toKey: dayKey(addDays(mon, 6)) };
+    const dow = new Date(todayUtc).getUTCDay(); // 0 = Sun
+    const mon = todayUtc - ((dow + 6) % 7) * 86_400_000;
+    return { fromKey: keyOfUtc(mon), toKey: keyOfUtc(mon + 6 * 86_400_000) };
   }
   if (mode === "month") {
-    const first = new Date(today.getFullYear(), today.getMonth(), 1);
-    const last = new Date(today.getFullYear(), today.getMonth() + 1, 0);
-    return { fromKey: dayKey(first), toKey: dayKey(last) };
+    const first = Date.UTC(w.y, w.mo - 1, 1);
+    const last = Date.UTC(w.y, w.mo, 0);
+    return { fromKey: keyOfUtc(first), toKey: keyOfUtc(last) };
   }
   if (mode === "custom" && custom) return custom;
   // Day, and Custom until two dates are picked.
-  const k = dayKey(today);
+  const k = keyOfUtc(todayUtc);
   return { fromKey: k, toKey: k };
 }
 
@@ -303,32 +317,6 @@ function presentColocated<
   return { pins, clusters };
 }
 
-// Punch times and dates render in the ORG's zone (data.timeZone) — the zone
-// the server resolved the range keys in, the zone the sheet's day headers
-// group by, and the zone the web sidebar shows. Mixing zones on one screen
-// is the failure mode: a device-local "2:30 AM" under an org-day "Jul 23"
-// header reads as the wrong day. `tz` undefined (no data yet, or an old
-// server payload without the field) falls back to the device zone.
-function clock(ms: number, tz: string | undefined): string {
-  return zonedFormat(
-    "clock",
-    "en-US",
-    { hour: "numeric", minute: "2-digit", hour12: true },
-    tz,
-    ms,
-  );
-}
-
-function shortDate(ms: number, tz: string | undefined): string {
-  return zonedFormat(
-    "shortDate",
-    "en-US",
-    { month: "short", day: "numeric" },
-    tz,
-    ms,
-  );
-}
-
 function initials(name: string): string {
   const parts = name.trim().split(/\s+/).filter(Boolean);
   if (parts.length === 0) return "?";
@@ -359,36 +347,6 @@ function projectDotColor(token: string | null): string | null {
     default:
       return null;
   }
-}
-
-// The sheet's day headers group by the ORG's calendar day, not the manager's
-// phone's — the server already resolved `from`/`to` and drew every punch's
-// window in the org timeZone (returned on the payload as data.timeZone), so
-// display grouping has to agree with it. Getting this wrong is silent and
-// specific: a manager checking Day in an org east of them sees punches from
-// the evening before spill into their own "WED, JUL 23" day header, right
-// under a peek line and range label that both say "Jul 24" — the two
-// surfaces on the same screen disagreeing about what day it is. `tz`
-// undefined (no data yet, or an old server not yet returning the field)
-// falls back to the device's own zone — the previous, imperfect behavior,
-// not a crash.
-function dayKeyInZone(ms: number, tz: string | undefined): string {
-  return zonedFormat(
-    "dayKey",
-    "en-CA",
-    { year: "numeric", month: "2-digit", day: "2-digit" },
-    tz,
-    ms,
-  );
-}
-function dayHeadingInZone(ms: number, tz: string | undefined): string {
-  return zonedFormat(
-    "dayHead",
-    "en-US",
-    { weekday: "short", month: "short", day: "numeric" },
-    tz,
-    ms,
-  );
 }
 
 /** The bottom sheet's collapsed height: the grab handle plus the count line.
@@ -706,7 +664,15 @@ export function RosterMap() {
   // month is a pile of pins with no way to ask "where was Diego?".
   const [whoId, setWhoId] = useState<string | null>(null);
 
-  const range = useMemo(() => computeRange(mode, custom), [mode, custom]);
+  // getOrgTz() is a render-time module read, not reactive state — safe here
+  // because the zone lands (via the status fetch) before this screen can
+  // mount, and every data load re-renders anyway. Included in the deps so a
+  // late arrival recomputes on the next render rather than never.
+  const orgZone = getOrgTz();
+  const range = useMemo(
+    () => computeRange(mode, custom, orgZone),
+    [mode, custom, orgZone],
+  );
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -1614,9 +1580,13 @@ export function RosterMap() {
       {/* Verbatim, mono — a persistent privacy assurance under the map. */}
       <Text style={styles.privacy}>{PRIVACY_CAPTION}</Text>
 
+      {/* No `key` here on purpose: the conditional render already mounts a
+          fresh sheet (and a fresh seed) on every open, and a range-derived
+          key would REMOUNT the sheet mid-open — discarding the manager's
+          in-progress picks — the moment the org zone lands and shifts a
+          preset's day keys under it. */}
       {customOpen ? (
         <CustomRangeSheet
-          key={`${range.fromKey}:${range.toKey}`}
           initial={range}
           onCancel={() => setCustomOpen(false)}
           onApply={(r) => {

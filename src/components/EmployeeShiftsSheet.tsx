@@ -16,50 +16,35 @@ import {
   type EditableEntry,
   type ManagerEntry,
 } from "../api";
+import { getOrgTz } from "../lib/org-tz";
+import {
+  clockInZone,
+  clockWithDayInZone,
+  weekdayDateInZone,
+} from "../lib/zoned-time";
 import { getAccessToken } from "../supabase";
 import { lightColors as c, scrim } from "../theme";
 import { EditEntryModal } from "./EditEntryModal";
 
-const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const MONTHS = [
-  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
 const DAY_MS = 86_400_000;
 
-function pad(n: number): string {
-  return n.toString().padStart(2, "0");
-}
-
+// Row times render in the ORG's zone, matching the Edit modal a row opens.
 function fmtDate(iso: string): string {
-  const d = new Date(iso);
-  return `${DAYS[d.getDay()]}, ${MONTHS[d.getMonth()]} ${d.getDate()}`;
+  return weekdayDateInZone(Date.parse(iso), getOrgTz());
 }
 
 function clock(iso: string): string {
-  const d = new Date(iso);
-  let h = d.getHours();
-  const m = d.getMinutes();
-  const ap = h >= 12 ? "PM" : "AM";
-  h = h % 12 || 12;
-  return `${h}:${pad(m)} ${ap}`;
+  return clockInZone(Date.parse(iso), getOrgTz());
 }
 
 /**
- * The end time, carrying its date when the shift did not end on the day it
- * started. "6:09 PM to 4:19 PM · 213h 10m" reads as a typo; the day is what
- * makes the hours make sense. Overnight crews hit this every shift, and a
- * missed clock-out turns it into a week.
+ * The end time, carrying its date when the shift did not end on the org day
+ * it started. "6:09 PM to 4:19 PM · 213h 10m" reads as a typo; the day is
+ * what makes the hours make sense. Overnight crews hit this every shift, and
+ * a missed clock-out turns it into a week.
  */
 function endLabel(startIso: string, endIso: string): string {
-  const a = new Date(startIso);
-  const b = new Date(endIso);
-  const sameDay =
-    a.getFullYear() === b.getFullYear() &&
-    a.getMonth() === b.getMonth() &&
-    a.getDate() === b.getDate();
-  if (sameDay) return clock(endIso);
-  return `${MONTHS[b.getMonth()]} ${b.getDate()}, ${clock(endIso)}`;
+  return clockWithDayInZone(Date.parse(endIso), Date.parse(startIso), getOrgTz());
 }
 
 function dur(ms: number): string {

@@ -23,6 +23,8 @@ import { AddEntryModal } from "../components/AddEntryModal";
 import { EditEntryModal } from "../components/EditEntryModal";
 import { EmployeeShiftsSheet } from "../components/EmployeeShiftsSheet";
 import { RosterMap } from "../components/RosterMap";
+import { getOrgTz } from "../lib/org-tz";
+import { clockWithDayInZone } from "../lib/zoned-time";
 import { getAccessToken } from "../supabase";
 import { lightColors as c, radii } from "../theme";
 
@@ -32,15 +34,6 @@ const MODE_KEY = "clox.roster.viewmode.v1";
 // Manager screens use the light "paper" theme (the dark on-shift palette is for
 // an employee's own running clock).
 
-function clock(ms: number): string {
-  const d = new Date(ms);
-  let h = d.getHours();
-  const m = d.getMinutes();
-  const ampm = h >= 12 ? "PM" : "AM";
-  h = h % 12 || 12;
-  return `${h}:${m.toString().padStart(2, "0")} ${ampm}`;
-}
-
 function dur(ms: number): string {
   const min = Math.floor((ms > 0 ? ms : 0) / 60000);
   const h = Math.floor(min / 60);
@@ -48,25 +41,14 @@ function dur(ms: number): string {
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
 
-const MONTHS = [
-  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-
 /**
- * "6:18 PM" for a shift that started today, "Jul 14, 6:18 PM" for one that did
- * not. A shift running for eight days used to show a bare clock time, which
- * reads as this morning until you notice the 195h sitting next to it.
+ * "6:18 PM" for a shift that started on the org's today, "Jul 14, 6:18 PM"
+ * for one that did not — ORG zone, matching the Adjust-start editor this row
+ * opens. A shift running for eight days used to show a bare clock time,
+ * which reads as this morning until you notice the 195h sitting next to it.
  */
 function startedAt(sinceMs: number, nowMs: number): string {
-  const s = new Date(sinceMs);
-  const n = new Date(nowMs);
-  const sameDay =
-    s.getFullYear() === n.getFullYear() &&
-    s.getMonth() === n.getMonth() &&
-    s.getDate() === n.getDate();
-  if (sameDay) return clock(sinceMs);
-  return `${MONTHS[s.getMonth()]} ${s.getDate()}, ${clock(sinceMs)}`;
+  return clockWithDayInZone(sinceMs, nowMs, getOrgTz());
 }
 
 /** Cents → "$1,234.56" without Intl (Hermes support is spotty). */

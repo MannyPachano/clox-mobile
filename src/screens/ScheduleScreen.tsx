@@ -25,7 +25,12 @@ import { AddShiftModal } from "../components/AddShiftModal";
 import { ScheduleBoard } from "../components/ScheduleBoard";
 import { haptics } from "../lib/haptics";
 import { getOrgTz } from "../lib/org-tz";
-import { wallPartsInZone, zonedWallToUtc } from "../lib/zoned-time";
+import {
+  clockInZone,
+  wallPartsInZone,
+  ymdInZone,
+  zonedWallToUtc,
+} from "../lib/zoned-time";
 import { getAccessToken } from "../supabase";
 import { lightColors as c, radii } from "../theme";
 
@@ -44,28 +49,34 @@ function pad(n: number): string {
   return n.toString().padStart(2, "0");
 }
 
-function dayKey(d: Date): string {
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+// The whole week grid — day keys, columns, labels, the query window — lives
+// in the ORG's calendar. A schedule describes the site's days; grouping by
+// the manager's phone's days shows a night shift under the wrong column and
+// disagrees with the web board. Calendar arithmetic runs in UTC space
+// (anchored on the org's today), where adding whole days is exact.
+
+/** "YYYY-MM-DD" from a UTC-calendar carrier ms (see mondayUtcOf). */
+function keyOfUtc(ms: number): string {
+  const d = new Date(ms);
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+}
+
+/** The org day an instant falls on. */
+function dayKeyOf(ms: number, tz: string | undefined): string {
+  return ymdInZone(ms, tz);
 }
 
 function clock(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "--:--";
-  let h = d.getHours();
-  const m = d.getMinutes();
-  const ampm = h >= 12 ? "PM" : "AM";
-  h = h % 12 || 12;
-  return `${h}:${pad(m)} ${ampm}`;
+  return clockInZone(Date.parse(iso), getOrgTz());
 }
 
-/** Monday of the week `offset` weeks from now, at local midnight. */
-function mondayOf(offset: number): Date {
-  const d = new Date();
-  d.setHours(0, 0, 0, 0);
-  const day = d.getDay(); // 0 = Sun
-  const diffToMonday = day === 0 ? -6 : 1 - day;
-  d.setDate(d.getDate() + diffToMonday + offset * 7);
-  return d;
+/** UTC-midnight ms of the Monday of the org week `offset` weeks from now.
+ *  A carrier value: only its UTC calendar fields mean anything. */
+function mondayUtcOf(offset: number, tz: string | undefined): number {
+  const w = wallPartsInZone(Date.now(), tz);
+  const todayUtc = Date.UTC(w.y, w.mo - 1, w.d);
+  const dow = new Date(todayUtc).getUTCDay(); // 0 = Sun
+  return todayUtc - ((dow + 6) % 7) * 86_400_000 + offset * 7 * 86_400_000;
 }
 
 export function ScheduleScreen() {
@@ -78,10 +89,16 @@ export function ScheduleScreen() {
   const [editShift, setEditShift] = useState<ScheduledShiftDto | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
   const [mode, setMode] = useState<ViewMode>("list");
-  const [selectedDayKey, setSelectedDayKey] = useState(() => dayKey(new Date()));
+  const [selectedDayKey, setSelectedDayKey] = useState(() =>
+    dayKeyOf(Date.now(), getOrgTz()),
+  );
   const [isOffline, setIsOffline] = useState(false);
 
-  const todayKey = useMemo(() => dayKey(new Date()), []);
+  // A render-time module read, not reactive state: the zone lands (via the
+  // status fetch) before this tab can be visited, and every data load
+  // re-renders. In the deps so a late arrival recomputes next render.
+  const tz = getOrgTz();
+  const todayKey = useMemo(() => dayKeyOf(new Date().getTime(), tz), [tz]);
 
   // Restore the last-used List/Board view.
   useEffect(() => {
@@ -105,48 +122,65 @@ export function ScheduleScreen() {
     return unsub;
   }, []);
 
-  const weekStart = useMemo(() => mondayOf(weekOffset), [weekOffset]);
+  const weekStartUtc = useMemo(
+    () => mondayUtcOf(weekOffset, tz),
+    [weekOffset, tz],
+  );
 
+  // The query window: instants at the org's midnights bounding the week, so
+  // the fetched set is exactly what the org-day columns will show.
   const range = useMemo(() => {
-    const end = new Date(weekStart);
-    end.setDate(weekStart.getDate() + 7);
-    return { fromIso: weekStart.toISOString(), toIso: end.toISOString() };
-  }, [weekStart]);
+    const partsOf = (ms: number) => {
+      const d = new Date(ms);
+      return {
+        y: d.getUTCFullYear(),
+        mo: d.getUTCMonth() + 1,
+        d: d.getUTCDate(),
+        h: 0,
+        mi: 0,
+      };
+    };
+    return {
+      fromIso: new Date(zonedWallToUtc(partsOf(weekStartUtc), tz)).toISOString(),
+      toIso: new Date(
+        zonedWallToUtc(partsOf(weekStartUtc + 7 * 86_400_000), tz),
+      ).toISOString(),
+    };
+  }, [weekStartUtc, tz]);
 
   const days = useMemo(() => {
     const out: { key: string; label: string }[] = [];
     for (let i = 0; i < 7; i++) {
-      const d = new Date(weekStart);
-      d.setDate(weekStart.getDate() + i);
+      const d = new Date(weekStartUtc + i * 86_400_000);
       out.push({
-        key: dayKey(d),
-        label: `${DOW[d.getDay()]} · ${MONTHS[d.getMonth()]} ${d.getDate()}`,
+        key: keyOfUtc(d.getTime()),
+        label: `${DOW[d.getUTCDay()]} · ${MONTHS[d.getUTCMonth()]} ${d.getUTCDate()}`,
       });
     }
     return out;
-  }, [weekStart]);
+  }, [weekStartUtc]);
 
   const weekLabel = useMemo(() => {
-    const end = new Date(weekStart);
-    end.setDate(weekStart.getDate() + 6);
-    const a = `${MONTHS[weekStart.getMonth()]} ${weekStart.getDate()}`;
+    const start = new Date(weekStartUtc);
+    const end = new Date(weekStartUtc + 6 * 86_400_000);
+    const a = `${MONTHS[start.getUTCMonth()]} ${start.getUTCDate()}`;
     const b =
-      end.getMonth() === weekStart.getMonth()
-        ? `${end.getDate()}`
-        : `${MONTHS[end.getMonth()]} ${end.getDate()}`;
+      end.getUTCMonth() === start.getUTCMonth()
+        ? `${end.getUTCDate()}`
+        : `${MONTHS[end.getUTCMonth()]} ${end.getUTCDate()}`;
     return `${a} to ${b}`;
-  }, [weekStart]);
+  }, [weekStartUtc]);
 
   const byDay = useMemo(() => {
     const m = new Map<string, ScheduledShiftDto[]>();
     for (const s of shifts) {
-      const k = dayKey(new Date(s.startsAt));
+      const k = dayKeyOf(Date.parse(s.startsAt), tz);
       const list = m.get(k);
       if (list) list.push(s);
       else m.set(k, [s]);
     }
     return m;
-  }, [shifts]);
+  }, [shifts, tz]);
 
   const dayKeys = useMemo(() => days.map((d) => d.key), [days]);
 
@@ -159,45 +193,23 @@ export function ScheduleScreen() {
       ? todayKey
       : (dayKeys[0] ?? todayKey);
 
-  // Move a shift to another day, keeping its wall-clock time and duration.
-  // The wall-clock is read and recomposed in the ORG's zone (a schedule
-  // describes the site's mornings, and a drag on a traveling manager's phone
-  // must not shift the crew's 9:00 AM) — but the DISTANCE moved is the day
-  // DELTA between the board columns, which are DEVICE-local day keys. The
-  // delta is what the gesture means: reinterpreting the device-day targetKey
-  // as an org calendar date directly would move the shift an extra day
-  // whenever the start straddles the two zones' midnights (and make a
-  // one-column drag a no-op in the other direction). Applying the delta to
-  // the org date keeps the card landing exactly on the drop column.
-  // Optimistic: the card jumps immediately and rolls back on failure.
+  // Move a shift to another day, keeping its org wall-clock time and its
+  // duration. The board's columns ARE org days now, so the drop target reads
+  // directly as the org calendar date to recompose onto — a drag on a
+  // traveling manager's phone never shifts the crew's 9:00 AM. Optimistic:
+  // the card jumps immediately and rolls back on failure.
   const moveShiftToDay = useCallback(
     async (shift: ScheduledShiftDto, targetKey: string) => {
       const token = await getAccessToken();
       if (!token) return;
-      const tz = getOrgTz();
-      const start = new Date(shift.startsAt);
-      const startMs = start.getTime();
+      const zone = getOrgTz();
+      const startMs = Date.parse(shift.startsAt);
       const durationMs = Date.parse(shift.endsAt) - startMs;
-      const parseKey = (key: string): number => {
-        const [y, m, d] = key.split("-").map(Number);
-        return Date.UTC(y ?? 1970, (m ?? 1) - 1, d ?? 1);
-      };
-      const dayDelta = Math.round(
-        (parseKey(targetKey) - parseKey(dayKey(start))) / 86_400_000,
-      );
-      const wall = wallPartsInZone(startMs, tz);
-      const shifted = new Date(
-        Date.UTC(wall.y, wall.mo - 1, wall.d) + dayDelta * 86_400_000,
-      );
+      const wall = wallPartsInZone(startMs, zone);
+      const [ty, tm, td] = targetKey.split("-").map(Number);
       const newStartMs = zonedWallToUtc(
-        {
-          y: shifted.getUTCFullYear(),
-          mo: shifted.getUTCMonth() + 1,
-          d: shifted.getUTCDate(),
-          h: wall.h,
-          mi: wall.mi,
-        },
-        tz,
+        { y: ty ?? 1970, mo: tm ?? 1, d: td ?? 1, h: wall.h, mi: wall.mi },
+        zone,
       );
       const startIso = new Date(newStartMs).toISOString();
       const endIso = new Date(newStartMs + durationMs).toISOString();
@@ -206,7 +218,7 @@ export function ScheduleScreen() {
       // refetch/add/delete during the in-flight save isn't clobbered. Restore
       // the day the user was viewing (the shift's source day) so a failed move
       // doesn't strand them on the now-empty target day.
-      const sourceKey = dayKey(start);
+      const sourceKey = dayKeyOf(startMs, zone);
       setShifts((s) =>
         s.map((x) =>
           x.id === shift.id ? { ...x, startsAt: startIso, endsAt: endIso } : x,

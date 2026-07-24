@@ -30,6 +30,12 @@ import {
 } from "../api";
 import { precheckGeofence, type Fence } from "../geofence";
 import { haptics } from "../lib/haptics";
+import { getOrgTz } from "../lib/org-tz";
+import {
+  clockInZone,
+  clockWithDayInZone,
+  weekdayDateInZone,
+} from "../lib/zoned-time";
 import { SelectField } from "../components/SelectField";
 import { SelfieCapture } from "../components/SelfieCapture";
 import { EditEntryModal } from "../components/EditEntryModal";
@@ -61,12 +67,6 @@ import { newUuid } from "../uuid";
 // Android. Module-level so it runs once, before any clock-in.
 NetInfo.configure({ shouldFetchWiFiSSID: true });
 
-const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const MONTHS = [
-  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-
 /** How the blocked-clock-in alert names the required network(s). */
 function wifiNetworkNames(ssids: string[]): string {
   const named = ssids.map((s) => s.trim()).filter((s) => s.length > 0);
@@ -82,37 +82,10 @@ function formatElapsed(ms: number): string {
   )}:${pad(total % 60)}`;
 }
 
-/**
- * End time plus its date when the shift crossed midnight. A night crew's
- * "6:00 PM to 2:30 AM" is otherwise indistinguishable from a shift that
- * somehow ran backwards.
- */
-function formatEnd(startMs: number, endMs: number): string {
-  const a = new Date(startMs);
-  const b = new Date(endMs);
-  const sameDay =
-    a.getFullYear() === b.getFullYear() &&
-    a.getMonth() === b.getMonth() &&
-    a.getDate() === b.getDate();
-  if (sameDay) return formatClock(endMs);
-  return `${MONTHS[b.getMonth()]} ${b.getDate()}, ${formatClock(endMs)}`;
-}
-
-function formatClock(ms: number): string {
-  const d = new Date(ms);
-  if (Number.isNaN(d.getTime())) return "—:—";
-  let h = d.getHours();
-  const m = d.getMinutes();
-  const ampm = h >= 12 ? "PM" : "AM";
-  h = h % 12 || 12;
-  return `${h}:${m.toString().padStart(2, "0")} ${ampm}`;
-}
-
-function formatDate(ms: number): string {
-  const d = new Date(ms);
-  if (Number.isNaN(d.getTime())) return "—";
-  return `${DAYS[d.getDay()]}, ${MONTHS[d.getMonth()]} ${d.getDate()}`;
-}
+// Shift times (history rows, upcoming scheduled) render in the ORG's zone
+// via the shared zoned-time formatters, matching the edit modals they open
+// and the web app. The live clock card is the one deliberate exception: it
+// is the PHONE's clock, so it formats with tz undefined (device zone).
 
 function formatDuration(ms: number): string {
   const min = Math.round((ms > 0 ? ms : 0) / 60000);
@@ -742,8 +715,11 @@ export function ClockScreen({
             {!clockedIn ? (
               <>
                 <Text style={styles.statusLabel}>NOT CLOCKED IN</Text>
-                <Text style={styles.clockNow}>{formatClock(now)}</Text>
-                <Text style={styles.dateNow}>{formatDate(now)}</Text>
+                {/* The phone's own clock — device zone on purpose. */}
+                <Text style={styles.clockNow}>{clockInZone(now, undefined)}</Text>
+                <Text style={styles.dateNow}>
+                  {weekdayDateInZone(now, undefined)}
+                </Text>
               </>
             ) : (
               <>
@@ -907,11 +883,15 @@ export function ClockScreen({
                 <View key={s.id} style={styles.historyRow}>
                   <View style={styles.historyLeft}>
                     <Text style={styles.historyDate}>
-                      {formatDate(Date.parse(s.startsAt))}
+                      {weekdayDateInZone(Date.parse(s.startsAt), getOrgTz())}
                     </Text>
                     <Text style={styles.historySub} numberOfLines={1}>
-                      {formatClock(Date.parse(s.startsAt))} to{" "}
-                      {formatEnd(Date.parse(s.startsAt), Date.parse(s.endsAt))}
+                      {clockInZone(Date.parse(s.startsAt), getOrgTz())} to{" "}
+                      {clockWithDayInZone(
+                        Date.parse(s.endsAt),
+                        Date.parse(s.startsAt),
+                        getOrgTz(),
+                      )}
                     </Text>
                   </View>
                 </View>
@@ -939,7 +919,7 @@ export function ClockScreen({
                   <View style={styles.historyLeft}>
                     <View style={styles.historyDateRow}>
                       <Text style={styles.historyDate}>
-                        {formatDate(Date.parse(s.start))}
+                        {weekdayDateInZone(Date.parse(s.start), getOrgTz())}
                       </Text>
                       {s.rejected ? (
                         <View style={styles.rejectedBadge}>
@@ -948,8 +928,12 @@ export function ClockScreen({
                       ) : null}
                     </View>
                     <Text style={styles.historySub} numberOfLines={1}>
-                      {formatClock(Date.parse(s.start))} to{" "}
-                      {formatEnd(Date.parse(s.start), Date.parse(s.end))}
+                      {clockInZone(Date.parse(s.start), getOrgTz())} to{" "}
+                      {clockWithDayInZone(
+                        Date.parse(s.end),
+                        Date.parse(s.start),
+                        getOrgTz(),
+                      )}
                       {s.project ? ` · ${s.project}` : ""}
                     </Text>
                     {s.rejected ? (

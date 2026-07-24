@@ -155,3 +155,63 @@ export function ymdInZone(ms: number, tz: string | undefined): string {
     ms,
   );
 }
+
+// ── Shared display formatters. Every screen that shows a shift's time uses
+//    these with the ORG zone, so what a list says always matches what the
+//    edit modal seeded from the same instant (and what the web app shows).
+//    tz undefined formats in the device zone — that is deliberate for the
+//    one surface describing the PHONE (the live clock card), and the
+//    fallback for payloads that predate the org-zone field.
+
+/** "3:05 PM" — the wall-clock an instant shows in `tz`. */
+export function clockInZone(ms: number, tz: string | undefined): string {
+  if (Number.isNaN(ms)) return "—:—";
+  return zonedFormat(
+    "clock",
+    "en-US",
+    { hour: "numeric", minute: "2-digit", hour12: true },
+    tz,
+    ms,
+  );
+}
+
+/** "Jul 14" in `tz`. */
+export function shortDateInZone(ms: number, tz: string | undefined): string {
+  if (Number.isNaN(ms)) return "—";
+  return zonedFormat(
+    "shortDate",
+    "en-US",
+    { month: "short", day: "numeric" },
+    tz,
+    ms,
+  );
+}
+
+/** "Wed, Jul 23" in `tz`. */
+export function weekdayDateInZone(ms: number, tz: string | undefined): string {
+  if (Number.isNaN(ms)) return "—";
+  return zonedFormat(
+    "weekdayDate",
+    "en-US",
+    { weekday: "short", month: "short", day: "numeric" },
+    tz,
+    ms,
+  );
+}
+
+/** "3:05 PM" when `ms` falls on the same `tz` day as `refMs`, else
+ *  "Jul 14, 3:05 PM". The date is what keeps an overnight end (or a
+ *  days-old running start) from reading as this morning's. */
+export function clockWithDayInZone(
+  ms: number,
+  refMs: number,
+  tz: string | undefined,
+): string {
+  // Same degradation as the sibling formatters: Intl.format(new Date(NaN))
+  // THROWS, and this must never turn a malformed timestamp into a render
+  // crash. A NaN ref just drops the date suffix.
+  if (Number.isNaN(ms)) return clockInZone(ms, tz);
+  if (Number.isNaN(refMs)) return clockInZone(ms, tz);
+  if (ymdInZone(ms, tz) === ymdInZone(refMs, tz)) return clockInZone(ms, tz);
+  return `${shortDateInZone(ms, tz)}, ${clockInZone(ms, tz)}`;
+}

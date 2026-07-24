@@ -24,29 +24,24 @@ import {
 
 import { type BoardColor, type ScheduledShiftDto } from "../api";
 import { haptics } from "../lib/haptics";
+import { getOrgTz } from "../lib/org-tz";
+import { clockInZone, ymdInZone } from "../lib/zoned-time";
 import { lightColors as c, radii, spacing } from "../theme";
 
 const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
-function pad(n: number): string {
-  return n.toString().padStart(2, "0");
-}
-
-/** Parse a `YYYY-MM-DD` day key into a LOCAL Date (device zone), matching how
- *  ScheduleScreen derives day keys from shift times. */
+/** Parse a `YYYY-MM-DD` day key into a calendar-carrier Date, read only for
+ *  its Y/M/D fields when labeling a column (the keys are ORG days now, so
+ *  the label is zone-free once the key exists). */
 function localDate(key: string): Date {
   const [y, m, d] = key.split("-").map(Number);
   return new Date(y ?? 1970, (m ?? 1) - 1, d ?? 1);
 }
 
+// Card times render in the ORG's zone, matching the columns' org-day keys
+// and the AddShiftModal a card opens.
 function clock(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "--:--";
-  let h = d.getHours();
-  const m = d.getMinutes();
-  const ampm = h >= 12 ? "PM" : "AM";
-  h = h % 12 || 12;
-  return `${h}:${pad(m)} ${ampm}`;
+  return clockInZone(Date.parse(iso), getOrgTz());
 }
 
 /** The board palette maps the seven tokens onto the mobile theme (clay=accent,
@@ -383,10 +378,9 @@ export function ScheduleBoard({
   );
 }
 
-/** Day key of an ISO instant in the device zone (matches ScheduleScreen). */
+/** Day key of an ISO instant in the ORG zone (matches ScheduleScreen). */
 function dayKeyOf(iso: string): string {
-  const d = new Date(iso);
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  return ymdInZone(Date.parse(iso), getOrgTz());
 }
 
 type CardProps = {
