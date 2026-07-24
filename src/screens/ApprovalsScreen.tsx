@@ -1,6 +1,7 @@
 import { useCallback, useState } from "react";
 import {
   ActivityIndicator,
+  KeyboardAvoidingView,
   Modal,
   Pressable,
   RefreshControl,
@@ -424,33 +425,50 @@ export function ApprovalsScreen() {
         animationType="slide"
         onRequestClose={() => setRejectTarget(null)}
       >
+        {/* The reason input and the Reject button must ride ABOVE the
+            keyboard — without this the whole sheet sits behind it and the
+            manager types blind. behavior="padding" on BOTH platforms: an RN
+            Modal's dialog window never honors adjustResize under SDK 54's
+            forced edge-to-edge, so padding is the only mechanism that works
+            on Android too (see EditEntryModal for the full story). */}
+        <KeyboardAvoidingView style={styles.rejectKav} behavior="padding">
         <Pressable
           style={styles.rejectBackdrop}
           onPress={() => (rejecting ? null : setRejectTarget(null))}
         >
           <Pressable style={styles.rejectSheet} onPress={() => {}}>
-            <Text style={styles.rejectTitle}>Reject this shift?</Text>
-            {rejectTarget ? (
-              <Text style={styles.rejectMeta}>{rejectTarget.label}</Text>
-            ) : null}
-            <Text style={styles.rejectLabel}>Reason (the employee will see this)</Text>
-            <TextInput
-              style={styles.rejectInput}
-              value={rejectReason}
-              onChangeText={setRejectReason}
-              placeholder="Not scheduled. Please confirm with the foreman."
-              placeholderTextColor={c.textMuted}
-              editable={!rejecting}
-              multiline
-              maxLength={280}
-            />
-            <Text style={styles.rejectNote}>
-              The shift stays on their timesheet so they can correct and
-              resubmit. Nothing is deleted.
-            </Text>
-            {rejectError ? (
-              <Text style={styles.rejectError}>{rejectError}</Text>
-            ) : null}
+            {/* The content scrolls and the sheet is height-capped so a long
+                reason (the input grows to ~7 lines at its 280 cap) plus the
+                keyboard can never push the title off the top of a small
+                screen; the actions row stays pinned below the scroll, like
+                the entry modals. */}
+            <ScrollView
+              style={styles.rejectScroll}
+              keyboardShouldPersistTaps="handled"
+            >
+              <Text style={styles.rejectTitle}>Reject this shift?</Text>
+              {rejectTarget ? (
+                <Text style={styles.rejectMeta}>{rejectTarget.label}</Text>
+              ) : null}
+              <Text style={styles.rejectLabel}>Reason (the employee will see this)</Text>
+              <TextInput
+                style={styles.rejectInput}
+                value={rejectReason}
+                onChangeText={setRejectReason}
+                placeholder="Not scheduled. Please confirm with the foreman."
+                placeholderTextColor={c.textMuted}
+                editable={!rejecting}
+                multiline
+                maxLength={280}
+              />
+              <Text style={styles.rejectNote}>
+                The shift stays on their timesheet so they can correct and
+                resubmit. Nothing is deleted.
+              </Text>
+              {rejectError ? (
+                <Text style={styles.rejectError}>{rejectError}</Text>
+              ) : null}
+            </ScrollView>
             <View style={styles.rejectActions}>
               <TouchableOpacity
                 onPress={() => setRejectTarget(null)}
@@ -477,6 +495,7 @@ export function ApprovalsScreen() {
             </View>
           </Pressable>
         </Pressable>
+        </KeyboardAvoidingView>
       </Modal>
 
       {banner ? (
@@ -562,6 +581,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
   },
   bannerText: { color: c.accentText, fontSize: 14, textAlign: "center" },
+  rejectKav: { flex: 1 },
   rejectBackdrop: {
     flex: 1,
     backgroundColor: scrim,
@@ -573,7 +593,9 @@ const styles = StyleSheet.create({
     borderTopRightRadius: 20,
     padding: 20,
     paddingBottom: 28,
+    maxHeight: "88%",
   },
+  rejectScroll: { flexShrink: 1 },
   rejectTitle: { color: c.text, fontSize: 20, fontWeight: "800" },
   rejectMeta: { color: c.textMuted, fontSize: 14, marginTop: 4, marginBottom: 8 },
   rejectLabel: {

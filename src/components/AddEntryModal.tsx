@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  KeyboardAvoidingView,
   Modal,
   Pressable,
   ScrollView,
@@ -12,37 +13,16 @@ import {
 } from "react-native";
 
 import { createManagerEntry, getStatus, type Option } from "../api";
+import { buildEditDays } from "../lib/edit-time";
+import { getOrgTz } from "../lib/org-tz";
+import { saveErrorMessage } from "../lib/save-error";
+import { zonedWallToUtc } from "../lib/zoned-time";
 import { getAccessToken } from "../supabase";
 import { lightColors as c, scrim } from "../theme";
 import { SelectField } from "./SelectField";
 
-const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const MONTHS = [
-  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-
 function pad(n: number): string {
   return n.toString().padStart(2, "0");
-}
-
-/** Last 14 days as options, id = "YYYY-MM-DD" (local). */
-function buildDays(): Option[] {
-  const base = new Date();
-  base.setHours(0, 0, 0, 0);
-  const out: Option[] = [];
-  for (let i = 0; i < 14; i++) {
-    const d = new Date(base.getTime() - i * 86_400_000);
-    const id = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-    const name =
-      i === 0
-        ? "Today"
-        : i === 1
-          ? "Yesterday"
-          : `${DAYS[d.getDay()]}, ${MONTHS[d.getMonth()]} ${d.getDate()}`;
-    out.push({ id, name });
-  }
-  return out;
 }
 
 /** Times in 15-min steps, id = "HH:MM" (24h), name = "9:00 AM". */
@@ -58,12 +38,20 @@ function buildTimes(): Option[] {
   return out;
 }
 
-function toIso(dateId: string, timeId: string): string | null {
+/** Compose a day + "HH:MM" as ORG wall-clock into an ISO instant. A manager
+ *  adding "9:00 AM" means the site's morning, whatever zone their phone is
+ *  in — device-zone composition here is how a traveling manager writes a
+ *  shift the org never worked. */
+function toIso(
+  dateId: string,
+  timeId: string,
+  tz: string | undefined,
+): string | null {
   const [y, mo, d] = dateId.split("-").map(Number);
   const [h, mi] = timeId.split(":").map(Number);
   if (!y || !mo || !d || Number.isNaN(h) || Number.isNaN(mi)) return null;
-  const dt = new Date(y, mo - 1, d, h, mi, 0, 0);
-  return Number.isNaN(dt.getTime()) ? null : dt.toISOString();
+  const ms = zonedWallToUtc({ y, mo, d, h, mi }, tz);
+  return Number.isNaN(ms) ? null : new Date(ms).toISOString();
 }
 
 type Props = {
@@ -74,7 +62,9 @@ type Props = {
 };
 
 export function AddEntryModal({ visible, employees, onClose, onCreated }: Props) {
-  const days = useMemo(buildDays, []);
+  // The org zone the picks compose in, frozen per open (see EditEntryModal).
+  const [tz, setTz] = useState<string | undefined>(undefined);
+  const days = useMemo(() => buildEditDays(tz), [tz]);
   const times = useMemo(buildTimes, []);
 
   const [projects, setProjects] = useState<Option[]>([]);
@@ -86,10 +76,26 @@ export function AddEntryModal({ visible, employees, onClose, onCreated }: Props)
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Only a date the USER picked survives a reopen. The mount-time default is
+  // built before the org zone is known (device zone), and near midnight the
+  // device's today is the org's yesterday — keeping that stale default would
+  // open the first Add entry with "Yesterday" preselected.
+  const datePicked = useRef(false);
 
   useEffect(() => {
     if (!visible) return;
     setError(null);
+    const zone = getOrgTz();
+    setTz(zone);
+    // The day list is zone-dependent; keep a pick the user actually made
+    // when it is still in the fresh list (the ids are stable "YYYY-MM-DD"
+    // strings), else default to the org's today.
+    const fresh = buildEditDays(zone);
+    setDateId((cur) =>
+      datePicked.current && fresh.some((d) => d.id === cur)
+        ? cur
+        : (fresh[0]?.id ?? ""),
+    );
     void getAccessToken().then(async (t) => {
       if (!t) return;
       try {
@@ -108,6 +114,7 @@ export function AddEntryModal({ visible, employees, onClose, onCreated }: Props)
     setProjectId(null);
     setNote("");
     setDateId(days[0]?.id ?? "");
+    datePicked.current = false;
     setError(null);
   }
 
@@ -120,8 +127,8 @@ export function AddEntryModal({ visible, employees, onClose, onCreated }: Props)
     setError(null);
     if (!employeeId) return setError("Pick an employee.");
     if (!startId || !endId) return setError("Pick start and end times.");
-    const startIso = toIso(dateId, startId);
-    const endIso = toIso(dateId, endId);
+    const startIso = toIso(dateId, startId, tz);
+    const endIso = toIso(dateId, endId, tz);
     if (!startIso || !endIso) return setError("Invalid time.");
     if (Date.parse(endIso) <= Date.parse(startIso)) {
       return setError("End must be after start.");
@@ -144,7 +151,9 @@ export function AddEntryModal({ visible, employees, onClose, onCreated }: Props)
         reset();
         onCreated();
       } else {
-        setError("Couldn't add the entry. Try again.");
+        setError(
+          saveErrorMessage(res.error, "Couldn't add the entry. Try again."),
+        );
       }
     } catch {
       setError("No connection. Try again.");
@@ -160,6 +169,12 @@ export function AddEntryModal({ visible, employees, onClose, onCreated }: Props)
       animationType="slide"
       onRequestClose={cancel}
     >
+      {/* Keeps the note input and the actions above the keyboard.
+          behavior="padding" on BOTH platforms: an RN Modal's dialog window
+          never honors adjustResize under SDK 54's forced edge-to-edge, so
+          padding is the only mechanism that works on Android too (see
+          EditEntryModal for the full story). */}
+      <KeyboardAvoidingView style={styles.kav} behavior="padding">
       <Pressable style={styles.backdrop} onPress={cancel}>
         <Pressable style={styles.sheet} onPress={() => {}}>
           <Text style={styles.title}>Add entry</Text>
@@ -176,7 +191,10 @@ export function AddEntryModal({ visible, employees, onClose, onCreated }: Props)
               value={dateId}
               options={days}
               placeholder="Date"
-              onSelect={(v) => setDateId(v ?? days[0]?.id ?? "")}
+              onSelect={(v) => {
+                datePicked.current = true;
+                setDateId(v ?? days[0]?.id ?? "");
+              }}
             />
             <SelectField
               label="Start"
@@ -228,11 +246,13 @@ export function AddEntryModal({ visible, employees, onClose, onCreated }: Props)
           </View>
         </Pressable>
       </Pressable>
+      </KeyboardAvoidingView>
     </Modal>
   );
 }
 
 const styles = StyleSheet.create({
+  kav: { flex: 1 },
   backdrop: {
     flex: 1,
     backgroundColor: scrim,

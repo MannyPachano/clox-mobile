@@ -19,6 +19,7 @@ import DateTimePicker from "@react-native-community/datetimepicker";
 import type { Region } from "react-native-maps";
 
 import { getManagerMapRange, type MapRangeData, type Option } from "../api";
+import { zonedFormat } from "../lib/zoned-time";
 import { getAccessToken } from "../supabase";
 import { lightColors as c, radii, scrim } from "../theme";
 import { SelectField } from "./SelectField";
@@ -300,40 +301,6 @@ function presentColocated<
     });
   }
   return { pins, clusters };
-}
-
-// Formatter cache: constructing an Intl.DateTimeFormat is the expensive
-// part (the format call itself is cheap), and the sheet rows call these
-// helpers several times per row per render — at the 400-punch cap that is
-// over a thousand constructions per render without it. The cache stays
-// tiny: four shapes times the handful of org zones one device ever sees.
-const dtfCache = new Map<string, Intl.DateTimeFormat>();
-function zonedFormat(
-  shape: string,
-  locale: string,
-  opts: Intl.DateTimeFormatOptions,
-  tz: string | undefined,
-  ms: number,
-): string {
-  const key = `${shape}|${tz ?? "device"}`;
-  let f = dtfCache.get(key);
-  if (!f) {
-    try {
-      f = new Intl.DateTimeFormat(locale, { ...opts, timeZone: tz });
-    } catch {
-      // The org's zone can be one this device's ICU has never heard of —
-      // the picker validates against the SERVER's tzdata, and e.g.
-      // "Europe/Kyiv" only exists in tzdata 2022b+, which old Android
-      // phones may predate. ECMA-402 says unknown timeZone THROWS, and
-      // this runs inside render, so without the catch one stale phone
-      // takes the whole app down every time this org's map opens. Device
-      // zone beats a crash; the web repo guards this same constructor
-      // (isFormattableZone) for the same reason.
-      f = new Intl.DateTimeFormat(locale, opts);
-    }
-    dtfCache.set(key, f);
-  }
-  return f.format(new Date(ms));
 }
 
 // Punch times and dates render in the ORG's zone (data.timeZone) — the zone

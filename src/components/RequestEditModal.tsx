@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  KeyboardAvoidingView,
   Modal,
   Pressable,
   ScrollView,
@@ -24,6 +25,9 @@ import {
   withDay,
   ymdOf,
 } from "../lib/edit-time";
+import { getOrgTz } from "../lib/org-tz";
+import { saveErrorMessage } from "../lib/save-error";
+import { pickerDateInZone, sameWallFields } from "../lib/zoned-time";
 import { getAccessToken } from "../supabase";
 import { lightColors as c, scrim } from "../theme";
 import { SelectField } from "./SelectField";
@@ -55,7 +59,10 @@ export function RequestEditModal({
   onClose,
   onSubmitted,
 }: Props) {
-  const days = useMemo(buildEditDays, []);
+  // The org zone the pickers were SEEDED in, frozen per open — seeding and
+  // composing must share one zone (see EditEntryModal).
+  const [tz, setTz] = useState<string | undefined>(undefined);
+  const days = useMemo(() => buildEditDays(tz), [tz]);
 
   const [projects, setProjects] = useState<Option[]>([]);
   const [dateId, setDateId] = useState("");
@@ -69,20 +76,56 @@ export function RequestEditModal({
   const dayOptions = useMemo(() => withDay(days, dateId), [days, dateId]);
 
   // Prefill on every open so reopening starts from the shift's real values,
-  // not leftover edits from a previous visit.
+  // not leftover edits from a previous visit. Times seed in the ORG's zone:
+  // the pickers show the site's clock, matching the web and the worker's
+  // own description of the shift.
+  // What the pickers were seeded WITH, so submit() can tell an untouched
+  // picker apart and send the shift's ORIGINAL ISO instead of recomposing
+  // (wall fields cannot represent every instant on DST nights — see
+  // EditEntryModal's seedRef).
+  const seedRef = useRef<{
+    dateId: string;
+    startIso: string;
+    startShell: Date;
+    endIso: string | null;
+    endShell: Date;
+  } | null>(null);
+
   useEffect(() => {
     if (!visible) return;
+    const zone = getOrgTz();
+    setTz(zone);
     if (startOnly) {
       if (!running) return;
-      setDateId(ymdOf(running.start));
-      setStartTime(new Date(running.start));
-      setEndTime(new Date());
+      const day = ymdOf(running.start, zone);
+      const startShell = pickerDateInZone(running.start, zone);
+      const endShell = pickerDateInZone(new Date().toISOString(), zone);
+      seedRef.current = {
+        dateId: day,
+        startIso: running.start,
+        startShell,
+        endIso: null,
+        endShell,
+      };
+      setDateId(day);
+      setStartTime(startShell);
+      setEndTime(endShell);
       setProjectId(null);
     } else {
       if (!shift) return;
-      setDateId(ymdOf(shift.start));
-      setStartTime(new Date(shift.start));
-      setEndTime(new Date(shift.end));
+      const day = ymdOf(shift.start, zone);
+      const startShell = pickerDateInZone(shift.start, zone);
+      const endShell = pickerDateInZone(shift.end, zone);
+      seedRef.current = {
+        dateId: day,
+        startIso: shift.start,
+        startShell,
+        endIso: shift.end,
+        endShell,
+      };
+      setDateId(day);
+      setStartTime(startShell);
+      setEndTime(endShell);
       setProjectId(shift.projectId);
     }
     setReason("");
@@ -107,24 +150,35 @@ export function RequestEditModal({
     setError(null);
     // Start-only (running shift): send the new start alone. No endIso — the
     // server rejects an end on a running entry and approval keeps it running.
+    // An untouched picker sends the shift's original ISO (see seedRef).
+    const seed = seedRef.current;
+    const keepStart =
+      seed != null &&
+      dateId === seed.dateId &&
+      sameWallFields(startTime, seed.startShell);
     let input: Parameters<typeof createEntryEditRequest>[1];
     if (startOnly) {
       if (!running) return;
-      const start = buildRunningStart(dateId, startTime);
+      const start = buildRunningStart(dateId, startTime, tz);
       if (!start.ok) return setError(start.error);
       input = {
         timeEntryId: running.id,
-        startIso: start.startIso,
+        startIso: keepStart ? seed.startIso : start.startIso,
         reason: reason.trim() || null,
       };
     } else {
       if (!shift) return;
-      const range = buildShiftRange(dateId, startTime, endTime);
+      const range = buildShiftRange(dateId, startTime, endTime, tz);
       if (!range.ok) return setError(range.error);
+      const keepEnd =
+        seed != null &&
+        seed.endIso != null &&
+        dateId === seed.dateId &&
+        sameWallFields(endTime, seed.endShell);
       input = {
         timeEntryId: shift.id,
-        startIso: range.startIso,
-        endIso: range.endIso,
+        startIso: keepStart ? seed.startIso : range.startIso,
+        endIso: keepEnd ? (seed.endIso ?? range.endIso) : range.endIso,
         projectId,
         reason: reason.trim() || null,
       };
@@ -140,7 +194,18 @@ export function RequestEditModal({
       if (res.ok) onSubmitted();
       else if (res.status === 409) {
         setError("This shift is already approved. Ask your manager to reopen it first.");
-      } else setError("Couldn't send the request. Try again.");
+      } else {
+        // This route files a future start (running shift) and end-not-after-
+        // start (completed shift) under bad_range; breaks are never checked
+        // here, so the shared sentence's silence about them stays honest and
+        // the override names the two real rules.
+        setError(
+          saveErrorMessage(res.error, "Couldn't send the request. Try again.", {
+            bad_range:
+              "Those times don't work. The start has to be in the past, and the end after the start.",
+          }),
+        );
+      }
     } catch {
       setError("No connection. Try again.");
     } finally {
@@ -155,6 +220,12 @@ export function RequestEditModal({
       animationType="slide"
       onRequestClose={onClose}
     >
+      {/* Keeps the reason input and the actions above the keyboard.
+          behavior="padding" on BOTH platforms: an RN Modal's dialog window
+          never honors adjustResize under SDK 54's forced edge-to-edge, so
+          padding is the only mechanism that works on Android too (see
+          EditEntryModal for the full story). */}
+      <KeyboardAvoidingView style={styles.kav} behavior="padding">
       <Pressable style={styles.backdrop} onPress={onClose}>
         <Pressable style={styles.sheet} onPress={() => {}}>
           <Text style={styles.title}>
@@ -225,11 +296,13 @@ export function RequestEditModal({
           </Pressable>
         </Pressable>
       </Pressable>
+      </KeyboardAvoidingView>
     </Modal>
   );
 }
 
 const styles = StyleSheet.create({
+  kav: { flex: 1 },
   backdrop: {
     flex: 1,
     backgroundColor: scrim,

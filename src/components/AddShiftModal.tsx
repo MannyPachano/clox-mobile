@@ -16,6 +16,10 @@ import {
   type Option,
   type ScheduledShiftDto,
 } from "../api";
+import { nextDay } from "../lib/edit-time";
+import { getOrgTz } from "../lib/org-tz";
+import { saveErrorMessage } from "../lib/save-error";
+import { wallPartsInZone, ymdInZone, zonedWallToUtc } from "../lib/zoned-time";
 import { getAccessToken } from "../supabase";
 import { lightColors as c, scrim } from "../theme";
 import { SelectField } from "./SelectField";
@@ -30,20 +34,22 @@ function pad(n: number): string {
   return n.toString().padStart(2, "0");
 }
 
-/** Next 42 days as options, id = "YYYY-MM-DD" (local) — scheduling looks ahead. */
-function buildDays(): Option[] {
-  const base = new Date();
-  base.setHours(0, 0, 0, 0);
+/** Next 42 days as options, id = "YYYY-MM-DD" — scheduling looks ahead.
+ *  "Today" is the ORG's today (a schedule describes the site's days), and
+ *  the iteration runs in UTC so adding whole days is exact across DST. */
+function buildDays(tz: string | undefined): Option[] {
+  const today = wallPartsInZone(Date.now(), tz);
+  const base = Date.UTC(today.y, today.mo - 1, today.d);
   const out: Option[] = [];
   for (let i = 0; i < 42; i++) {
-    const d = new Date(base.getTime() + i * 86_400_000);
-    const id = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    const d = new Date(base + i * 86_400_000);
+    const id = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
     const name =
       i === 0
         ? "Today"
         : i === 1
           ? "Tomorrow"
-          : `${DAYS[d.getDay()]}, ${MONTHS[d.getMonth()]} ${d.getDate()}`;
+          : `${DAYS[d.getUTCDay()]}, ${MONTHS[d.getUTCMonth()]} ${d.getUTCDate()}`;
     out.push({ id, name });
   }
   return out;
@@ -62,24 +68,33 @@ function buildTimes(): Option[] {
   return out;
 }
 
-function toIso(dateId: string, timeId: string): string | null {
+/** Compose a day + "HH:MM" as ORG wall-clock into an ISO instant. A schedule
+ *  says when the SITE works; "9:00 AM" composed in a traveling manager's
+ *  device zone would land the crew hours off on the web board. */
+function toIso(
+  dateId: string,
+  timeId: string,
+  tz: string | undefined,
+): string | null {
   const [y, mo, d] = dateId.split("-").map(Number);
   const [h, mi] = timeId.split(":").map(Number);
   if (!y || !mo || !d || Number.isNaN(h) || Number.isNaN(mi)) return null;
-  const dt = new Date(y, mo - 1, d, h, mi, 0, 0);
-  return Number.isNaN(dt.getTime()) ? null : dt.toISOString();
+  const ms = zonedWallToUtc({ y, mo, d, h, mi }, tz);
+  return Number.isNaN(ms) ? null : new Date(ms).toISOString();
 }
 
-/** ISO → "YYYY-MM-DD" (local), for seeding the date picker when editing. */
-function ymdOf(iso: string): string {
-  const d = new Date(iso);
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+/** ISO → the org-zone "YYYY-MM-DD", for seeding the date picker when editing. */
+function ymdOf(iso: string, tz: string | undefined): string {
+  const ms = Date.parse(iso);
+  return Number.isNaN(ms) ? "" : ymdInZone(ms, tz);
 }
 
-/** ISO → nearest-15-min "HH:MM" so it matches a time option when editing. */
-function nearest15(iso: string): string {
-  const d = new Date(iso);
-  let mins = Math.round((d.getHours() * 60 + d.getMinutes()) / 15) * 15;
+/** ISO → nearest-15-min "HH:MM" in the org zone, matching a time option. */
+function nearest15(iso: string, tz: string | undefined): string {
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) return "09:00";
+  const w = wallPartsInZone(ms, tz);
+  let mins = Math.round((w.h * 60 + w.mi) / 15) * 15;
   if (mins >= 1440) mins = 1425;
   return `${pad(Math.floor(mins / 60))}:${pad(mins % 60)}`;
 }
@@ -107,7 +122,10 @@ export function AddShiftModal({
   onUpdated,
   onRemove,
 }: Props) {
-  const days = useMemo(buildDays, []);
+  // The org zone the picks compose in, frozen per open (see EditEntryModal:
+  // seeding and composing must share one zone).
+  const [tz, setTz] = useState<string | undefined>(undefined);
+  const days = useMemo(() => buildDays(tz), [tz]);
   const times = useMemo(buildTimes, []);
   const editing = shift != null;
 
@@ -116,13 +134,13 @@ export function AddShiftModal({
   // date is still a selectable, correctly-labelled option.
   const dayOptions = useMemo(() => {
     if (!shift) return days;
-    const sid = ymdOf(shift.startsAt);
-    if (days.some((o) => o.id === sid)) return days;
+    const sid = ymdOf(shift.startsAt, tz);
+    if (!sid || days.some((o) => o.id === sid)) return days;
     const [y, mo, d] = sid.split("-").map(Number);
     const dt = new Date(y, mo - 1, d);
     const name = `${DAYS[dt.getDay()]}, ${MONTHS[dt.getMonth()]} ${dt.getDate()}`;
     return [{ id: sid, name }, ...days];
-  }, [days, shift]);
+  }, [days, shift, tz]);
 
   const [employeeId, setEmployeeId] = useState<string | null>(null);
   const [dateId, setDateId] = useState<string>(initialDateId ?? "");
@@ -134,30 +152,32 @@ export function AddShiftModal({
   // non-existent local hour normalises forward.
   const rollsToNextDay = useMemo(() => {
     if (!startId || !endId) return false;
-    const a = toIso(dateId, startId);
-    const b = toIso(dateId, endId);
+    const a = toIso(dateId, startId, tz);
+    const b = toIso(dateId, endId, tz);
     if (!a || !b) return false;
     return Date.parse(b) <= Date.parse(a);
-  }, [dateId, startId, endId]);
+  }, [dateId, startId, endId, tz]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   // Seed each time the sheet opens: from the shift when editing, else defaults.
   useEffect(() => {
     if (!visible) return;
+    const zone = getOrgTz();
+    setTz(zone);
     if (shift) {
       setEmployeeId(shift.employeeUserId);
-      setDateId(ymdOf(shift.startsAt));
-      setStartId(nearest15(shift.startsAt));
-      setEndId(nearest15(shift.endsAt));
+      setDateId(ymdOf(shift.startsAt, zone));
+      setStartId(nearest15(shift.startsAt, zone));
+      setEndId(nearest15(shift.endsAt, zone));
     } else {
       setEmployeeId(null);
-      setDateId(initialDateId ?? days[0]?.id ?? "");
+      setDateId(initialDateId ?? buildDays(zone)[0]?.id ?? "");
       setStartId("09:00");
       setEndId("17:00");
     }
     setError(null);
-  }, [visible, shift, initialDateId, days]);
+  }, [visible, shift, initialDateId]);
 
   function cancel() {
     setError(null);
@@ -168,13 +188,19 @@ export function AddShiftModal({
     setError(null);
     if (!employeeId) return setError("Pick an employee.");
     if (!startId || !endId) return setError("Pick start and end times.");
-    const startIso = toIso(dateId, startId);
-    let endIso = toIso(dateId, endId);
+    const startIso = toIso(dateId, startId, tz);
+    let endIso = toIso(dateId, endId, tz);
     if (!startIso || !endIso) return setError("Invalid time.");
-    // End not after start means the shift crosses midnight (a night crew): roll
-    // the end to the next day rather than rejecting it.
+    // End not after start means the shift crosses midnight (a night crew):
+    // roll the end to the next day rather than rejecting it. Rebuilt from the
+    // next day's WALL clock, not by adding a raw 24h — on a DST night those
+    // differ by an hour, and the crew's "6 PM to 2:30 AM" means the clock on
+    // the wall both evenings.
     if (Date.parse(endIso) <= Date.parse(startIso)) {
-      endIso = new Date(Date.parse(endIso) + 86_400_000).toISOString();
+      const nd = nextDay(dateId);
+      const rolled = nd ? toIso(nd, endId, tz) : null;
+      if (!rolled) return setError("Invalid time.");
+      endIso = rolled;
     }
     setBusy(true);
     const t = await getAccessToken();
@@ -191,7 +217,10 @@ export function AddShiftModal({
           employeeUserId: employeeId,
         });
         if (res.ok) onUpdated?.();
-        else setError("Couldn't save the shift. Try again.");
+        else
+          setError(
+            saveErrorMessage(res.error, "Couldn't save the shift. Try again."),
+          );
       } else {
         const res = await createManagerShift(t, {
           employeeUserId: employeeId,
@@ -199,7 +228,10 @@ export function AddShiftModal({
           endIso,
         });
         if (res.ok) onCreated();
-        else setError("Couldn't add the shift. Try again.");
+        else
+          setError(
+            saveErrorMessage(res.error, "Couldn't add the shift. Try again."),
+          );
       }
     } catch {
       setError("No connection. Try again.");

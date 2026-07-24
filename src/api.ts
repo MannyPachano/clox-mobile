@@ -1,5 +1,6 @@
 import { API_BASE_URL } from "./config";
 import { getAttestationForPunch } from "./attestation";
+import { setOrgTz } from "./lib/org-tz";
 import type { QueuedPunch } from "./queue";
 
 export type Option = { id: string; name: string };
@@ -11,6 +12,9 @@ export type StatusResponse = {
     name: string;
     requireProject: boolean;
     selfieRequired: boolean;
+    /** The org's IANA zone — the truth for shift wall-clock times. Absent
+     *  from a server that predates the field; readers fall back to device. */
+    timeZone?: string;
   };
   activeEntry: {
     id: string;
@@ -79,8 +83,14 @@ async function request<T>(
   return { ok: false, status: res.status, error };
 }
 
-export function getStatus(token: string): Promise<ApiResult<StatusResponse>> {
-  return request<StatusResponse>("status", token, "GET");
+export async function getStatus(
+  token: string,
+): Promise<ApiResult<StatusResponse>> {
+  const res = await request<StatusResponse>("status", token, "GET");
+  // Cache the org zone at the API chokepoint so every screen and modal can
+  // read it (lib/org-tz) without prop-drilling or its own fetch.
+  if (res.ok) setOrgTz(res.data.organization.timeZone);
+  return res;
 }
 
 /** Mark the guided tour finished for this user (syncs with the web app). */
@@ -540,13 +550,16 @@ export type MapRangeData = {
  * are org-timezone day keys (YYYY-MM-DD); equal values mean a single day.
  * Mirrors the web worksites map for the same org and range.
  */
-export function getManagerMapRange(
+export async function getManagerMapRange(
   token: string,
   fromKey: string,
   toKey: string,
 ): Promise<ApiResult<MapRangeData>> {
   const qs = `from=${encodeURIComponent(fromKey)}&to=${encodeURIComponent(toKey)}`;
-  return request(`manager/map-range?${qs}`, token, "GET");
+  const res = await request<MapRangeData>(`manager/map-range?${qs}`, token, "GET");
+  // Same org-zone cache as getStatus — either payload may land first.
+  if (res.ok) setOrgTz(res.data.timeZone);
+  return res;
 }
 
 export function deleteManagerShift(

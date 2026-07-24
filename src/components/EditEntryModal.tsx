@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  KeyboardAvoidingView,
   Modal,
   Pressable,
   ScrollView,
@@ -25,6 +26,9 @@ import {
   withDay,
   ymdOf,
 } from "../lib/edit-time";
+import { getOrgTz } from "../lib/org-tz";
+import { saveErrorMessage } from "../lib/save-error";
+import { pickerDateInZone, sameWallFields } from "../lib/zoned-time";
 import { getAccessToken } from "../supabase";
 import { lightColors as c, scrim } from "../theme";
 import { SelectField } from "./SelectField";
@@ -48,7 +52,12 @@ export function EditEntryModal({
   onClose,
   onSaved,
 }: Props) {
-  const days = useMemo(buildEditDays, []);
+  // The org zone the pickers were SEEDED in, frozen per open. Seeding and
+  // composing must use the same zone: if the zone arrived (or changed)
+  // between the seed and the save, wall values seeded in one zone would
+  // compose in another — exactly the corruption this exists to prevent.
+  const [tz, setTz] = useState<string | undefined>(undefined);
+  const days = useMemo(() => buildEditDays(tz), [tz]);
 
   const [projects, setProjects] = useState<Option[]>([]);
   const [dateId, setDateId] = useState("");
@@ -62,14 +71,45 @@ export function EditEntryModal({
   // Keep the entry's own date selectable even if it's older than the 14-day list.
   const dayOptions = useMemo(() => withDay(days, dateId), [days, dateId]);
 
-  // Prefill from the entry being edited — exact times, no rounding. Keyed on
-  // `visible` too, so reopening the modal for the same entry (e.g. the running
-  // shift) starts from the entry's real values, not leftover edits.
+  // Prefill from the entry being edited — exact times, no rounding, in the
+  // ORG's zone (the pickers show the site's clock, matching what the web
+  // shows and what the manager means). Keyed on `visible` too, so reopening
+  // the modal for the same entry (e.g. the running shift) starts from the
+  // entry's real values, not leftover edits.
+  // What the pickers were seeded WITH, so save() can tell an untouched
+  // picker apart and send the entry's ORIGINAL ISO instead of recomposing.
+  // Wall fields alone cannot represent every instant (the fall-back hour's
+  // second pass, or an org time inside the device zone's DST gap), so a
+  // recompose of untouched values can silently move a stored time by an
+  // hour twice a year. Original-when-untouched removes that entirely.
+  const seedRef = useRef<{
+    dateId: string;
+    startIso: string;
+    startShell: Date;
+    endIso: string | null;
+    endShell: Date;
+  } | null>(null);
+
   useEffect(() => {
     if (!visible || !entry) return;
-    setDateId(ymdOf(entry.start));
-    setStartTime(new Date(entry.start));
-    setEndTime(entry.end ? new Date(entry.end) : new Date());
+    const zone = getOrgTz();
+    setTz(zone);
+    const day = ymdOf(entry.start, zone);
+    const startShell = pickerDateInZone(entry.start, zone);
+    const endShell = pickerDateInZone(
+      entry.end ?? new Date().toISOString(),
+      zone,
+    );
+    seedRef.current = {
+      dateId: day,
+      startIso: entry.start,
+      startShell,
+      endIso: entry.end ?? null,
+      endShell,
+    };
+    setDateId(day);
+    setStartTime(startShell);
+    setEndTime(endShell);
     setProjectId(entry.projectId);
     setNote(entry.note ?? "");
     setError(null);
@@ -94,18 +134,32 @@ export function EditEntryModal({
     setError(null);
     // Start-only (running shift): send the new start alone. No endIso — the
     // server keeps the shift open. Completed entries send the full range.
+    // An untouched picker sends the entry's original ISO (see seedRef).
+    const seed = seedRef.current;
+    const keepStart =
+      seed != null &&
+      dateId === seed.dateId &&
+      sameWallFields(startTime, seed.startShell);
     let payload: Parameters<typeof updateManagerEntry>[1];
     if (startOnly) {
-      const start = buildRunningStart(dateId, startTime);
+      const start = buildRunningStart(dateId, startTime, tz);
       if (!start.ok) return setError(start.error);
-      payload = { id: entry.id, startIso: start.startIso };
-    } else {
-      const range = buildShiftRange(dateId, startTime, endTime);
-      if (!range.ok) return setError(range.error);
       payload = {
         id: entry.id,
-        startIso: range.startIso,
-        endIso: range.endIso,
+        startIso: keepStart ? seed.startIso : start.startIso,
+      };
+    } else {
+      const range = buildShiftRange(dateId, startTime, endTime, tz);
+      if (!range.ok) return setError(range.error);
+      const keepEnd =
+        seed != null &&
+        seed.endIso != null &&
+        dateId === seed.dateId &&
+        sameWallFields(endTime, seed.endShell);
+      payload = {
+        id: entry.id,
+        startIso: keepStart ? seed.startIso : range.startIso,
+        endIso: keepEnd ? (seed.endIso ?? range.endIso) : range.endIso,
         projectId,
         note: note.trim() || null,
       };
@@ -121,7 +175,19 @@ export function EditEntryModal({
       if (res.ok) onSaved();
       else if (res.status === 409) {
         setError("This entry is locked (already approved). Unlock it on the web to edit.");
-      } else setError("Couldn't save. Try again.");
+      } else {
+        // Say the server's reason when it gave one (the codes are stable);
+        // the generic line is only for codes we can't say anything true
+        // about. This route's bad_range causes: unparseable times, end not
+        // after start, or a window that strands a logged break — so the
+        // override may honestly mention breaks.
+        setError(
+          saveErrorMessage(res.error, "Couldn't save. Try again.", {
+            bad_range:
+              "Those times don't fit this shift. Check them, and any breaks logged inside the shift.",
+          }),
+        );
+      }
     } catch {
       setError("No connection. Try again.");
     } finally {
@@ -136,8 +202,18 @@ export function EditEntryModal({
       animationType="slide"
       onRequestClose={onClose}
     >
-      <Pressable style={styles.backdrop} onPress={onClose}>
-        <Pressable style={styles.sheet} onPress={() => {}}>
+      {/* The keyboard must never cover the note input or the Save button.
+          behavior="padding" on BOTH platforms: the transparent Modal spans
+          the full screen so the padding math is exact with no offset — and
+          on Android it is the ONLY mechanism that works here, because under
+          SDK 54's forced edge-to-edge an RN Modal's dialog window never
+          honors adjustResize (its decor doesn't fit system windows, which
+          makes SOFT_INPUT_ADJUST_RESIZE a documented no-op). LoginScreen's
+          ios-only split is for the main activity window, where resize does
+          work; that split does not transfer to Modals. */}
+      <KeyboardAvoidingView style={styles.kav} behavior="padding">
+        <Pressable style={styles.backdrop} onPress={onClose}>
+          <Pressable style={styles.sheet} onPress={() => {}}>
           <Text style={styles.title}>
             {startOnly ? "Adjust start time" : "Edit entry"}
           </Text>
@@ -208,13 +284,15 @@ export function EditEntryModal({
               )}
             </TouchableOpacity>
           </View>
+          </Pressable>
         </Pressable>
-      </Pressable>
+      </KeyboardAvoidingView>
     </Modal>
   );
 }
 
 const styles = StyleSheet.create({
+  kav: { flex: 1 },
   backdrop: {
     flex: 1,
     backgroundColor: scrim,

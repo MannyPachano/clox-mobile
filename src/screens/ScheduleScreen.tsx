@@ -24,6 +24,8 @@ import {
 import { AddShiftModal } from "../components/AddShiftModal";
 import { ScheduleBoard } from "../components/ScheduleBoard";
 import { haptics } from "../lib/haptics";
+import { getOrgTz } from "../lib/org-tz";
+import { wallPartsInZone, zonedWallToUtc } from "../lib/zoned-time";
 import { getAccessToken } from "../supabase";
 import { lightColors as c, radii } from "../theme";
 
@@ -158,25 +160,47 @@ export function ScheduleScreen() {
       : (dayKeys[0] ?? todayKey);
 
   // Move a shift to another day, keeping its wall-clock time and duration.
-  // Optimistic: the card jumps immediately and rolls back if the save fails.
+  // The wall-clock is read and recomposed in the ORG's zone (a schedule
+  // describes the site's mornings, and a drag on a traveling manager's phone
+  // must not shift the crew's 9:00 AM) — but the DISTANCE moved is the day
+  // DELTA between the board columns, which are DEVICE-local day keys. The
+  // delta is what the gesture means: reinterpreting the device-day targetKey
+  // as an org calendar date directly would move the shift an extra day
+  // whenever the start straddles the two zones' midnights (and make a
+  // one-column drag a no-op in the other direction). Applying the delta to
+  // the org date keeps the card landing exactly on the drop column.
+  // Optimistic: the card jumps immediately and rolls back on failure.
   const moveShiftToDay = useCallback(
     async (shift: ScheduledShiftDto, targetKey: string) => {
       const token = await getAccessToken();
       if (!token) return;
+      const tz = getOrgTz();
       const start = new Date(shift.startsAt);
-      const durationMs = new Date(shift.endsAt).getTime() - start.getTime();
-      const [ty, tm, td] = targetKey.split("-").map(Number);
-      const newStart = new Date(
-        ty ?? 1970,
-        (tm ?? 1) - 1,
-        td ?? 1,
-        start.getHours(),
-        start.getMinutes(),
-        0,
-        0,
+      const startMs = start.getTime();
+      const durationMs = Date.parse(shift.endsAt) - startMs;
+      const parseKey = (key: string): number => {
+        const [y, m, d] = key.split("-").map(Number);
+        return Date.UTC(y ?? 1970, (m ?? 1) - 1, d ?? 1);
+      };
+      const dayDelta = Math.round(
+        (parseKey(targetKey) - parseKey(dayKey(start))) / 86_400_000,
       );
-      const startIso = newStart.toISOString();
-      const endIso = new Date(newStart.getTime() + durationMs).toISOString();
+      const wall = wallPartsInZone(startMs, tz);
+      const shifted = new Date(
+        Date.UTC(wall.y, wall.mo - 1, wall.d) + dayDelta * 86_400_000,
+      );
+      const newStartMs = zonedWallToUtc(
+        {
+          y: shifted.getUTCFullYear(),
+          mo: shifted.getUTCMonth() + 1,
+          d: shifted.getUTCDate(),
+          h: wall.h,
+          mi: wall.mi,
+        },
+        tz,
+      );
+      const startIso = new Date(newStartMs).toISOString();
+      const endIso = new Date(newStartMs + durationMs).toISOString();
 
       // Roll back by shift id (not a whole-array snapshot) so a concurrent
       // refetch/add/delete during the in-flight save isn't clobbered. Restore
