@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  Animated,
   Modal,
+  PanResponder,
   Platform,
   Pressable,
+  ScrollView,
   StyleSheet,
   Text,
   TouchableOpacity,
@@ -303,6 +306,21 @@ function initials(name: string): string {
   if (parts.length === 1) return parts[0]!.slice(0, 2).toUpperCase();
   return (parts[0]![0]! + parts[parts.length - 1]![0]!).toUpperCase();
 }
+
+/** "Wed, Jul 22" for the sheet's day headers (uppercased by the style). */
+function dayHeading(ms: number): string {
+  const d = new Date(ms);
+  const WD = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  return `${WD[d.getDay()]}, ${shortDate(ms)}`;
+}
+
+/** The bottom sheet's collapsed height: the grab handle plus the count line.
+ *  Also the map's bottom padding, so the Google logo and Apple legal text
+ *  ride above the peek bar instead of underneath it. */
+const SHEET_PEEK_H = 64;
+
+/** The open snap covers this share of the map area, per the approved spec. */
+const SHEET_HALF_RATIO = 0.46;
 
 /** A region that bounds all worksites + punches with a little padding. */
 function boundsRegion(data: MapRangeData): Region | null {
@@ -607,6 +625,207 @@ export function RosterMap() {
     return () => clearTimeout(id);
   }, [markerIdentity]);
 
+  // ── The bottom sheet: the same linked punch list the web sidebar carries,
+  //    as a Google Maps style sheet over the map. Two snaps: a peek bar and
+  //    half the map area. One selection shared by rows and pins.
+
+  const [selectedPunchId, setSelectedPunchId] = useState<string | null>(null);
+  const [mapH, setMapH] = useState(0);
+  // Which punch should open its callout once the camera settles and the fan
+  // re-presents for the new span. Set by a row tap; consumed by the effect
+  // below on the render AFTER onRegionChangeComplete (the settle updates
+  // viewSpan, which re-renders, which commits the settled fan's marker refs).
+  const calloutAfterSettle = useRef<string | null>(null);
+  // Marker instances by punch id, so a row tap can open a pin's callout.
+  // Structural type on purpose: the maps module is lazily required, and all
+  // the sheet needs from a marker is showCallout.
+  const markerRefs = useRef(new Map<string, { showCallout?: () => void }>());
+
+  // Sheet geometry. translateY 0 is the half snap; peekOffset hides all but
+  // the 64px peek bar. The gesture reads geometry through a ref because the
+  // PanResponder is created once and must not close over a stale height;
+  // the ref is synced by the first effect below, never during render.
+  const halfH = Math.max(Math.round(mapH * SHEET_HALF_RATIO), SHEET_PEEK_H);
+  const peekOffset = halfH - SHEET_PEEK_H;
+  const sheetSnapRef = useRef<"peek" | "half">("peek");
+  // Lazily-initialized state, not useRef().current: the instance is created
+  // once and reading state during render is legal where reading a ref is not.
+  const [sheetY] = useState(() => new Animated.Value(0));
+  const sheetGeo = useRef({ peekOffset: 0 });
+  useEffect(() => {
+    sheetGeo.current.peekOffset = peekOffset;
+  }, [peekOffset]);
+
+  const snapSheet = useCallback(
+    (snap: "peek" | "half", animated = true) => {
+      sheetSnapRef.current = snap;
+      const to = snap === "peek" ? sheetGeo.current.peekOffset : 0;
+      if (animated) {
+        Animated.spring(sheetY, {
+          toValue: to,
+          useNativeDriver: true,
+          friction: 10,
+          tension: 70,
+        }).start();
+      } else {
+        sheetY.setValue(to);
+      }
+    },
+    [sheetY],
+  );
+
+  // The map's height arrives after first layout (and changes on rotation).
+  // Re-seat the sheet at its current snap without animating, so it never
+  // drifts to a stale offset.
+  useEffect(() => {
+    snapSheet(sheetSnapRef.current, false);
+  }, [peekOffset, snapSheet]);
+
+  const sheetDragBase = useRef(0);
+  // Lazy state for the same reason as sheetY: one stable responder whose
+  // handlers read live values through refs. The lint rule flags the ref
+  // names inside the initializer, but they are only ever READ inside the
+  // gesture callbacks, at event time — never during render.
+  // eslint-disable-next-line react-hooks/refs
+  const [sheetResponder] = useState(() =>
+    PanResponder.create({
+      // A tap must reach the peek bar's Pressable; only a real drag claims.
+      onStartShouldSetPanResponder: () => false,
+      onMoveShouldSetPanResponder: (_e, gs) => Math.abs(gs.dy) > 6,
+      onPanResponderGrant: () => {
+        sheetDragBase.current =
+          sheetSnapRef.current === "peek" ? sheetGeo.current.peekOffset : 0;
+      },
+      onPanResponderMove: (_e, gs) => {
+        const max = sheetGeo.current.peekOffset;
+        const y = Math.min(Math.max(sheetDragBase.current + gs.dy, 0), max);
+        sheetY.setValue(y);
+      },
+      onPanResponderRelease: (_e, gs) => {
+        const max = sheetGeo.current.peekOffset;
+        // Where the finger left it, nudged by the fling direction.
+        const y = Math.min(
+          Math.max(sheetDragBase.current + gs.dy + gs.vy * 120, 0),
+          max,
+        );
+        const snap = y > max / 2 ? "peek" : "half";
+        sheetSnapRef.current = snap;
+        Animated.spring(sheetY, {
+          toValue: snap === "peek" ? max : 0,
+          useNativeDriver: true,
+          friction: 10,
+          tension: 70,
+        }).start();
+      },
+      onPanResponderTerminate: () => {
+        // Something else claimed the gesture; settle back to the last snap.
+        Animated.spring(sheetY, {
+          toValue:
+            sheetSnapRef.current === "peek" ? sheetGeo.current.peekOffset : 0,
+          useNativeDriver: true,
+          friction: 10,
+          tension: 70,
+        }).start();
+      },
+    }),
+  );
+
+  // Worksite labels, once per data load: the payload already carries the
+  // worksites, and a punch belongs to the nearest one whose radius contains
+  // it — the same rule the web sidebar applies server-side.
+  const worksiteNameById = useMemo(() => {
+    const out = new Map<string, string>();
+    if (!data) return out;
+    for (const p of data.punches) {
+      let best = Number.POSITIVE_INFINITY;
+      let name: string | null = null;
+      for (const w of data.worksites) {
+        const d = metresApart(
+          p.clockInLatitude,
+          p.clockInLongitude,
+          w.latitude,
+          w.longitude,
+        );
+        if (d <= w.radiusM && d < best) {
+          best = d;
+          name = w.name;
+        }
+      }
+      if (name) out.set(p.id, name);
+    }
+    return out;
+  }, [data]);
+
+  // The sheet's list: ON THE CLOCK first (longest-running on top), then
+  // completed punches newest first, under day headers when the range spans
+  // more than one day — mirroring the web sidebar.
+  const sheetList = useMemo(() => {
+    const onClock = visiblePunches
+      .filter((p) => p.clockOutMs == null)
+      .sort((a, b) => a.clockInMs - b.clockInMs);
+    const done = visiblePunches
+      .filter((p) => p.clockOutMs != null)
+      .sort((a, b) => b.clockInMs - a.clockInMs);
+    const dayKeys = new Set(
+      visiblePunches.map((p) => dayKey(new Date(p.clockInMs))),
+    );
+    return { onClock, done, groupByDay: dayKeys.size > 1 };
+  }, [visiblePunches]);
+
+  // Row positions inside the sheet's scroll content, for scroll-into-view
+  // when a pin tap selects a row. The list renders FLAT (headers and rows as
+  // siblings) so each onLayout y is content-relative.
+  const rowYs = useRef(new Map<string, number>());
+  const sheetScrollRef = useRef<ScrollView | null>(null);
+
+  const onRowPress = useCallback(
+    (p: { id: string; clockInLatitude: number; clockInLongitude: number }) => {
+      setSelectedPunchId(p.id);
+      // Open the callout only after the camera settles and the fan
+      // re-presents; a timer would race both.
+      calloutAfterSettle.current = p.id;
+      mapRef.current?.animateToRegion(
+        {
+          latitude: p.clockInLatitude,
+          longitude: p.clockInLongitude,
+          latitudeDelta: FAN_MAX_SPAN_LAT / 3,
+          longitudeDelta: FAN_MAX_SPAN_LAT / 3,
+        },
+        350,
+      );
+      // Drop to the peek bar so the map (and the pin) is visible.
+      snapSheet("peek");
+    },
+    [snapSheet],
+  );
+
+  const onPinPress = useCallback((id: string) => {
+    setSelectedPunchId(id);
+    // While the sheet is open, reveal the row the pin just selected. At the
+    // peek snap the native callout is the response; the row is highlighted
+    // whenever the sheet next opens.
+    if (sheetSnapRef.current === "half") {
+      const y = rowYs.current.get(id);
+      if (y != null) {
+        sheetScrollRef.current?.scrollTo({
+          y: Math.max(y - 8, 0),
+          animated: true,
+        });
+      }
+    }
+  }, []);
+
+  // A row tap parked a callout id. The camera settling updates viewSpan and
+  // re-fans, so by the time this effect runs the marker refs match the
+  // settled region. A punch that ended up clustered away has no ref and the
+  // callout quietly does not open, per spec.
+  useEffect(() => {
+    const id = calloutAfterSettle.current;
+    if (!id) return;
+    calloutAfterSettle.current = null;
+    markerRefs.current.get(id)?.showCallout?.();
+  }, [viewSpan, markerIdentity]);
+
   if (!Maps) {
     return (
       <View style={styles.fallback}>
@@ -632,6 +851,66 @@ export function RosterMap() {
           data.noLocationCount === 1 ? "has" : "have"
         } no location${activeWhoId ? ", across the whole team" : ""}.`
       : null;
+
+  const activeRangeText =
+    range.fromKey === range.toKey
+      ? rangeLabel(range.fromKey)
+      : `${rangeLabel(range.fromKey)} to ${rangeLabel(range.toKey)}`;
+
+  // The peek bar's one line. With the server cap hit and no person filter,
+  // the plain count would read as the whole story; say "First 400" the way
+  // the web sidebar does. A person filter shows that person's subset, where
+  // the plain count is the honest one (the cap banner below the map already
+  // carries the caveat).
+  const sheetCountLine =
+    data?.truncated && !activeWhoId
+      ? `First 400 located punches · ${activeRangeText}`
+      : `${visiblePunches.length} located ${
+          visiblePunches.length === 1 ? "punch" : "punches"
+        } · ${activeRangeText}`;
+
+  const renderSheetRow = (p: MapRangeData["punches"][number]) => {
+    const onClock = p.clockOutMs == null;
+    // Same date-truth rule as the callouts: an out on another day says so.
+    const outOnAnotherDay =
+      p.clockOutMs != null && shortDate(p.clockOutMs) !== shortDate(p.clockInMs);
+    const time = onClock
+      ? `On shift since ${clock(p.clockInMs)}`
+      : `${clock(p.clockInMs)} to ${clock(p.clockOutMs!)}${
+          outOnAnotherDay ? ` · ${shortDate(p.clockOutMs!)}` : ""
+        }`;
+    const site = worksiteNameById.get(p.id);
+    const selected = selectedPunchId === p.id;
+    return (
+      <Pressable
+        key={p.id}
+        onLayout={(e) => rowYs.current.set(p.id, e.nativeEvent.layout.y)}
+        onPress={() => onRowPress(p)}
+        style={[styles.sheetRow, selected && styles.sheetRowSelected]}
+        accessibilityRole="button"
+        accessibilityLabel={`${p.displayName}, ${time}`}
+      >
+        <View
+          style={[
+            styles.sheetDisc,
+            onClock ? styles.sheetDiscOn : styles.sheetDiscDone,
+          ]}
+        >
+          <Text style={styles.sheetDiscText}>{initials(p.displayName)}</Text>
+        </View>
+        <View style={styles.sheetRowBody}>
+          <Text style={styles.sheetRowName} numberOfLines={1}>
+            {p.displayName}
+          </Text>
+          <Text style={styles.sheetRowMeta} numberOfLines={2}>
+            {time}
+            {site ? ` · ${site}` : ""}
+            {p.projectName ? ` · ${p.projectName}` : ""}
+          </Text>
+        </View>
+      </Pressable>
+    );
+  };
 
   return (
     <View style={styles.wrap}>
@@ -685,13 +964,12 @@ export function RosterMap() {
 
       {/* Which range is actually on screen. A pill alone cannot say "Jul 1 to
           Jul 22", and Custom is meaningless without it. */}
-      <Text style={styles.rangeActive}>
-        {range.fromKey === range.toKey
-          ? rangeLabel(range.fromKey)
-          : `${rangeLabel(range.fromKey)} to ${rangeLabel(range.toKey)}`}
-      </Text>
+      <Text style={styles.rangeActive}>{activeRangeText}</Text>
 
-      <View style={styles.mapWrap}>
+      <View
+        style={styles.mapWrap}
+        onLayout={(e) => setMapH(e.nativeEvent.layout.height)}
+      >
         {region ? (
           <MapView
             ref={mapRef}
@@ -699,6 +977,11 @@ export function RosterMap() {
             initialRegion={region}
             showsUserLocation={false}
             toolbarEnabled={false}
+            // Keeps the Google logo and Apple legal text above the sheet's
+            // peek bar instead of underneath it.
+            mapPadding={{ top: 0, right: 0, bottom: SHEET_PEEK_H, left: 0 }}
+            // The settle updates viewSpan; the callout effect above consumes
+            // any parked row-tap callout on the render that follows.
             onRegionChangeComplete={(r) => setViewSpan(r.latitudeDelta)}
             // The map is context; the punches are the content. These props do
             // NOT overlap: Android's MapManager.setMapType looks the string up
@@ -777,9 +1060,14 @@ export function RosterMap() {
               return (
                 <Marker
                   key={p.id}
+                  ref={(r) => {
+                    if (r) markerRefs.current.set(p.id, r);
+                    else markerRefs.current.delete(p.id);
+                  }}
                   coordinate={{ latitude: p.fanLat, longitude: p.fanLng }}
                   anchor={{ x: 0.5, y: 0.5 }}
                   tracksViewChanges={trackMarkers}
+                  onPress={() => onPinPress(p.id)}
                 >
                   {onClock ? (
                     <View style={styles.initialsPin}>
@@ -844,6 +1132,75 @@ export function RosterMap() {
           <View style={styles.loadingChip}>
             <ActivityIndicator color={c.accent} size="small" />
           </View>
+        ) : null}
+
+        {/* The linked punch list, as a bottom sheet over the map — the same
+            list the web sidebar shows. Drag the header between the peek bar
+            and half the map, or tap it to toggle. The list scrolls inside
+            the sheet; the map never moves with it. */}
+        {region && mapH > 0 ? (
+          <Animated.View
+            style={[
+              styles.sheetPanel,
+              { height: halfH, transform: [{ translateY: sheetY }] },
+            ]}
+          >
+            <View {...sheetResponder.panHandlers}>
+              <Pressable
+                style={styles.sheetHead}
+                onPress={() =>
+                  snapSheet(
+                    sheetSnapRef.current === "peek" ? "half" : "peek",
+                  )
+                }
+                accessibilityRole="button"
+                accessibilityLabel={`Punch list. ${sheetCountLine}`}
+                accessibilityHint="Opens and closes the list of punches on the map."
+              >
+                <View style={styles.sheetGrabBar} />
+                <Text style={styles.sheetCountLine} numberOfLines={1}>
+                  {sheetCountLine}
+                </Text>
+              </Pressable>
+            </View>
+            <ScrollView
+              ref={sheetScrollRef}
+              style={styles.sheetListScroll}
+              contentContainerStyle={styles.sheetListContent}
+            >
+              {visiblePunches.length === 0 ? (
+                <Text style={styles.sheetEmpty}>
+                  No located punches in this range.
+                </Text>
+              ) : null}
+              {sheetList.onClock.length > 0 ? (
+                <Text style={styles.sheetKicker}>On the clock</Text>
+              ) : null}
+              {sheetList.onClock.map(renderSheetRow)}
+              {sheetList.done.length > 0 && sheetList.onClock.length > 0 ? (
+                <Text style={styles.sheetKicker}>Punches</Text>
+              ) : null}
+              {sheetList.groupByDay
+                ? sheetList.done.flatMap((p, i) => {
+                    const k = dayKey(new Date(p.clockInMs));
+                    const prev =
+                      i > 0
+                        ? dayKey(new Date(sheetList.done[i - 1]!.clockInMs))
+                        : null;
+                    const nodes = [];
+                    if (k !== prev) {
+                      nodes.push(
+                        <Text key={`day-${k}`} style={styles.sheetDayHead}>
+                          {dayHeading(p.clockInMs)}
+                        </Text>,
+                      );
+                    }
+                    nodes.push(renderSheetRow(p));
+                    return nodes;
+                  })
+                : sheetList.done.map(renderSheetRow)}
+            </ScrollView>
+          </Animated.View>
         ) : null}
       </View>
 
@@ -1025,6 +1382,110 @@ const styles = StyleSheet.create({
     paddingHorizontal: 18,
   },
   retryText: { color: c.text, fontSize: 14, fontWeight: "700" },
+  // ── The punch-list bottom sheet over the map. Surface and hairline from
+  //    the same light tokens as the rest of this screen (the map area stays
+  //    paper in both phone palettes, so the sheet does too). The soft top
+  //    shadow separates it from map imagery, the way native map sheets do.
+  sheetPanel: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: c.surface,
+    borderTopLeftRadius: radii.lg,
+    borderTopRightRadius: radii.lg,
+    borderTopWidth: 1,
+    borderColor: c.border,
+    shadowColor: "#000",
+    shadowOpacity: 0.15,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: -2 },
+    elevation: 8,
+  },
+  sheetHead: {
+    height: SHEET_PEEK_H,
+    alignItems: "center",
+    paddingTop: 8,
+    paddingHorizontal: 16,
+  },
+  sheetGrabBar: {
+    width: 36,
+    height: 4,
+    borderRadius: 999,
+    backgroundColor: c.border,
+    marginBottom: 8,
+  },
+  sheetCountLine: {
+    fontFamily: MONO,
+    fontSize: 11,
+    fontWeight: "600",
+    letterSpacing: 1.2,
+    textTransform: "uppercase",
+    color: c.textMuted,
+  },
+  sheetListScroll: { flex: 1 },
+  sheetListContent: { paddingHorizontal: 10, paddingBottom: 12 },
+  sheetEmpty: {
+    color: c.textMuted,
+    fontSize: 13,
+    paddingHorizontal: 6,
+    paddingTop: 8,
+  },
+  sheetKicker: {
+    fontFamily: MONO,
+    fontSize: 10.5,
+    fontWeight: "600",
+    letterSpacing: 1.2,
+    textTransform: "uppercase",
+    color: c.textMuted,
+    paddingHorizontal: 6,
+    paddingTop: 10,
+    paddingBottom: 4,
+  },
+  sheetDayHead: {
+    fontFamily: MONO,
+    fontSize: 10.5,
+    fontWeight: "600",
+    letterSpacing: 1,
+    textTransform: "uppercase",
+    color: c.textMuted,
+    paddingHorizontal: 6,
+    paddingTop: 10,
+    paddingBottom: 4,
+  },
+  sheetRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    paddingVertical: 9,
+    paddingHorizontal: 8,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: "transparent",
+  },
+  // Selected: the clay wash with a full border, matching the web sidebar.
+  sheetRowSelected: {
+    backgroundColor: "rgba(184, 74, 44, 0.10)",
+    borderColor: c.accent,
+  },
+  sheetDisc: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  sheetDiscOn: { backgroundColor: c.success },
+  sheetDiscDone: { backgroundColor: c.accent },
+  sheetDiscText: { color: c.accentText, fontSize: 10, fontWeight: "700" },
+  sheetRowBody: { flex: 1, minWidth: 0 },
+  sheetRowName: { color: c.text, fontSize: 14, fontWeight: "600" },
+  sheetRowMeta: {
+    color: c.textMuted,
+    fontSize: 12,
+    lineHeight: 16,
+    marginTop: 2,
+  },
   backdrop: { flex: 1, backgroundColor: scrim, justifyContent: "flex-end" },
   sheet: {
     backgroundColor: c.bg,
