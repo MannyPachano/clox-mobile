@@ -514,6 +514,8 @@ export type MapPunch = {
   /** null while the worker is still on the clock. */
   clockOutMs: number | null;
   projectName: string | null;
+  /** Palette token ("clay" | "moss" | ...) for the sheet row's project dot. */
+  projectColor: string | null;
   clockInLatitude: number;
   clockInLongitude: number;
 };
@@ -521,6 +523,10 @@ export type MapPunch = {
 export type MapRangeData = {
   from: string;
   to: string;
+  /** The zone `from`/`to` and every punch's day boundary were resolved in.
+   *  The punch-list sheet groups by calendar day in this zone, not the
+   *  device's own. */
+  timeZone: string;
   worksites: MapWorksite[];
   punches: MapPunch[];
   /** true when the located-punch list hit the server's 400-pin cap. */
