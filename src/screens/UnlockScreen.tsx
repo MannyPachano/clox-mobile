@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
-  AppState,
   StyleSheet,
   Text,
   TouchableOpacity,
@@ -80,8 +79,12 @@ export function UnlockScreen({
     }
   }, [onUnlocked]);
 
-  // Offer biometrics on mount (once), and again when the app returns to the
-  // foreground on the lock screen — but never while a cooldown is active.
+  // Offer biometrics once when the lock screen mounts (cold start, and again on
+  // a fresh re-lock since App remounts this screen). We deliberately do NOT
+  // re-prompt on AppState "active": presenting the Face ID sheet itself pushes
+  // the app inactive, so cancelling it ("Use PIN") returns us to active and
+  // would instantly re-trigger Face ID, trapping the user out of the PIN pad.
+  // Manual retry stays available via the "Use Face ID" button below.
   useEffect(() => {
     let cancelled = false;
     void isBiometricAvailable().then((b) => {
@@ -103,15 +106,6 @@ export function UnlockScreen({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  useEffect(() => {
-    const sub = AppState.addEventListener("change", (s) => {
-      if (s === "active" && bioReady && biometricEnabled && !lockedOut) {
-        void runBiometric();
-      }
-    });
-    return () => sub.remove();
-  }, [bioReady, biometricEnabled, lockedOut, runBiometric]);
 
   const submit = useCallback(
     async (entered: string) => {
