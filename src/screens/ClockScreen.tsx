@@ -301,7 +301,7 @@ export function ClockScreen({
         mocked: null,
       };
       try {
-        await enqueuePunch(punch);
+        await enqueuePunch(punch, session.user.id);
       } catch {
         setBanner(
           "Couldn't save that — check your phone's storage and try again.",
@@ -335,7 +335,7 @@ export function ClockScreen({
         ...(applyToShift ? { applyToShift: true } : {}),
       };
       try {
-        await enqueuePunch(punch);
+        await enqueuePunch(punch, session.user.id);
       } catch {
         setBanner("Couldn't save the project switch — try again.");
         return;
@@ -488,7 +488,7 @@ export function ClockScreen({
         mocked: coords.mocked,
       };
       try {
-        await enqueuePunch(punch);
+        await enqueuePunch(punch, session.user.id);
       } catch {
         setBusy(false);
         setBanner(

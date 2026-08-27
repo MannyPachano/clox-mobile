@@ -10,6 +10,11 @@ import {
 import { reportError } from "./error-reporting";
 
 const QUEUE_KEY = "clox.punch.queue.v1";
+// The user id that owns the queued punches. Stamped on every enqueue so a
+// different user signing in on this device never drains someone else's punches
+// under their own token (App reconciles on sign-in). This is what lets the lock
+// re-auth path preserve the queue for the SAME user instead of dropping it.
+const OWNER_KEY = "clox.punch.queue.owner.v1";
 
 export type PunchKind =
   | "in"
@@ -113,12 +118,32 @@ function withQueueLock<T>(fn: () => Promise<T>): Promise<T> {
   return run;
 }
 
-export async function enqueuePunch(punch: QueuedPunch): Promise<void> {
+export async function enqueuePunch(
+  punch: QueuedPunch,
+  userId: string,
+): Promise<void> {
   await withQueueLock(async () => {
     const items = await readQueue();
     items.push(punch);
     await writeQueue(items);
+    // Bind the queue to its creator. Only the signed-in user enqueues, so this
+    // is always their id; it is read back at sign-in to decide keep vs. clear.
+    try {
+      await AsyncStorage.setItem(OWNER_KEY, userId);
+    } catch {
+      // Non-fatal: worst case the owner is unknown and App clears defensively.
+    }
   });
+}
+
+/** The user id that enqueued the current punches, or null when the queue is
+ *  empty / unstamped. */
+export async function getQueueOwner(): Promise<string | null> {
+  try {
+    return await AsyncStorage.getItem(OWNER_KEY);
+  } catch {
+    return null;
+  }
 }
 
 export async function queuedCount(): Promise<number> {
@@ -126,16 +151,19 @@ export async function queuedCount(): Promise<number> {
 }
 
 /**
- * Drop every queued punch. Called on sign-out: the queue is a single
- * device-global key with no per-user scoping, and `drainQueue` sends each
- * punch under whatever bearer token is current. Without this, punches the
- * previous user queued offline would drain under the NEXT person to sign in
- * on the same device, recording one worker's shift as another's.
+ * Drop every queued punch (and its owner stamp). Used by an explicit Sign out
+ * (flush what we can, drop the rest) and defensively at sign-in when a
+ * DIFFERENT user owns the pending punches. `drainQueue` sends each punch under
+ * whatever bearer token is current, so punches must never outlive their owner
+ * into another account. The lock re-auth path deliberately does NOT call this —
+ * it keeps the queue for the same user, relying on the owner stamp + the
+ * sign-in reconcile guard for safety.
  */
 export async function clearQueue(): Promise<void> {
   await withQueueLock(async () => {
     try {
       await AsyncStorage.removeItem(QUEUE_KEY);
+      await AsyncStorage.removeItem(OWNER_KEY);
     } catch (err) {
       reportError(err, "queue.clearQueue");
     }

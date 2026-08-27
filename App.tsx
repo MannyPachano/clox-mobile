@@ -27,7 +27,7 @@ import { ErrorBoundary } from "./src/components/ErrorBoundary";
 import { installErrorReporting } from "./src/error-reporting";
 import { ManagerTabs } from "./src/navigation/ManagerTabs";
 import { registerForPush, unregisterForPush } from "./src/push";
-import { clearQueue, drainQueue } from "./src/queue";
+import { clearQueue, drainQueue, getQueueOwner, queuedCount } from "./src/queue";
 import { ClockScreen } from "./src/screens/ClockScreen";
 import { LoginScreen } from "./src/screens/LoginScreen";
 import { UnlockScreen } from "./src/screens/UnlockScreen";
@@ -104,6 +104,21 @@ export default function App() {
     });
     return () => sub.remove();
   }, []);
+
+  // Guard the device-global punch queue across accounts: if the signed-in user
+  // is not the one who enqueued the pending punches, clear them so they can't
+  // drain under the wrong token. The common path (same user unlocking or
+  // re-authenticating) matches and keeps the queue intact.
+  useEffect(() => {
+    const uid = session?.user?.id;
+    if (!uid) return;
+    void (async () => {
+      const owner = await getQueueOwner();
+      if (owner && owner !== uid && (await queuedCount()) > 0) {
+        await clearQueue();
+      }
+    })();
+  }, [session?.user?.id]);
 
   // Register this device for push once signed in. Deferred behind
   // InteractionManager so it never competes with the first render. No-op in
@@ -201,10 +216,23 @@ export default function App() {
   };
 
   // Escape hatch from the lock screen: the user forgot their PIN, exhausted the
-  // attempts, or chose to re-authenticate. Sign out fully so they can enter
-  // their password (which requires being online).
+  // attempts, or chose to re-authenticate. Unlike an explicit Sign out, this
+  // PRESERVES the punch queue: they are almost always the same person (it's
+  // their phone) and will re-authenticate as themselves, so their offline
+  // punches must survive. The owner stamp guards the rare case — if a DIFFERENT
+  // user signs in, the sign-in reconcile effect below clears the queue before
+  // it could drain under the wrong token. We still drop the lock (a forgotten
+  // PIN can't gate anything) and the role snapshot.
   const handleReauth = () => {
-    void handleSignOut();
+    void (async () => {
+      const t = await getAccessToken();
+      if (t) await unregisterForPush(t);
+      await clearBootSnapshot();
+      await clearLock();
+      setLockStatus({ configured: false, biometric: false, identity: null });
+      setLocked(false);
+      await supabase.auth.signOut();
+    })();
   };
 
   const onUnlocked = () => setLocked(false);
