@@ -20,7 +20,8 @@
       "bundleIdentifier": "com.getclox.clock",
       "infoPlist": {
         "NSLocationWhenInUseUsageDescription": "Clox checks your location only when you clock in or out, to confirm you're at the job site. It does not track you in the background.",
-        "ITSAppUsesNonExemptEncryption": false
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSFaceIDUsageDescription": "Clox uses Face ID so you can unlock the app and clock in quickly, even offline. Your face data never leaves your device."
       },
       "entitlements": {
         "com.apple.developer.devicecheck.appattest-environment": "production",
@@ -74,7 +75,13 @@
         }
       ],
       "expo-font",
-      "@react-native-community/datetimepicker"
+      "@react-native-community/datetimepicker",
+      [
+        "expo-local-authentication",
+        {
+          "faceIDPermission": "Clox uses Face ID so you can unlock the app and clock in quickly, even offline. Your face data never leaves your device."
+        }
+      ]
     ],
     "extra": {
       "eas": {

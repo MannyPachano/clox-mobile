@@ -41,6 +41,7 @@ import { SelfieCapture } from "../components/SelfieCapture";
 import { EditEntryModal } from "../components/EditEntryModal";
 import { RequestEditModal } from "../components/RequestEditModal";
 import { Wordmark } from "../components/Wordmark";
+import { LockSetupSheet } from "../components/LockSetupSheet";
 import { getPunchLocation, warmUpLocation } from "../location";
 import {
   drainQueue,
@@ -50,6 +51,7 @@ import {
   type QueuedPunch,
 } from "../queue";
 import { getAccessToken } from "../supabase";
+import { getLockStatus, type LockStatus } from "../lib/app-lock";
 import {
   darkColors,
   normalizeThemePreference,
@@ -139,6 +141,14 @@ export function ClockScreen({
   const [editShift, setEditShift] = useState<HistoryShift | null>(null);
   const [requestShift, setRequestShift] = useState<HistoryShift | null>(null);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
+  const [lockSheetOpen, setLockSheetOpen] = useState(false);
+  const [lockStatus, setLockStatus] = useState<LockStatus | null>(null);
+  const refreshLock = useCallback(() => {
+    void getLockStatus().then(setLockStatus);
+  }, []);
+  useEffect(() => {
+    refreshLock();
+  }, [refreshLock]);
   // Worksite fences for the client-side clock-in pre-check. Empty = no geofence.
   const [fences, setFences] = useState<Fence[]>([]);
   // WiFi-restricted clock-in config. Unlike the geofence advisory this one
@@ -1063,6 +1073,17 @@ export function ClockScreen({
                 style={styles.sheetRow}
                 onPress={() => {
                   setAccountMenuOpen(false);
+                  setLockSheetOpen(true);
+                }}
+              >
+                <Text style={styles.sheetRowText}>
+                  {lockStatus?.configured ? "App lock" : "Set up app lock"}
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.sheetRow}
+                onPress={() => {
+                  setAccountMenuOpen(false);
                   onSignOut();
                 }}
               >
@@ -1082,6 +1103,20 @@ export function ClockScreen({
             </TouchableOpacity>
           </TouchableOpacity>
         </Modal>
+
+        <LockSetupSheet
+          visible={lockSheetOpen}
+          onClose={() => setLockSheetOpen(false)}
+          configured={lockStatus?.configured ?? false}
+          biometricEnabled={lockStatus?.biometric ?? false}
+          identity={{
+            userId: session.user.id,
+            email: session.user.email ?? null,
+            displayName: userName,
+            role: isManager ? "manager" : "employee",
+          }}
+          onChanged={refreshLock}
+        />
 
         {banner ? (
           <TouchableOpacity

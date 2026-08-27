@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  AppState,
   InteractionManager,
   StyleSheet,
   View,
@@ -16,6 +17,12 @@ import {
   readBootSnapshot,
   writeBootSnapshot,
 } from "./src/boot-snapshot";
+import {
+  clearLock,
+  getLockStatus,
+  recordIdentity,
+  type LockStatus,
+} from "./src/lib/app-lock";
 import { ErrorBoundary } from "./src/components/ErrorBoundary";
 import { installErrorReporting } from "./src/error-reporting";
 import { ManagerTabs } from "./src/navigation/ManagerTabs";
@@ -23,6 +30,7 @@ import { registerForPush, unregisterForPush } from "./src/push";
 import { clearQueue, drainQueue } from "./src/queue";
 import { ClockScreen } from "./src/screens/ClockScreen";
 import { LoginScreen } from "./src/screens/LoginScreen";
+import { UnlockScreen } from "./src/screens/UnlockScreen";
 import { getAccessToken, supabase } from "./src/supabase";
 import { lightColors } from "./src/theme";
 import { TutorialProvider } from "./src/tutorial/TutorialContext";
@@ -46,16 +54,55 @@ export default function App() {
   // Default true → never auto-run the tour until the server confirms it's unseen
   // (so an offline/failed status fetch doesn't surprise an existing user).
   const [tutorialDone, setTutorialDone] = useState(true);
+  // Offline app lock. `lockStatus` is read once on boot; `locked` starts true
+  // whenever a lock is configured and a session is being restored (a cold start
+  // always challenges), and flips false on a successful unlock. `bgSinceRef`
+  // powers the re-lock grace period on foreground.
+  const [lockStatus, setLockStatus] = useState<LockStatus | null>(null);
+  const [locked, setLocked] = useState(false);
+  const bgSinceRef = useRef<number | null>(null);
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => {
+    void (async () => {
+      const [{ data }, status] = await Promise.all([
+        supabase.auth.getSession(),
+        getLockStatus(),
+      ]);
+      setLockStatus(status);
+      // A cold start always challenges when a lock exists and a session is
+      // being restored — the unlock gate sits in front of the app.
+      if (status.configured && data.session) setLocked(true);
       setSession(data.session);
       setLoading(false);
-    });
+    })();
     const { data: sub } = supabase.auth.onAuthStateChange((_event, next) => {
       setSession(next);
     });
     return () => sub.subscription.unsubscribe();
+  }, []);
+
+  // Re-lock when the app returns to the foreground after a grace period, so a
+  // quick app-switch doesn't nag but a phone left down re-challenges. Cold
+  // start is already covered above. Only arms while a lock is configured.
+  const LOCK_GRACE_MS = 60_000;
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (state) => {
+      if (state === "active") {
+        const since = bgSinceRef.current;
+        bgSinceRef.current = null;
+        // Re-read status on foreground (not on every tick) so a lock set up
+        // mid-session arms without a restart, and a removed one stops locking.
+        if (since != null && Date.now() - since > LOCK_GRACE_MS) {
+          void getLockStatus().then((st) => {
+            setLockStatus(st);
+            if (st.configured) setLocked(true);
+          });
+        }
+      } else if (state === "background" || state === "inactive") {
+        if (bgSinceRef.current == null) bgSinceRef.current = Date.now();
+      }
+    });
+    return () => sub.remove();
   }, []);
 
   // Register this device for push once signed in. Deferred behind
@@ -108,6 +155,14 @@ export default function App() {
             userId: session.user.id,
             role: res.data.user.role,
           });
+          // Keep the lock's display identity current so the unlock screen names
+          // the right person even after the access token later expires offline.
+          void recordIdentity({
+            userId: session.user.id,
+            email: session.user.email ?? null,
+            displayName: res.data.user.name,
+            role: res.data.user.role,
+          });
         } else {
           setRole((cur) => cur ?? seeded ?? "employee");
         }
@@ -137,8 +192,22 @@ export default function App() {
     }
     await clearQueue();
     await clearBootSnapshot();
+    // The lock is bound to this account; the next person to sign in must set
+    // their own. clearing also resets the failed-attempt counter.
+    await clearLock();
+    setLockStatus({ configured: false, biometric: false, identity: null });
+    setLocked(false);
     await supabase.auth.signOut();
   };
+
+  // Escape hatch from the lock screen: the user forgot their PIN, exhausted the
+  // attempts, or chose to re-authenticate. Sign out fully so they can enter
+  // their password (which requires being online).
+  const handleReauth = () => {
+    void handleSignOut();
+  };
+
+  const onUnlocked = () => setLocked(false);
 
   // Signed in but role not resolved yet — hold on the spinner so we don't flash
   // the employee screen before swapping to the manager tabs.
@@ -149,12 +218,23 @@ export default function App() {
       <ErrorBoundary>
         <View style={styles.root}>
           <StatusBar style="dark" />
-        {loading || resolvingRole ? (
+        {loading ? (
           <View style={styles.center}>
             <ActivityIndicator color={lightColors.accent} size="large" />
           </View>
         ) : !session ? (
           <LoginScreen />
+        ) : lockStatus?.configured && locked ? (
+          <UnlockScreen
+            identity={lockStatus.identity}
+            biometricEnabled={lockStatus.biometric}
+            onUnlocked={onUnlocked}
+            onReauth={handleReauth}
+          />
+        ) : resolvingRole ? (
+          <View style={styles.center}>
+            <ActivityIndicator color={lightColors.accent} size="large" />
+          </View>
         ) : role === "manager" ? (
           <TutorialProvider role="manager" autoStart={!tutorialDone}>
             <ManagerTabs session={session} onSignOut={handleSignOut} />
