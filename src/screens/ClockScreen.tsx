@@ -224,14 +224,19 @@ export function ClockScreen({
     }
   }, []);
 
+  // Guided-tour replay + the first-run trigger (declared before sync so the
+  // callback can fire it once a punch is accepted by the server).
+  const { start: startTutorial, onPunchSucceeded } = useTutorial();
+
   const sync = useCallback(async () => {
     const token = await getAccessToken();
     if (!token) return;
     const result = await drainQueue(token);
     setPending(result.remaining);
     if (result.errors.length > 0) setBanner(result.errors[0] ?? null);
+    if (result.synced > 0) onPunchSucceeded();
     await refresh();
-  }, [refresh]);
+  }, [refresh, onPunchSucceeded]);
 
   useEffect(() => {
     void refresh();
@@ -559,11 +564,11 @@ export function ClockScreen({
     setBusy(false);
   }, [enqueueSimple]);
 
-  // Guided-tour anchors (measured by the spotlight overlay) + replay trigger.
+  // Guided-tour anchors (measured by the spotlight overlay).
   const clockInRef = useTutorialTarget("clockIn");
   const projectRef = useTutorialTarget("project");
   const historyRef = useTutorialTarget("history");
-  const { start: startTutorial } = useTutorial();
+  const scheduleRef = useTutorialTarget("schedule");
 
   const clockedIn = shiftStartedAt !== null;
   const palette = resolvePalette(themePreference, clockedIn);
@@ -887,7 +892,7 @@ export function ClockScreen({
           )}
 
           {upcoming.length > 0 ? (
-            <View style={styles.history}>
+            <View ref={scheduleRef} style={styles.history}>
               <Text style={styles.historyTitle}>Upcoming shifts</Text>
               {upcoming.slice(0, 3).map((s) => (
                 <View key={s.id} style={styles.historyRow}>

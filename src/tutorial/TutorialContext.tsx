@@ -32,6 +32,8 @@ type TutorialContextValue = {
   skip: () => void;
   registerTarget: (key: string, node: Measurable | null) => void;
   measureActive: () => Promise<Rect | null>;
+  /** Call after a punch reaches the server; starts the pending first-run tour once. */
+  onPunchSucceeded: () => void;
 };
 
 const TutorialCtx = createContext<TutorialContextValue | null>(null);
@@ -61,7 +63,11 @@ export function TutorialProvider({
   children: ReactNode;
 }) {
   const steps = useMemo(() => buildSteps(role), [role]);
-  const [active, setActive] = useState(() => autoStart && steps.length > 0);
+  // The first-run tour no longer fires on first login, when the history step
+  // has nothing to point at. It stays pending until the first punch reaches
+  // the server (onPunchSucceeded), so there is a shift for it to spotlight.
+  const [active, setActive] = useState(false);
+  const pendingRef = useRef(autoStart && steps.length > 0);
   const [index, setIndex] = useState(0);
   const targets = useRef<Map<string, Measurable | null>>(new Map());
 
@@ -94,6 +100,14 @@ export function TutorialProvider({
   const back = useCallback(() => setIndex((i) => Math.max(0, i - 1)), []);
 
   const start = useCallback(() => {
+    pendingRef.current = false;
+    setIndex(0);
+    setActive(true);
+  }, []);
+
+  const onPunchSucceeded = useCallback(() => {
+    if (!pendingRef.current) return;
+    pendingRef.current = false;
     setIndex(0);
     setActive(true);
   }, []);
@@ -125,6 +139,7 @@ export function TutorialProvider({
     skip,
     registerTarget,
     measureActive,
+    onPunchSucceeded,
   };
 
   return <TutorialCtx.Provider value={value}>{children}</TutorialCtx.Provider>;
