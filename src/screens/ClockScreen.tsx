@@ -28,6 +28,7 @@ import {
   type MyScheduledShift,
   type Option,
 } from "../api";
+import { readFenceCache, writeFenceCache } from "../fence-cache";
 import { precheckGeofence, type Fence } from "../geofence";
 import { haptics } from "../lib/haptics";
 import { getOrgTz } from "../lib/org-tz";
@@ -150,7 +151,23 @@ export function ClockScreen({
     refreshLock();
   }, [refreshLock]);
   // Worksite fences for the client-side clock-in pre-check. Empty = no geofence.
+  // Seeded on mount from the last good getStatus on disk (fence-cache.ts), so a
+  // cold start with no signal can still warn an off-site worker; the live
+  // refresh below replaces them and the saved copy. The seed never overwrites
+  // fences a live refresh has already applied, whichever answers first.
   const [fences, setFences] = useState<Fence[]>([]);
+  const liveFencesRef = useRef(false);
+  const userId = session.user.id;
+  useEffect(() => {
+    let cancelled = false;
+    void readFenceCache(userId).then((cached) => {
+      if (cancelled || liveFencesRef.current || !cached) return;
+      setFences(cached);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [userId]);
   // WiFi-restricted clock-in config. Unlike the geofence advisory this one
   // BLOCKS: only the phone can see the SSID, so the check lives here.
   const [wifi, setWifi] = useState<{ enforced: boolean; ssids: string[] }>({
@@ -189,7 +206,10 @@ export function ClockScreen({
         setThemePreference(normalizeThemePreference(d.themePreference));
         setProjects(d.projects);
         setTasksByProject(d.tasksByProject);
-        setFences(d.geofence?.worksites ?? []);
+        const worksites = d.geofence?.worksites ?? [];
+        liveFencesRef.current = true;
+        setFences(worksites);
+        void writeFenceCache(userId, worksites);
         setWifi(
           d.wifi
             ? { enforced: d.wifi.enforced, ssids: d.wifi.ssids ?? [] }
@@ -222,7 +242,7 @@ export function ClockScreen({
     } finally {
       setReady(true);
     }
-  }, []);
+  }, [userId]);
 
   // Guided-tour replay + the first-run trigger (declared before sync so the
   // callback can fire it once a punch is accepted by the server).

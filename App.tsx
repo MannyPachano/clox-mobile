@@ -24,6 +24,10 @@ import {
   type LockStatus,
 } from "./src/lib/app-lock";
 import { ErrorBoundary } from "./src/components/ErrorBoundary";
+import {
+  clearFenceCache,
+  clearFenceCacheUnlessOwner,
+} from "./src/fence-cache";
 import { installErrorReporting } from "./src/error-reporting";
 import { ManagerTabs } from "./src/navigation/ManagerTabs";
 import { registerForPush, unregisterForPush } from "./src/push";
@@ -108,11 +112,13 @@ export default function App() {
   // Guard the device-global punch queue across accounts: if the signed-in user
   // is not the one who enqueued the pending punches, clear them so they can't
   // drain under the wrong token. The common path (same user unlocking or
-  // re-authenticating) matches and keeps the queue intact.
+  // re-authenticating) matches and keeps the queue intact. The cached worksite
+  // fences (fence-cache.ts) get the same account-switch guard.
   useEffect(() => {
     const uid = session?.user?.id;
     if (!uid) return;
     void (async () => {
+      await clearFenceCacheUnlessOwner(uid);
       const owner = await getQueueOwner();
       if (owner && owner !== uid && (await queuedCount()) > 0) {
         await clearQueue();
@@ -207,6 +213,7 @@ export default function App() {
     }
     await clearQueue();
     await clearBootSnapshot();
+    await clearFenceCache();
     // The lock is bound to this account; the next person to sign in must set
     // their own. clearing also resets the failed-attempt counter.
     await clearLock();
@@ -228,6 +235,7 @@ export default function App() {
       const t = await getAccessToken();
       if (t) await unregisterForPush(t);
       await clearBootSnapshot();
+      await clearFenceCache();
       await clearLock();
       setLockStatus({ configured: false, biometric: false, identity: null });
       setLocked(false);
