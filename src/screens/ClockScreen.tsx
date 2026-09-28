@@ -780,7 +780,11 @@ export function ClockScreen({
                     accessibilityRole="button"
                     accessibilityLabel="Adjust start time"
                   >
-                    <Text style={styles.adjustLink}>Adjust start time</Text>
+                    {/* The underline is a clay border on a wrapper, not
+                        textDecorationColor, which Android ignores. */}
+                    <View style={styles.adjustLinkLine}>
+                      <Text style={styles.adjustLink}>Adjust start time</Text>
+                    </View>
                   </TouchableOpacity>
                 ) : null}
               </>
@@ -1259,12 +1263,18 @@ const makeStyles = (c: Palette) =>
       fontWeight: "600",
       marginTop: 12,
     },
+    // Text in the card's own text colour with a clay underline: clay text on
+    // the dark card measured 2.94:1 (4.08:1 on the light card), and clay stays
+    // the accent as the underline instead of the letters.
+    adjustLinkLine: {
+      marginTop: 14,
+      borderBottomWidth: 1.5,
+      borderBottomColor: c.accent,
+    },
     adjustLink: {
-      color: c.accent,
+      color: c.text,
       fontSize: 14,
       fontWeight: "600",
-      textDecorationLine: "underline",
-      marginTop: 14,
     },
     switchHint: {
       color: c.textMuted,
@@ -1285,7 +1295,7 @@ const makeStyles = (c: Palette) =>
     },
     bigButton: { borderRadius: 18, paddingVertical: 22, alignItems: "center" },
     inButton: { backgroundColor: c.accent },
-    outButton: { backgroundColor: c.danger },
+    outButton: { backgroundColor: c.dangerFill },
     breakButton: {
       backgroundColor: c.surfaceAlt,
       borderWidth: 1,
@@ -1340,7 +1350,7 @@ const makeStyles = (c: Palette) =>
     // a struck-through duration — it is not worked time until the employee fixes
     // it. Tapping the row opens the correction request sheet.
     rejectedBadge: {
-      backgroundColor: c.danger,
+      backgroundColor: c.dangerFill,
       borderRadius: 6,
       paddingHorizontal: 6,
       paddingVertical: 1,
@@ -1364,7 +1374,7 @@ const makeStyles = (c: Palette) =>
       lineHeight: 18,
     },
     bannerWrap: {
-      backgroundColor: c.danger,
+      backgroundColor: c.dangerFill,
       paddingVertical: 12,
       paddingHorizontal: 20,
     },
