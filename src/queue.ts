@@ -38,13 +38,83 @@ export type QueuedPunch = {
   /** switch_project only — true retags the whole current entry in place
    *  instead of splitting it at clientTime. */
   applyToShift?: boolean;
+  /** Set when the punch can't sync on its own and is kept on the phone for
+   *  the worker and their manager instead of being sent or dropped. */
+  held?: HeldReason;
+  /** For a clock-out, break or switch: the id of the clock-in it belongs to,
+   *  when that clock-in was still waiting in this queue at the time of the
+   *  tap; null when it had already synced. Stamped by enqueuePunch. Missing
+   *  on punches saved by an older app version. */
+  dependsOn?: string | null;
 };
+
+/**
+ * Why a punch is held on the phone.
+ *   too_old          More than MAX_REPLAY_AGE_MS old. The server keeps a
+ *                    replayed punch's tap time only for 24 hours; after that it
+ *                    would record the sync time instead, so the punch is never
+ *                    sent and the manager adds the shift by hand.
+ *   depends_on_held  A clock-out, break or switch whose clock-in is held. It
+ *                    can't land without that clock-in, so it stays with it.
+ */
+export type HeldReason = "too_old" | "depends_on_held";
+
+/** One hour short of the server's 24-hour window (clampClientTime in the web
+ *  repo), so a punch that is sent near the limit still keeps its tap time.
+ *  The same margin as the browser's queue (punch-sync-policy.ts). */
+export const MAX_REPLAY_AGE_MS = 23 * 60 * 60_000;
+
+export function isTooOldToReplay(clientTime: string, nowMs: number): boolean {
+  const ms = Date.parse(clientTime);
+  if (Number.isNaN(ms)) return true;
+  return nowMs - ms > MAX_REPLAY_AGE_MS;
+}
+
+/**
+ * Whether the punch at `index` must be held, and why. Pure, so the rules can
+ * be checked without AsyncStorage. `items` is the queue in enqueue order with
+ * earlier holds already applied, so a clock-in held in the same pass holds the
+ * punches that follow it.
+ */
+export function holdReasonFor(
+  items: QueuedPunch[],
+  index: number,
+  nowMs: number,
+): HeldReason | null {
+  const punch = items[index];
+  if (!punch) return null;
+  if (punch.held) return punch.held;
+  if (isTooOldToReplay(punch.clientTime, nowMs)) return "too_old";
+  if (punch.kind !== "in") {
+    if (punch.dependsOn !== undefined) {
+      if (punch.dependsOn === null) return null;
+      const start = items.find((p) => p.id === punch.dependsOn);
+      return start?.held ? "depends_on_held" : null;
+    }
+    // Saved by an older app version, with no stamp: the nearest earlier
+    // clock-in still in the queue is the best guess.
+    for (let i = index - 1; i >= 0; i -= 1) {
+      const earlier = items[i];
+      if (earlier && earlier.kind === "in") {
+        return earlier.held ? "depends_on_held" : null;
+      }
+    }
+  }
+  return null;
+}
 
 export type DrainResult = {
   synced: number;
+  /** Punches still waiting to sync (held ones are not counted). */
   remaining: number;
+  /** Punches held on the phone because they can't sync on their own. */
+  held: number;
   errors: string[];
 };
+
+/** Shown once, when a drain first holds a punch. */
+const HELD_MESSAGE =
+  "A punch saved on this phone is more than a day old, so it can't sync by itself. It is kept on this phone. Ask your manager to add that shift.";
 
 const LABELS: Record<PunchKind, string> = {
   in: "Clock-in",
@@ -124,7 +194,20 @@ export async function enqueuePunch(
 ): Promise<void> {
   await withQueueLock(async () => {
     const items = await readQueue();
-    items.push(punch);
+    // Record which queued clock-in this punch belongs to while the queue
+    // still shows it; once that clock-in syncs it leaves the queue, and a
+    // later look-back could land on an older, held clock-in instead.
+    let dependsOn: string | null = null;
+    if (punch.kind !== "in") {
+      for (let i = items.length - 1; i >= 0; i -= 1) {
+        const earlier = items[i];
+        if (earlier && earlier.kind === "in") {
+          dependsOn = earlier.id;
+          break;
+        }
+      }
+    }
+    items.push(punch.kind === "in" ? punch : { ...punch, dependsOn });
     await writeQueue(items);
     // Bind the queue to its creator. Only the signed-in user enqueues, so this
     // is always their id; it is read back at sign-in to decide keep vs. clear.
@@ -146,8 +229,31 @@ export async function getQueueOwner(): Promise<string | null> {
   }
 }
 
+/** Punches waiting to sync. Held punches never sync, so they don't count;
+ *  otherwise the Clock screen would never take the server's state again. */
 export async function queuedCount(): Promise<number> {
+  return (await readQueue()).filter((p) => !p.held).length;
+}
+
+/** Punches held on the phone because they can't sync on their own. */
+export async function heldCount(): Promise<number> {
+  return (await readQueue()).filter((p) => p.held).length;
+}
+
+/** Every punch stored on the phone, held or not. The account-switch guard
+ *  uses this, so another user's held punches are cleared too. */
+export async function storedPunchCount(): Promise<number> {
   return (await readQueue()).length;
+}
+
+/** Remove the held punches, once the worker's manager has added the shift.
+ *  Punches still waiting to sync are kept. */
+export async function removeHeldPunches(): Promise<void> {
+  await withQueueLock(async () => {
+    const items = await readQueue();
+    const kept = items.filter((p) => !p.held);
+    if (kept.length !== items.length) await writeQueue(kept);
+  });
 }
 
 /**
@@ -202,16 +308,40 @@ export async function drainQueue(token: string): Promise<DrainResult> {
   // Only one drain at a time. Overlapping drains (online + visibilitychange
   // firing together) would each read the queue and double-send / clobber.
   if (draining) {
-    return { synced, remaining: await queuedCount(), errors };
+    return { synced, remaining: await queuedCount(), held: await heldCount(), errors };
   }
   draining = true;
 
   try {
-    // Process the oldest item each pass. Network happens outside the lock;
-    // the item is then removed by id inside the lock, so a punch enqueued
-    // concurrently (a live tap mid-sync) is never dropped.
+    // Process the oldest punch still waiting to sync each pass. On the way,
+    // inside the lock, hold any punch too old to keep its tap time and any
+    // punch whose clock-in is held; held punches stay in the queue in their
+    // place and are never sent. Network happens outside the lock; the item is
+    // then removed by id inside the lock, so a punch enqueued concurrently (a
+    // live tap mid-sync) is never dropped.
+    let newlyHeld = 0;
     for (;;) {
-      const head = await withQueueLock(async () => (await readQueue())[0] ?? null);
+      const head = await withQueueLock(async () => {
+        const items = await readQueue();
+        const nowMs = Date.now();
+        let changed = false;
+        let next: QueuedPunch | null = null;
+        for (let i = 0; i < items.length; i += 1) {
+          const item = items[i];
+          if (!item || item.held) continue;
+          const reason = holdReasonFor(items, i, nowMs);
+          if (reason) {
+            items[i] = { ...item, held: reason };
+            changed = true;
+            newlyHeld += 1;
+            continue;
+          }
+          next = item;
+          break;
+        }
+        if (changed) await writeQueue(items);
+        return next;
+      });
       if (!head) break;
 
       let outcome: "done" | "drop" | "stop";
@@ -252,9 +382,10 @@ export async function drainQueue(token: string): Promise<DrainResult> {
 
       if (outcome === "done") synced += 1;
     }
+    if (newlyHeld > 0) errors.unshift(HELD_MESSAGE);
   } finally {
     draining = false;
   }
 
-  return { synced, remaining: await queuedCount(), errors };
+  return { synced, remaining: await queuedCount(), held: await heldCount(), errors };
 }

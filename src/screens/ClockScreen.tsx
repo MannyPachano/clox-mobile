@@ -48,6 +48,7 @@ import {
   drainQueue,
   enqueuePunch,
   queuedCount,
+  removeHeldPunches,
   type PunchKind,
   type QueuedPunch,
 } from "../queue";
@@ -120,6 +121,9 @@ export function ClockScreen({
   const [shiftStartedAt, setShiftStartedAt] = useState<string | null>(null);
   const [onBreakSince, setOnBreakSince] = useState<string | null>(null);
   const [pending, setPending] = useState(0);
+  // Punches kept on the phone because they are too old to sync on their own
+  // (queue.ts holdReasonFor). They never count as waiting to sync.
+  const [held, setHeld] = useState(0);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState("");
   const [banner, setBanner] = useState<string | null>(null);
@@ -253,6 +257,7 @@ export function ClockScreen({
     if (!token) return;
     const result = await drainQueue(token);
     setPending(result.remaining);
+    setHeld(result.held);
     if (result.errors.length > 0) setBanner(result.errors[0] ?? null);
     if (result.synced > 0) onPunchSucceeded();
     await refresh();
@@ -574,6 +579,25 @@ export function ClockScreen({
     await enqueueSimple("break_start");
     setBusy(false);
   }, [enqueueSimple]);
+
+  // The held line is tappable: once the manager has added the shift, the
+  // worker can remove the held punches from the phone.
+  const onHeldPress = useCallback(() => {
+    Alert.alert(
+      held === 1 ? "Remove the held punch?" : "Remove the held punches?",
+      "Only do this after your manager has added the shift. The held punches are deleted from this phone, and punches waiting to sync are kept.",
+      [
+        { text: "Keep", style: "cancel" },
+        {
+          text: "Remove",
+          style: "destructive",
+          onPress: () => {
+            void removeHeldPunches().then(() => setHeld(0));
+          },
+        },
+      ],
+    );
+  }, [held]);
 
   const onBreakEnd = useCallback(async () => {
     haptics.light();
@@ -911,9 +935,23 @@ export function ClockScreen({
             <Text style={styles.pending}>
               {pending} {pending === 1 ? "punch" : "punches"} waiting to sync
             </Text>
-          ) : (
+          ) : held > 0 ? null : (
             <Text style={styles.synced}>All punches synced</Text>
           )}
+
+          {held > 0 ? (
+            <TouchableOpacity
+              onPress={onHeldPress}
+              accessibilityRole="button"
+              accessibilityHint="Removes the held punches after your manager has added the shift"
+            >
+              <Text style={styles.held}>
+                {held === 1
+                  ? "1 punch is held on this phone because it is too old to sync by itself. Ask your manager to add that shift, then tap here to remove it."
+                  : `${held} punches are held on this phone because they are too old to sync by themselves. Ask your manager to add that shift, then tap here to remove them.`}
+              </Text>
+            </TouchableOpacity>
+          ) : null}
 
           {upcoming.length > 0 ? (
             <View ref={scheduleRef} style={styles.history}>
@@ -1323,6 +1361,14 @@ const makeStyles = (c: Palette) =>
       fontSize: 14,
       textAlign: "center",
       marginTop: 18,
+    },
+    held: {
+      color: c.warn,
+      fontSize: 14,
+      lineHeight: 20,
+      textAlign: "center",
+      marginTop: 12,
+      fontWeight: "600",
     },
     history: { marginTop: 28 },
     historyTitle: {

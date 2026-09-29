@@ -31,7 +31,12 @@ import {
 import { installErrorReporting } from "./src/error-reporting";
 import { ManagerTabs } from "./src/navigation/ManagerTabs";
 import { registerForPush, unregisterForPush } from "./src/push";
-import { clearQueue, drainQueue, getQueueOwner, queuedCount } from "./src/queue";
+import {
+  clearQueue,
+  drainQueue,
+  getQueueOwner,
+  storedPunchCount,
+} from "./src/queue";
 import { ClockScreen } from "./src/screens/ClockScreen";
 import { LoginScreen } from "./src/screens/LoginScreen";
 import { UnlockScreen } from "./src/screens/UnlockScreen";
@@ -120,7 +125,7 @@ export default function App() {
     void (async () => {
       await clearFenceCacheUnlessOwner(uid);
       const owner = await getQueueOwner();
-      if (owner && owner !== uid && (await queuedCount()) > 0) {
+      if (owner && owner !== uid && (await storedPunchCount()) > 0) {
         await clearQueue();
       }
     })();
