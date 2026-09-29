@@ -21,3 +21,9 @@ google-play-service-account.json
 # and ignore the native settings in app.json.
 /ios
 /android
+
+# Written into targets/ by @bacons/apple-targets at every prebuild, from
+# targets/*/expo-target.config.js (the entitlements and the colors). EAS
+# regenerates them; the config is the source.
+/targets/*/generated.entitlements
+/targets/*/Assets.xcassets
