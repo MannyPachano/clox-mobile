@@ -55,7 +55,7 @@ Test login: **`brightmindcr8@gmail.com` / `timTTPW1!`**
 ---
 
 ## Daily dev workflow
-1. `cd clox-mobile && npx expo start`
+1. `cd clox-mobile && npx expo start --go` (with `expo-dev-client` installed, plain `npx expo start` opens in development-build mode; press `s` there to switch to Expo Go)
 2. Scan the QR → app opens in Expo Go.
 3. Edit any file in `src/` and save → **Fast Refresh** updates the phone in ~1s.
 4. **Reload:** press `r` in the terminal, or shake the phone → Reload.

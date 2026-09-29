@@ -83,7 +83,6 @@ import {
   queuedCount,
   removeHeldPunches,
   takeQueuedClockInForUndo,
-  type PunchKind,
   type QueuedPunch,
 } from "../queue";
 import {
@@ -117,6 +116,7 @@ import {
 import { useTutorial, useTutorialTarget } from "../tutorial/TutorialContext";
 import { TutorialOverlay } from "../tutorial/TutorialOverlay";
 import { newUuid } from "../uuid";
+import { buildSimplePunch, type SimplePunchKind } from "../punch-builders";
 
 // iOS only exposes the WiFi network name when this is on (plus the Access WiFi
 // Information entitlement and precise location permission). Harmless on
@@ -657,24 +657,18 @@ export function ClockScreen({
   }, [refresh, sync]);
 
   const enqueueSimple = useCallback(
-    async (kind: PunchKind) => {
+    async (kind: SimplePunchKind) => {
       // Any later punch ends the undo offer: undoing the clock-in would
       // orphan this one.
       closeUndoOffer(false);
       localEpochRef.current += 1;
-      const punch: QueuedPunch = {
+      // The same builder the lock-screen tap inbox uses, so a clock-out or
+      // break from either place is the same punch.
+      const punch = buildSimplePunch(kind, {
         id: newUuid(),
-        kind,
         clientTime: new Date().toISOString(),
-        projectId: kind === "out" ? projectId : null,
-        taskId: null,
-        note: null,
-        selfie: null,
-        latitude: null,
-        longitude: null,
-        accuracyM: null,
-        mocked: null,
-      };
+        projectId,
+      });
       try {
         await enqueuePunch(punch, userId);
       } catch {
