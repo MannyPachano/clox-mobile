@@ -40,6 +40,20 @@ export const SHIFT_SURFACES_ENABLED = true;
 export const SHIFT_SURFACE_MODULE_NAME = "CloxShiftSurface";
 
 /**
+ * Android: the headless JS task every notification tap starts (the Kotlin
+ * ShiftActionTaskService, SurfaceContract.HEADLESS_TASK), in the app's
+ * running React instance or a new one without a screen. While it runs, the
+ * process is kept out of the frozen cached state and the JavaScript timers
+ * keep running, which a paused app in the background does not get. index.js
+ * registers it with AppRegistry.registerHeadlessTask before
+ * registerRootComponent; its data is `{ id }`, the tap just saved, and it
+ * runs the same inbox pass as the onTap event (read the whole inbox, queue,
+ * ack, drain). A listening JavaScript gets the onTap event for the same tap,
+ * so the pass must be single-flight. The service stops it after 30 seconds.
+ */
+export const SHIFT_ACTION_TASK_NAME = "CloxShiftAction";
+
+/**
  * One call's worth of work for native, decided in JS. Native applies it in
  * this order: write `state` to the shared store (and reload the widget
  * timelines), end, update or start Live Activities, then post or cancel the

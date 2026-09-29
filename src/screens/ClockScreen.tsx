@@ -102,6 +102,7 @@ import {
   type ReminderPrefs,
 } from "../reminders";
 import { getNotificationAccess } from "../push";
+import { askForLockScreenOnce } from "../notification-ask";
 import { getAccessToken } from "../supabase";
 import { getLockStatus, type LockStatus } from "../lib/app-lock";
 import {
@@ -207,6 +208,10 @@ export function ClockScreen({
   const owedAskingRef = useRef(new Set<string>());
   // The first-run tour waits while the undo offer is up (see sync).
   const tutorialDueRef = useRef(false);
+  // Android, decision 4: the one-time lock-screen notification question
+  // waits for the clock-in to stand (its undo offer closing by itself). Any
+  // other close (an undo, a clock-out or break in the window) drops it.
+  const lockScreenAskDueRef = useRef(false);
 
   const [projects, setProjects] = useState<Option[]>([]);
   const [tasksByProject, setTasksByProject] = useState<
@@ -488,6 +493,7 @@ export function ClockScreen({
   // unless the clock-in was undone: then it waits for the next punch.
   const closeUndoOffer = useCallback(
     (undone: boolean) => {
+      lockScreenAskDueRef.current = false;
       if (!undoOfferRef.current) return;
       setUndoOffer(null);
       if (tutorialDueRef.current) {
@@ -497,6 +503,14 @@ export function ClockScreen({
     },
     [setUndoOffer, onPunchSucceeded],
   );
+
+  // Decision 4 (Android): once a clock-in stands, ask once whether the
+  // running shift may show on the lock screen. After Allow, a refresh brings
+  // the shift to the notification.
+  const offerLockScreenOnce = useCallback(async () => {
+    const result = await askForLockScreenOnce(getAccessToken);
+    if (result === "allowed") void refresh();
+  }, [refresh]);
 
   // One undo request to the server for the clock-in sent with `key`. Null
   // when no answer came back (no connection, or none in time).
@@ -621,11 +635,19 @@ export function ClockScreen({
   useEffect(() => {
     if (!undoOffer || undoBusy) return;
     const t = setTimeout(
-      () => closeUndoOffer(false),
+      () => {
+        // Read both before closing: closeUndoOffer drops the ask, and may
+        // open the first-run tour, which the question must not cover (it
+        // then waits for a later clock-in).
+        const askDue = lockScreenAskDueRef.current;
+        const tourOpens = tutorialDueRef.current;
+        closeUndoOffer(false);
+        if (askDue && !tourOpens) void offerLockScreenOnce();
+      },
       Math.max(0, undoOfferClosesAt(undoOffer) - Date.now()),
     );
     return () => clearTimeout(t);
-  }, [undoOffer, undoBusy, closeUndoOffer]);
+  }, [undoOffer, undoBusy, closeUndoOffer, offerLockScreenOnce]);
 
   useEffect(() => {
     if (!undoNote) return;
@@ -895,6 +917,7 @@ export function ClockScreen({
         shownAtMs: Date.now() + CHECK_MS,
         noticeMs: undoNoticeMs(screenReaderOn),
       });
+      lockScreenAskDueRef.current = true;
       // With a screen reader on, focus moves to the offer once it shows (the
       // effect before the loading return), and its label says all of this.
       // Otherwise a short line, in case a reader is on but not detected yet.

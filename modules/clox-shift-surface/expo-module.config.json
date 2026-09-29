@@ -1,6 +1,9 @@
 {
-  "platforms": ["apple"],
+  "platforms": ["apple", "android"],
   "apple": {
     "modules": ["CloxShiftSurfaceModule"]
+  },
+  "android": {
+    "modules": ["expo.modules.cloxshiftsurface.CloxShiftSurfaceModule"]
   }
 }
