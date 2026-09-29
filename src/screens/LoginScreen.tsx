@@ -178,7 +178,8 @@ const makeStyles = (c: Palette) =>
       marginBottom: 24,
       alignSelf: "center",
     },
-    offlineText: { color: "#0f0f0e", fontSize: 14, fontWeight: "600" },
+    // Light text on the amber: 5.17:1 (ink on it measured 3.50:1).
+    offlineText: { color: c.accentText, fontSize: 14, fontWeight: "600" },
     hint: {
       color: c.textMuted,
       fontSize: 13,

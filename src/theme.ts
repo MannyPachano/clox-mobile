@@ -25,6 +25,10 @@ export type Palette = {
    *  text colour on the dark surface, where it must stay light to read, while
    *  a fill under light text must be dark enough to pass 4.5:1. */
   dangerFill: string;
+  /** The unfilled part of the hold-to-clock-out button, which fills with
+   *  dangerFill. Darker than dangerFill so the fill reads, and it carries
+   *  accentText too: 9.1:1. */
+  dangerTrack: string;
   border: string;
   warn: string;
   /* The four extra project board colors (clay/moss/amber map to accent/success
@@ -49,6 +53,7 @@ export const darkColors: Palette = {
   // #e2655a under accentText measured 3.18:1. This is the same hue and chroma
   // (OKLCH), darkened just past 4.5:1: 4.65:1 under #fbf8f3.
   dangerFill: "#c2473e",
+  dangerTrack: "#7a2a1d", // the mockup's hold button base
   border: "#33332d",
   warn: "#e0b15a",
   // Lighter tones so the dot reads on the dark surface (mirrors web dark).
@@ -69,8 +74,11 @@ export const lightColors: Palette = {
   success: "#4f5e42", // deep moss on purpose: readable at small sizes on paper
   danger: "#bb3b2a", // darker than web danger on purpose: readable on paper
   dangerFill: "#bb3b2a", // 5.26:1 under accentText already
+  dangerTrack: "#7a2a1d",
   border: "#ddd5c5",
-  warn: "#9a6b15", // darker than web amber on purpose: readable on paper
+  // Darker than web amber on purpose: 4.78:1 on paper (bg), 5.21:1 on
+  // surface, so 14px text passes 4.5:1 (#9a6b15 measured 4.08:1 on paper).
+  warn: "#8c6112",
   // Deepened on purpose, same reason as success/warn: readable on paper.
   projSlate: "#47586a",
   projPlum: "#664459",

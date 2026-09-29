@@ -7,6 +7,8 @@ import {
   clockOut,
   switchProject,
 } from "./api";
+import type { QueuedCopy, UndoPlan } from "./clock-moment";
+import { planRemovesLocalCopy } from "./clock-moment";
 import { reportError } from "./error-reporting";
 
 const QUEUE_KEY = "clox.punch.queue.v1";
@@ -291,6 +293,89 @@ function send(token: string, punch: QueuedPunch) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// What an undo of a clock-in needs from the queue
+// ---------------------------------------------------------------------------
+
+/**
+ * Punch ids a drain pass has handed to the network in this app session. A
+ * punch still queued after that may have reached the server even though no
+ * answer came back (a dropped connection, a 5xx), so an undo of it must also
+ * ask the server. The Clock screen's undo offer lives only as long as this
+ * JS session, so an in-memory record covers every tap on it. Entries go when
+ * the punch leaves the queue.
+ */
+const sendAttempted = new Set<string>();
+
+/**
+ * Punch ids a drain pass must not send, because an undo is deciding what to
+ * do with them. A pass stops at one rather than skipping it, so the punches
+ * after it keep their order.
+ */
+const withheld = new Set<string>();
+
+/** The punch a drain pass is sending right now. `settled` resolves once that
+ *  send's outcome is written back to the queue. */
+let inFlight: { id: string; settled: Promise<void> } | null = null;
+
+/**
+ * Take the clock-in `punchId` out of the queue for an undo, when `plan` says
+ * to. `plan` is given what the queue holds for it (null once it has left the
+ * queue: sent and answered, or dropped) and returns the undo plan
+ * (clock-moment.ts planUndo).
+ *
+ * Safe against a drain running at the same time: the punch is withheld from
+ * any later pass first, then a send of it already on the wire is waited out,
+ * then the queue is read and changed inside the queue lock. Without the wait
+ * a pass could deliver the clock-in after it was removed here, and the
+ * server would keep it. A punch the plan keeps is released to the next sync.
+ * Returns null, having changed nothing, when a send of it is still on the
+ * wire after `maxWaitMs`, or is found on the wire inside the lock.
+ */
+export async function takeQueuedClockInForUndo(
+  punchId: string,
+  plan: (copy: QueuedCopy | null) => UndoPlan,
+  maxWaitMs: number,
+): Promise<UndoPlan | null> {
+  withheld.add(punchId);
+  try {
+    // A send of this punch already on the wire: wait for its answer, but not
+    // forever. Null tells the caller nothing was decided or changed.
+    const deadline = Date.now() + maxWaitMs;
+    while (inFlight && inFlight.id === punchId) {
+      const left = deadline - Date.now();
+      if (left <= 0) return null;
+      await Promise.race([
+        inFlight.settled,
+        new Promise<void>((resolve) => setTimeout(resolve, left)),
+      ]);
+    }
+    return await withQueueLock(async () => {
+      // A drain picked it up after all: its send is on the wire, so nothing
+      // is decided here (the same answer as a wait that ran out).
+      if (inFlight && inFlight.id === punchId) return null;
+      const items = await readQueue();
+      const idx = items.findIndex((p) => p.id === punchId);
+      const found = idx >= 0 ? items[idx] : undefined;
+      const copy: QueuedCopy | null = found
+        ? {
+            attempted: sendAttempted.has(punchId),
+            hasLaterPunches: items.some((p) => p.dependsOn === punchId),
+          }
+        : null;
+      const decided = plan(copy);
+      if (found && planRemovesLocalCopy(decided)) {
+        items.splice(idx, 1);
+        await writeQueue(items);
+        sendAttempted.delete(punchId);
+      }
+      return decided;
+    });
+  } finally {
+    withheld.delete(punchId);
+  }
+}
+
 /**
  * Send queued punches to the server in order. Stops at the first network
  * failure or auth error so order is preserved and the tail retries later.
@@ -321,6 +406,7 @@ export async function drainQueue(token: string): Promise<DrainResult> {
     // live tap mid-sync) is never dropped.
     let newlyHeld = 0;
     for (;;) {
+      let settle: () => void = () => {};
       const head = await withQueueLock(async () => {
         const items = await readQueue();
         const nowMs = Date.now();
@@ -336,51 +422,72 @@ export async function drainQueue(token: string): Promise<DrainResult> {
             newlyHeld += 1;
             continue;
           }
+          // An undo is deciding about this one: stop here, keeping order.
+          if (withheld.has(item.id)) break;
           next = item;
           break;
         }
         if (changed) await writeQueue(items);
+        // The write yields, and an undo may have withheld the pick meanwhile
+        // (it saw no send in flight yet). Stop the pass instead of sending.
+        if (next && withheld.has(next.id)) next = null;
+        if (next) {
+          // Recorded inside the lock, in the same step as the pick, so an
+          // undo either sees this send or stops the pass before it.
+          sendAttempted.add(next.id);
+          const settled = new Promise<void>((resolve) => {
+            settle = resolve;
+          });
+          inFlight = { id: next.id, settled };
+        }
         return next;
       });
       if (!head) break;
 
-      let outcome: "done" | "drop" | "stop";
       try {
-        const res = await send(token, head);
-        if (res.ok || res.status === 409) {
-          // 409 = already reflected on the server (idempotent replay) — done.
-          outcome = "done";
-        } else if (res.status === 401) {
-          // Token expired/invalid — stop; auth refresh + a later drain resumes.
-          outcome = "stop";
-        } else if (res.status >= 400 && res.status < 500) {
-          // Won't succeed on retry (geo_outside, project_required, …) — drop it
-          // and surface a friendly reason instead of looping forever.
-          errors.push(`${LABELS[head.kind]} failed: ${friendly(res.error)}`);
-          outcome = "drop";
-        } else {
-          // 5xx / unexpected — keep and retry later.
+        let outcome: "done" | "drop" | "stop";
+        try {
+          const res = await send(token, head);
+          if (res.ok || res.status === 409) {
+            // 409 = already reflected on the server (idempotent replay) — done.
+            outcome = "done";
+          } else if (res.status === 401) {
+            // Token expired/invalid — stop; auth refresh + a later drain resumes.
+            outcome = "stop";
+          } else if (res.status >= 400 && res.status < 500) {
+            // Won't succeed on retry (geo_outside, project_required, …) — drop it
+            // and surface a friendly reason instead of looping forever.
+            errors.push(`${LABELS[head.kind]} failed: ${friendly(res.error)}`);
+            outcome = "drop";
+          } else {
+            // 5xx / unexpected — keep and retry later.
+            outcome = "stop";
+          }
+        } catch {
+          // Network down — keep everything, retry on reconnect.
           outcome = "stop";
         }
-      } catch {
-        // Network down — keep everything, retry on reconnect.
-        outcome = "stop";
+
+        if (outcome === "stop") break;
+
+        // Remove exactly this item by id (not by position) so concurrently
+        // enqueued punches survive.
+        await withQueueLock(async () => {
+          const items = await readQueue();
+          const idx = items.findIndex((i) => i.id === head.id);
+          if (idx >= 0) {
+            items.splice(idx, 1);
+            await writeQueue(items);
+          }
+        });
+        sendAttempted.delete(head.id);
+
+        if (outcome === "done") synced += 1;
+      } finally {
+        // Let an undo waiting on this punch read the queue now.
+        inFlight = null;
+        settle();
       }
-
-      if (outcome === "stop") break;
-
-      // Remove exactly this item by id (not by position) so concurrently
-      // enqueued punches survive.
-      await withQueueLock(async () => {
-        const items = await readQueue();
-        const idx = items.findIndex((i) => i.id === head.id);
-        if (idx >= 0) {
-          items.splice(idx, 1);
-          await writeQueue(items);
-        }
-      });
-
-      if (outcome === "done") synced += 1;
     }
     if (newlyHeld > 0) errors.unshift(HELD_MESSAGE);
   } finally {
