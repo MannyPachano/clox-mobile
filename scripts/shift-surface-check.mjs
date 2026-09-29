@@ -24,6 +24,7 @@ import {
   carryPendingTap,
   fillTime,
   isDismissed,
+  isSurfaceOpenUrl,
   parseActivityRecord,
   parseDismissal,
   parseInbox,
@@ -33,10 +34,15 @@ import {
   planInbox,
   planNotification,
   planNotificationAsk,
+  planSurfaceApply,
   projectTaskLabel,
   sameShift,
+  sameSurfaceState,
+  settleTaps,
+  storedSessionUserId,
   surfaceView,
   tapApplies,
+  tapOutcomeFrom,
 } from "../src/shift-surface-state.ts";
 
 let pass = 0,
@@ -395,6 +401,134 @@ const snap = parseSnapshot(JSON.stringify({
 eq([snap.platform, snap.activities.length, snap.activityRecord?.activityId, snap.dismissal?.phase, snap.state?.status, snap.notificationShown], ["ios", 1, "a1", "on", "on", false], "snapshot parses and drops bad rows");
 eq(parseDismissal({ ...dis(), phase: "lunch" }), null, "bad dismissal");
 eq(parseActivityRecord({ ...rec(), createdMs: "x" }), null, "bad record");
+
+// ── The start line needs the org's zone ─────────────────────────────────
+eq(state({}, NOW).startedAtText, "T0", "start line in the org's zone");
+const noZone = buildSurfaceState(input(), NOW, () => null);
+eq([noZone.startedAtText, surfaceView(noZone, NOW).activity.line3], [null, null], "org zone unknown: no start line, never the phone's zone");
+eq(buildSurfaceState(input(), NOW, () => "").startedAtText, null, "an empty time is stored as null (Swift would print it)");
+
+// ── A clock-out's final line survives the refresh after it ─────────────
+eq(planActivity(ctx({ state: off, activities: [act({ state: "ended" })], record: rec({ endedByApp: true }) })).endNow, [], "clocked out: the app's final line stays up");
+eq(planActivity(ctx({ state: off, activities: [act({ state: "ended" })], record: rec({ endedByApp: false }) })).endNow, ["a1"], "clocked out: the system's 8 hour card goes");
+eq(planActivity(ctx({ state: off, activities: [act({ state: "ended" }), act({ id: "a0", state: "ended" })], record: rec({ endedByApp: true }) })).endNow, ["a0"], "clocked out: only the recorded final line stays");
+eq(planActivity(ctx({ state: state({ shiftStartMs: NOW }), activities: [act({ state: "ended" })], record: rec({ endedByApp: true }) })).endNow, ["a1"], "a new shift: the final line goes");
+
+// ── One plan per change (planSurfaceApply) ───────────────────────────────
+const snapOf = (over = {}) => ({ ...EMPTY_SNAPSHOT, platform: "ios", activitiesSupported: true, activitiesEnabled: true, ...over });
+const inboxTap = (over = {}) => tap(over);
+let pa = planSurfaceApply({ snapshot: snapOf(), next: on, inbox: [], nowMs: NOW, foreground: true, source: "push" });
+eq([pa.changed, pa.apply.activity.plan.start, pa.apply.notification.post, "dismissal" in pa.apply], [true, true, false, false], "first push: start, nothing to clear");
+eq(pa.apply.activity.view.show, true, "the view to start with rides along");
+pa = planSurfaceApply({ snapshot: snapOf({ state: on, activities: [act({ createdMs: NOW - H })] }), next: state({}, NOW + 5000), inbox: [], nowMs: NOW + 5000, foreground: true, source: "push" });
+eq(pa.changed, false, "same state, activity live: nothing sent (no widget reload)");
+pa = planSurfaceApply({ snapshot: snapOf({ state: on, activities: [act({ createdMs: NOW - H })] }), next: brk, inbox: [], nowMs: NOW, foreground: false, source: "push" });
+eq([pa.changed, pa.apply.activity.plan.update], [true, "a1"], "a break from the background: update");
+pa = planSurfaceApply({ snapshot: snapOf({ state: on }), next: on, inbox: [], nowMs: NOW, foreground: true, source: "push" });
+eq([pa.changed, pa.apply.activity.plan.start], [true, true], "same state but no activity (iOS ended it): start again");
+const andSnap = (over = {}) => snapOf({ platform: "android", activitiesSupported: false, activitiesEnabled: false, notificationsAllowed: true, ...over });
+pa = planSurfaceApply({ snapshot: andSnap({ state: on, notificationShown: false }), next: on, inbox: [], nowMs: NOW, foreground: true, source: "push" });
+eq([pa.changed, pa.apply.notification.post], [true, true], "Android after a reboot: same state, notification gone, post again");
+pa = planSurfaceApply({ snapshot: andSnap({ state: on, notificationShown: true }), next: on, inbox: [], nowMs: NOW, foreground: true, source: "push" });
+eq(pa.changed, false, "Android, showing and unchanged: nothing sent");
+pa = planSurfaceApply({ snapshot: andSnap({ state: on, notificationShown: true, dismissal: dis({ surface: "notification" }) }), next: on, inbox: [], nowMs: NOW, foreground: true, source: "push" });
+eq([pa.apply.notification.post, "dismissal" in pa.apply], [false, false], "swiped away: stays away, dismissal kept");
+pa = planSurfaceApply({ snapshot: andSnap({ state: on, dismissal: dis({ surface: "notification" }) }), next: brk, inbox: [], nowMs: NOW, foreground: true, source: "push" });
+eq([pa.apply.notification.post, pa.apply.dismissal], [true, null], "a break: the swipe is cleared and it posts again");
+pa = planSurfaceApply({ snapshot: snapOf({ state: on, dismissal: dis() }), next: off, inbox: [], nowMs: NOW, foreground: true, source: "push" });
+eq(pa.apply.dismissal, null, "clocked out: the swipe is cleared for the next shift");
+pa = planSurfaceApply({ snapshot: snapOf({ state: on, dismissal: dis() }), next: on, inbox: [], nowMs: NOW, foreground: true, source: "push" });
+eq([pa.apply.activity.plan.start, pa.changed], [false, false], "swiped away this shift: no start on open");
+
+// A push keeps a pending tap, and never takes down a clock-out being sent.
+pa = planSurfaceApply({ snapshot: snapOf({ state: pendOut, activities: [act()] }), next: on, inbox: [inboxTap()], nowMs: NOW, foreground: true, source: "push" });
+eq([pa.apply.state.pendingTap?.id, pa.apply.activity.plan.update, pa.apply.activity.plan.start], [ID1, "a1", false], "push during a tap: pending kept, no restart");
+pa = planSurfaceApply({ snapshot: snapOf({ state: pendOut, activities: [act()] }), next: off, inbox: [inboxTap()], nowMs: NOW, foreground: true, source: "push" });
+eq([pa.apply.state.status, pa.apply.activity.plan.endNow, pa.apply.notification.cancel], ["off", [], false], "refresh lands before the clock-out settles: the card waits for its final line");
+pa = planSurfaceApply({ snapshot: snapOf({ state: pendOut, activities: [act(), act({ id: "old", shiftStartMs: START - 24 * H })] }), next: off, inbox: [inboxTap()], nowMs: NOW, foreground: true, source: "push" });
+eq(pa.apply.activity.plan.endNow, ["old"], "the hold keeps only the card being clocked out");
+pa = planSurfaceApply({ snapshot: andSnap({ state: pendOut, notificationShown: true }), next: off, inbox: [inboxTap()], nowMs: NOW, foreground: true, source: "push" });
+eq([pa.apply.notification.post, pa.apply.notification.cancel], [false, false], "Android: the pending notification waits for its final line");
+pa = planSurfaceApply({ snapshot: snapOf({ state: pendOut, activities: [act()] }), next: off, inbox: [], nowMs: NOW, foreground: true, source: "push" });
+eq(pa.apply.activity.plan.endNow, ["a1"], "tap already answered: the push ends it");
+pa = planSurfaceApply({ snapshot: snapOf({ state: pendOut, activities: [act()] }), next: state({ userId: null }), inbox: [inboxTap()], nowMs: NOW, foreground: true, source: "push" });
+eq(pa.apply.activity.plan.endNow, ["a1"], "signed out: no hold");
+const pendBrkS = applyTap(on, { id: ID1, kind: "break_start", tapMs: NOW - 1000 }, NOW);
+pa = planSurfaceApply({ snapshot: snapOf({ state: pendBrkS, activities: [act()] }), next: off, inbox: [inboxTap({ kind: "break_start" })], nowMs: NOW, foreground: true, source: "push" });
+eq(pa.apply.activity.plan.endNow, ["a1"], "only a clock-out is held");
+
+// Settling writes the outcome with its final line.
+r = settleTaps(pendOut, [{ tap: { id: ID1, kind: "out", tapMs: NOW - 10_000, userId: A }, outcome: "sent" }], NOW, fmt);
+eq([r.state.status, r.finalCard?.text], ["off", `Clocked out at ${fmt(NOW - 10_000)}.`], "settle: sent clock-out");
+pa = planSurfaceApply({ snapshot: snapOf({ state: pendOut, activities: [act()] }), next: r.state, inbox: [], nowMs: NOW, foreground: false, source: "settle", finalCard: r.finalCard });
+eq([pa.changed, pa.apply.activity.plan.endNow, pa.apply.activity.finalCard?.text, pa.apply.notification.finalCard?.text], [true, ["a1"], r.finalCard.text, r.finalCard.text], "settle: the card ends with its final line");
+r = settleTaps(off, [{ tap: { id: ID1, kind: "out", tapMs: NOW - 10_000, userId: A }, outcome: "queued" }], NOW, fmt);
+eq([r.state, r.finalCard?.text], [off, SURFACE_COPY.savedOffline], "settle after a refresh replaced the pending state: final line only");
+r = settleTaps(pendOut, [{ tap: { id: ID1, kind: "out", tapMs: NOW - 10_000, userId: B }, outcome: "sent" }], NOW, fmt);
+eq([r.state, r.finalCard], [pendOut, null], "settle: another account's state is left alone");
+eq(settleTaps(null, [{ tap: { id: ID1, kind: "out", tapMs: NOW, userId: A }, outcome: "sent" }], NOW, fmt), { state: null, finalCard: null }, "settle after a sign-out cleared everything: nothing");
+r = settleTaps(pendBrk, [{ tap: { id: ID2, kind: "break_start", tapMs: NOW - 2000, userId: A }, outcome: "refused" }], NOW, fmt);
+eq([r.state.status, r.state.notice?.text, r.finalCard], ["on", SURFACE_COPY.refusedBreakStart, null], "settle: refused break keeps the shift with a notice");
+r = settleTaps(pendOut, [{ tap: { id: ID1, kind: "out", tapMs: NOW - 10_000, userId: A }, outcome: "not_sent" }], NOW, fmt);
+eq([r.state.status, r.state.pendingTap, r.finalCard], ["on", null, null], "settle: not sent clears the pending look only");
+
+// A refusal notice survives the Clock screen's refresh that follows the pass.
+const refusedS = settleTaps(pendOut, [{ tap: { id: ID1, kind: "out", tapMs: NOW - 10_000, userId: A }, outcome: "refused" }], NOW, fmt).state;
+pa = planSurfaceApply({ snapshot: snapOf({ state: refusedS, activities: [act()] }), next: state({}, NOW + 2000), inbox: [], nowMs: NOW + 2000, foreground: false, source: "push" });
+v = surfaceView(pa.apply.state, NOW + 2000);
+eq(
+  [pa.changed, pa.apply.state.notice?.text, v.activity.line3, v.activity.buttons.map((b) => b.kind), tapApplies(pa.apply.state, "out")],
+  [false, SURFACE_COPY.refusedOut, SURFACE_COPY.refusedOut, ["break_start", "open"], false],
+  "refresh for the same shift after a refused clock-out: the notice and the Open Clox button stay",
+);
+pa = planSurfaceApply({ snapshot: snapOf({ state: refusedS, activities: [act()] }), next: state({ breakStartMs: NOW }, NOW + 2000), inbox: [], nowMs: NOW + 2000, foreground: false, source: "push" });
+eq([pa.apply.state.notice, surfaceView(pa.apply.state, NOW).activity.buttons.map((b) => b.kind)], [null, ["break_end", "out"]], "a break starting drops the notice");
+pa = planSurfaceApply({ snapshot: snapOf({ state: refusedS }), next: state({ projectId: "p2", projectName: "Other" }, NOW + 2000), inbox: [], nowMs: NOW + 2000, foreground: true, source: "push" });
+eq(pa.apply.state.notice, null, "a project switch drops the notice (how a missing project is fixed)");
+pa = planSurfaceApply({ snapshot: snapOf({ state: refusedS }), next: state({ shiftStartMs: NOW }, NOW + 2000), inbox: [], nowMs: NOW + 2000, foreground: true, source: "push" });
+eq(pa.apply.state.notice, null, "another shift drops the notice");
+pa = planSurfaceApply({ snapshot: snapOf({ state: refusedS }), next: off, inbox: [], nowMs: NOW + 2000, foreground: true, source: "push" });
+eq([pa.apply.state.status, pa.apply.state.notice], ["off", null], "a clock-out drops the notice");
+pa = planSurfaceApply({ snapshot: snapOf({ state: refusedS }), next: state({ userId: B }, NOW + 2000), inbox: [], nowMs: NOW + 2000, foreground: true, source: "push" });
+eq(pa.apply.state.notice, null, "another person: no notice carried");
+const refusedBrk = settleTaps(pendBrk, [{ tap: { id: ID2, kind: "break_start", tapMs: NOW - 2000, userId: A }, outcome: "refused" }], NOW, fmt).state;
+pa = planSurfaceApply({ snapshot: snapOf({ state: refusedBrk }), next: state({}, NOW + 2000), inbox: [], nowMs: NOW + 2000, foreground: true, source: "push" });
+eq([pa.apply.state.notice?.kind, tapApplies(pa.apply.state, "break_start"), tapApplies(pa.apply.state, "out")], ["break_start", true, true], "a refused break's notice stays, and its buttons still work");
+pa = planSurfaceApply({ snapshot: snapOf({ state: refusedS }), next: refusedS, inbox: [], nowMs: NOW + 2000, foreground: false, source: "settle" });
+eq(pa.apply.state.notice?.text, SURFACE_COPY.refusedOut, "settle writes its own notice");
+eq(applyTap(refusedBrk, { id: ID3, kind: "break_start", tapMs: NOW }, NOW).notice, null, "a new tap clears the notice");
+
+// A 409: what the tap asked for already held. Never the tap's time.
+r = applyTapOutcome(pendOut, { id: ID1, kind: "out", tapMs: NOW - 10_000 }, "already", NOW, fmt);
+eq([r.state.status, r.state.pendingTap, r.finalCard?.text], ["off", null, SURFACE_COPY.clockedOut], "clock-out 409 (shift already ended elsewhere): You're clocked out., no time");
+r = applyTapOutcome(pendEnd, { id: ID2, kind: "break_end", tapMs: NOW - 2000 }, "already", NOW, fmt);
+eq([r.state.status, r.state.breakStartMs, r.finalCard], ["on", null, null], "break end 409: back on the clock");
+r = applyTapOutcome(pendBrk, { id: ID2, kind: "break_start", tapMs: NOW - 2000 }, "already", NOW, fmt);
+eq([r.state.status, r.finalCard], ["break", null], "break start 409: on break");
+r = settleTaps(pendOut, [{ tap: { id: ID1, kind: "out", tapMs: NOW - 10_000, userId: A }, outcome: "already" }], NOW, fmt);
+eq([r.state.status, r.finalCard?.text], ["off", SURFACE_COPY.clockedOut], "settle: a 409 clock-out ends with the plain line");
+
+// What became of a queued tap.
+eq(tapOutcomeFrom({ settled: "sent", stored: false, held: false }), "sent", "outcome: sent");
+eq(tapOutcomeFrom({ settled: "refused", stored: false, held: false }), "refused", "outcome: refused");
+eq(tapOutcomeFrom({ settled: "already", stored: false, held: false }), "already", "outcome: 409, already so");
+eq(tapOutcomeFrom({ settled: null, stored: true, held: false }), "queued", "outcome: still queued");
+eq(tapOutcomeFrom({ settled: null, stored: true, held: true }), "refused", "outcome: held reads as refused (open Clox)");
+eq(tapOutcomeFrom({ settled: null, stored: false, held: false }), "unknown", "outcome: left in an earlier session");
+
+// State comparison ignores only updatedMs.
+eq(sameSurfaceState(on, { ...on, updatedMs: 1 }), true, "same state apart from the time it was built");
+eq(sameSurfaceState(on, { ...on, label: "Other" }), false, "label differs");
+eq(sameSurfaceState(on, { ...on, copy: { ...on.copy, clockOut: "End shift" } }), false, "copy differs");
+eq(sameSurfaceState(on, pendOut), false, "pending differs");
+eq(sameSurfaceState(null, null), true, "both empty");
+
+// ── Links and the stored session ─────────────────────────────────────────
+eq(["clox://clock", "clox://clock/", "clox:///clock", "CLOX://clock?x=1", " clox://clock "].map(isSurfaceOpenUrl), [true, true, true, true, true], "clox://clock opens the Clock screen");
+eq(["clox://clock-in", "clox://clockout", "https://clox.app/clock", "clox://", "", null, undefined].map(isSurfaceOpenUrl), [false, false, false, false, false, false, false], "nothing else is the Clock screen link");
+eq(storedSessionUserId(JSON.stringify({ access_token: "a", refresh_token: "r", user: { id: A } })), A, "stored session: its user");
+eq(storedSessionUserId(JSON.stringify({ access_token: "a", user: { id: A } })), null, "no refresh token: not a session");
+eq([storedSessionUserId(null), storedSessionUserId("junk"), storedSessionUserId("{}")], [null, null, null], "nothing stored");
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

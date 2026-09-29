@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  AppState,
   StyleSheet,
   Text,
   TouchableOpacity,
@@ -55,6 +56,12 @@ export function UnlockScreen({
   const biometricTriedRef = useRef(false);
 
   const lockedOut = retryAt != null && now < retryAt;
+  // Read by the one biometric offer, which can wait for the foreground while
+  // a cooldown restored from disk lands.
+  const lockedOutRef = useRef(lockedOut);
+  useEffect(() => {
+    lockedOutRef.current = lockedOut;
+  }, [lockedOut]);
 
   // Restore any in-force cooldown from disk (survives an app kill mid-lockout).
   useEffect(() => {
@@ -85,24 +92,48 @@ export function UnlockScreen({
   // the app inactive, so cancelling it ("Use PIN") returns us to active and
   // would instantly re-trigger Face ID, trapping the user out of the PIN pad.
   // Manual retry stays available via the "Use Face ID" button below.
+  //
+  // The one offer waits for the app to be in the foreground. iOS can start
+  // Clox in the background for a Lock Screen or widget button (the tap itself
+  // needs no Clox unlock, decision 3), and this screen then mounts with
+  // nobody looking: a prompt there would fail, use up the one offer, and
+  // leave the person to find "Use Face ID" when they open the app. So it
+  // waits for the first "active", once, and never again after that.
   useEffect(() => {
     let cancelled = false;
+    let sub: { remove(): void } | null = null;
+    const offer = () => {
+      if (
+        cancelled ||
+        !biometricEnabled ||
+        biometricTriedRef.current ||
+        lockedOutRef.current
+      ) {
+        return;
+      }
+      biometricTriedRef.current = true;
+      void runBiometric();
+    };
     void isBiometricAvailable().then((b) => {
       if (cancelled) return;
       setBioKind(b.kind);
       setBioReady(b.available);
-      if (
-        b.available &&
-        biometricEnabled &&
-        !biometricTriedRef.current &&
-        !lockedOut
-      ) {
-        biometricTriedRef.current = true;
-        void runBiometric();
+      if (!b.available) return;
+      if (AppState.currentState === "active") {
+        offer();
+        return;
       }
+      sub = AppState.addEventListener("change", (state) => {
+        if (state !== "active") return;
+        sub?.remove();
+        sub = null;
+        offer();
+      });
     });
     return () => {
       cancelled = true;
+      sub?.remove();
+      sub = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

@@ -246,7 +246,9 @@ export type SurfaceStateV1 = {
   /** A tap saved on this phone that JS has not answered yet. */
   pendingTap: { id: string; kind: SurfaceTapKind; tapMs: number } | null;
   /** The last tap was refused by the server. Shown in place of the start
-   *  line until the next state from the app. */
+   *  line (and, while it stands, a refused clock-out opens Clox) until the
+   *  shift, its phase or its project changes, or another tap is saved; a
+   *  push that only confirms the same shift keeps it (planSurfaceApply). */
   notice: { kind: SurfaceTapKind; text: string } | null;
   copy: SurfaceCopy;
   updatedMs: number;
@@ -409,17 +411,22 @@ export type SurfaceInput = {
   orgTimeZone: string | null;
 };
 
+/** A clock time in the org's zone ("9:42 AM"), or null when the org's zone
+ *  is not known truthfully (the line is then left out, never shown in the
+ *  phone's own zone). The app passes shift-surface.ts clockTextIn with the
+ *  org's zone. */
+export type FormatClock = (ms: number) => string | null;
+
 /**
  * The state for what the app knows now. `formatClock` gives a clock time in
- * the org's zone ("9:42 AM"); the app passes zoned-time's clockInZone with
- * the org zone. A state built here has no pending tap and no notice: the
- * app's own view replaces both (see carryPendingTap for a push that must
- * keep a tap native is still waiting on).
+ * the org's zone ("9:42 AM"). A state built here has no pending tap and no
+ * notice: the app's own view replaces both (see carryPendingTap for a push
+ * that must keep a tap native is still waiting on).
  */
 export function buildSurfaceState(
   input: SurfaceInput,
   nowMs: number,
-  formatClock: (ms: number) => string,
+  formatClock: FormatClock,
 ): SurfaceStateV1 {
   const base: SurfaceStateV1 = {
     v: SURFACE_SCHEMA_VERSION,
@@ -453,7 +460,9 @@ export function buildSurfaceState(
     breakStartMs: onBreak ? (input.breakStartMs as number) : null,
     projectId,
     label: projectTaskLabel(input.projectName, input.taskName),
-    startedAtText: formatClock(input.shiftStartMs),
+    // Never "": Swift fills "{time}" with an empty string where JS would
+    // leave the line out.
+    startedAtText: formatClock(input.shiftStartMs) || null,
     needsProjectToClockOut: input.requireProject && !projectId,
   };
 }
@@ -776,20 +785,25 @@ export function applyTap(
 
 /**
  * How a saved tap ended up, as JS learns it:
- *   sent      the server took it (2xx, or 409 for a punch it already has)
+ *   sent      the server took it (2xx), at the tap's time
+ *   already   409: what it asked for already held (a clock-out for a shift
+ *             that ended elsewhere: the web, a kiosk, a manager, the auto
+ *             clock-out). Settles like sent, but never claims the tap's time.
  *   queued    saved in the punch queue, not sent yet (offline, or held)
  *   refused   the server refused it (a 4xx the queue dropped)
  *   not_sent  never queued: it belonged to another account, or was malformed
  */
-export type TapOutcome = "sent" | "queued" | "refused" | "not_sent";
+export type TapOutcome = "sent" | "already" | "queued" | "refused" | "not_sent";
+
+/** The shift ended from a surface: iOS ends the Live Activity with this
+ *  final line, left on the Lock Screen until dismissAtMs; Android replaces
+ *  the ongoing notification with a plain one that times out then. */
+export type FinalCard = { text: string; dismissAtMs: number };
 
 export type OutcomeResult = {
   state: SurfaceStateV1;
-  /** The shift ended from a surface: iOS ends the Live Activity with this
-   *  final line, left on the Lock Screen until dismissAtMs; Android replaces
-   *  the ongoing notification with a plain one that times out then. Null
-   *  leaves both to planActivity and planNotification. */
-  finalCard: { text: string; dismissAtMs: number } | null;
+  /** Null leaves both surfaces to planActivity and planNotification. */
+  finalCard: FinalCard | null;
 };
 
 /**
@@ -801,7 +815,7 @@ export function applyTapOutcome(
   tap: Pick<SurfaceTapV1, "id" | "kind" | "tapMs">,
   outcome: TapOutcome,
   nowMs: number,
-  formatClock: (ms: number) => string,
+  formatClock: FormatClock,
 ): OutcomeResult {
   const copy = state.copy ?? SURFACE_COPY;
   const cleared: SurfaceStateV1 = {
@@ -825,12 +839,15 @@ export function applyTapOutcome(
     };
   }
 
-  // sent or queued: the punch stands, on the server or in the queue.
+  // sent, already or queued: the shift is where the tap asked, on the server
+  // or in the queue.
   if (tap.kind === "out") {
     const text =
       outcome === "sent"
         ? (fillTime(copy.clockedOutAt, formatClock(tap.tapMs)) ?? copy.clockedOut)
-        : copy.savedOffline;
+        : outcome === "already"
+          ? copy.clockedOut
+          : copy.savedOffline;
     return {
       state: {
         ...cleared,
@@ -1048,7 +1065,10 @@ export type ActivityPlan = {
  *
  * - Nothing shows (clocked out, signed out, off switch): end every activity,
  *   including one the system ended at 8 hours that still sits on the Lock
- *   Screen.
+ *   Screen. The one exception is the activity the app itself ended with a
+ *   final line (a clock-out from the Lock Screen): it stays until its own
+ *   dismissal time, so the refresh that follows the clock-out does not take
+ *   "Clocked out at 5:02 PM." away at once.
  * - The running shift's own activity is live: update it, or replace it once
  *   it is ACTIVITY_REPLACE_AFTER_MS old and the app is in the foreground, so
  *   a long shift keeps a live timer past the system's 8 hour end.
@@ -1068,7 +1088,10 @@ export function planActivity(ctx: ActivityContext): ActivityPlan {
   const lingering = ctx.activities.filter((a) => a.state === "ended");
 
   if (!isShiftShown(state) || !state) {
-    plan.endNow = [...live, ...lingering].map((a) => a.id);
+    const rec = ctx.record;
+    const finalCard = (a: ActivityInfo) =>
+      !!rec && rec.v === SURFACE_SCHEMA_VERSION && rec.endedByApp && rec.activityId === a.id;
+    plan.endNow = [...live, ...lingering.filter((a) => !finalCard(a))].map((a) => a.id);
     return plan;
   }
 
@@ -1160,6 +1183,283 @@ export function planNotificationAsk(input: {
   if (input.platform !== "android" || !input.enabled) return "none";
   if (input.granted || input.askedBefore) return "none";
   return input.canAskAgain ? "ask" : "settings";
+}
+
+// ── One call to native: a push or a settled tap ──────────────────────────
+
+/** Everything native's apply() is given, less the schema version
+ *  (shift-surface.ts NativeApplyPlan adds it). */
+export type SurfaceApply = {
+  state: SurfaceStateV1;
+  activity: { plan: ActivityPlan; view: LiveActivityView; finalCard: FinalCard | null };
+  notification: {
+    post: boolean;
+    cancel: boolean;
+    view: NotificationView;
+    finalCard: FinalCard | null;
+  };
+  /** Undefined leaves the saved dismissal alone; null clears it. */
+  dismissal?: SurfaceDismissalV1 | null;
+};
+
+export type SurfaceApplyInput = {
+  snapshot: NativeSnapshot;
+  /** The state to show. */
+  next: SurfaceStateV1;
+  /** The inbox as native returned it. */
+  inbox: readonly unknown[];
+  nowMs: number;
+  /** AppState is "active": only then may a Live Activity start. */
+  foreground: boolean;
+  /**
+   * "push": the Clock screen's own view of the shift (a punch it made, or a
+   * refresh that applied the server's answer). "settle": the tap pass
+   * writing a tap's outcome, after it acked the tap.
+   */
+  source: "push" | "settle";
+  /** settle only: the final line a surface clock-out leaves. */
+  finalCard?: FinalCard | null;
+};
+
+function inboxIds(inbox: readonly unknown[]): string[] {
+  const ids: string[] = [];
+  for (const raw of inbox) {
+    if (isObj(raw) && typeof raw.id === "string") ids.push(raw.id.toLowerCase());
+  }
+  return ids;
+}
+
+function sameTap(
+  a: SurfaceStateV1["pendingTap"],
+  b: SurfaceStateV1["pendingTap"],
+): boolean {
+  if (!a || !b) return a === b;
+  return a.id === b.id && a.kind === b.kind && a.tapMs === b.tapMs;
+}
+
+/** Two states that draw the same surfaces (updatedMs aside). */
+export function sameSurfaceState(a: SurfaceStateV1 | null, b: SurfaceStateV1 | null): boolean {
+  if (!a || !b) return a === b;
+  if (
+    a.v !== b.v ||
+    a.enabled !== b.enabled ||
+    a.status !== b.status ||
+    a.ownerUserId !== b.ownerUserId ||
+    a.shiftStartMs !== b.shiftStartMs ||
+    a.breakStartMs !== b.breakStartMs ||
+    a.projectId !== b.projectId ||
+    a.label !== b.label ||
+    a.startedAtText !== b.startedAtText ||
+    a.orgTimeZone !== b.orgTimeZone ||
+    a.needsProjectToClockOut !== b.needsProjectToClockOut ||
+    !sameTap(a.pendingTap, b.pendingTap)
+  ) {
+    return false;
+  }
+  if ((a.notice?.kind ?? null) !== (b.notice?.kind ?? null)) return false;
+  if ((a.notice?.text ?? null) !== (b.notice?.text ?? null)) return false;
+  for (const key of Object.keys(SURFACE_COPY) as (keyof SurfaceCopy)[]) {
+    if (a.copy[key] !== b.copy[key]) return false;
+  }
+  return true;
+}
+
+/**
+ * The one plan every state change goes through, and whether it changes
+ * anything (a push that changes nothing is not sent, so the widget is not
+ * reloaded for nothing).
+ *
+ * - A push keeps a tap native is still waiting on (carryPendingTap; native
+ *   does the same under its lock), and keeps a refusal notice while the
+ *   shift, its phase and its project stay the same.
+ * - A saved dismissal belongs to one shift and one phase. Any other state
+ *   clears it, so the next shift, or a break starting or ending, shows the
+ *   surface again. While it stands, nothing starts or posts.
+ * - A push that would take a surface down while a Lock Screen clock-out is
+ *   still being sent (the refresh that follows the send can land first)
+ *   leaves that surface alone: the tap pass ends it a moment later with its
+ *   final line. The state is still written, so the widget and any new tap
+ *   see the shift as over.
+ */
+export function planSurfaceApply(input: SurfaceApplyInput): {
+  apply: SurfaceApply;
+  changed: boolean;
+} {
+  const { snapshot, nowMs } = input;
+  const prev = snapshot.state;
+  const ids = inboxIds(input.inbox);
+  let state = input.source === "push" ? carryPendingTap(prev, input.next, ids) : input.next;
+  // A refusal notice survives a push that only confirms the same shift: the
+  // Clock screen refreshes right after the tap pass, and the server still
+  // has the shift the refused tap was about, so the line stays and Clock out
+  // keeps opening Clox. A real change drops it: a clock-out, a break
+  // starting or ending, a project switch (how a missing project is fixed),
+  // another shift or another person.
+  if (
+    input.source === "push" &&
+    prev?.notice &&
+    !state.notice &&
+    !state.pendingTap &&
+    prev.ownerUserId === state.ownerUserId &&
+    isShiftShown(prev) &&
+    isShiftShown(state) &&
+    phaseOf(prev) === phaseOf(state) &&
+    prev.projectId === state.projectId &&
+    sameShift(prev.shiftStartMs, state.shiftStartMs)
+  ) {
+    state = { ...state, notice: prev.notice };
+  }
+  const shown = isShiftShown(state);
+  const saved = snapshot.dismissal;
+  const stands = shown && isDismissed(saved, state.shiftStartMs, phaseOf(state));
+  const dismissal = saved && !stands ? null : undefined;
+
+  let activity = planActivity({
+    state,
+    activities: snapshot.activities,
+    record: snapshot.activityRecord,
+    dismissal: stands ? saved : null,
+    nowMs,
+    foreground: input.foreground,
+    activitiesEnabled: snapshot.activitiesEnabled,
+  });
+  let notification = planNotification({
+    state,
+    dismissal: stands ? saved : null,
+    shown: snapshot.notificationShown,
+    allowed: snapshot.notificationsAllowed,
+  });
+
+  const held = prev?.pendingTap;
+  if (
+    input.source === "push" &&
+    !shown &&
+    prev &&
+    held &&
+    held.kind === "out" &&
+    ids.includes(held.id) &&
+    !!prev.ownerUserId &&
+    prev.ownerUserId === state.ownerUserId
+  ) {
+    const sending = new Set(
+      snapshot.activities
+        .filter(
+          (a) =>
+            (a.state === "active" || a.state === "stale") &&
+            sameShift(a.shiftStartMs, prev.shiftStartMs),
+        )
+        .map((a) => a.id),
+    );
+    activity = { ...activity, endNow: activity.endNow.filter((id) => !sending.has(id)) };
+    notification = { post: false, cancel: false };
+  }
+
+  const finalCard = input.source === "settle" ? (input.finalCard ?? null) : null;
+  const view = surfaceView(state, nowMs);
+  const apply: SurfaceApply = {
+    state,
+    activity: { plan: activity, view: view.activity, finalCard },
+    notification: {
+      post: notification.post,
+      cancel: notification.cancel,
+      view: view.notification,
+      finalCard,
+    },
+  };
+  if (dismissal !== undefined) apply.dismissal = dismissal;
+
+  const changed =
+    input.source === "settle" ||
+    !sameSurfaceState(prev, state) ||
+    activity.endNow.length > 0 ||
+    activity.start ||
+    activity.recordDismissal !== null ||
+    dismissal !== undefined ||
+    notification.cancel ||
+    (notification.post && !snapshot.notificationShown);
+  return { apply, changed };
+}
+
+// ── The outcome of a saved tap ───────────────────────────────────────────
+
+/**
+ * What became of a queued tap, from the queue after the drain:
+ * `settled` is how it left the queue in this app session (queue.ts
+ * settledPunchOutcome), else it is still stored (held or waiting), else it
+ * left in an earlier session, or a sign-out cleared the queue, and nothing
+ * here knows how ("unknown").
+ */
+export function tapOutcomeFrom(input: {
+  settled: "sent" | "already" | "refused" | null;
+  stored: boolean;
+  held: boolean;
+}): TapOutcome | "unknown" {
+  if (input.settled) return input.settled;
+  // A held punch cannot sync by itself (its clock-in is held): the app has
+  // to be opened, which is what the refused line says.
+  if (input.stored) return input.held ? "refused" : "queued";
+  return "unknown";
+}
+
+export type SettledTap = {
+  tap: Pick<SurfaceTapV1, "id" | "kind" | "tapMs" | "userId">;
+  outcome: TapOutcome;
+};
+
+/**
+ * The state after the tap pass settles its taps, from native's state as it
+ * is now (a push may have replaced the pending state meanwhile). A tap whose
+ * pending look is still up gets its outcome (applyTapOutcome). A tap whose
+ * state was replaced only contributes a clock-out's final line, for the
+ * activity or notification that still shows it. Null: no state (a sign-out
+ * cleared everything), so nothing is written.
+ */
+export function settleTaps(
+  current: SurfaceStateV1 | null,
+  settled: readonly SettledTap[],
+  nowMs: number,
+  formatClock: FormatClock,
+): { state: SurfaceStateV1 | null; finalCard: FinalCard | null } {
+  if (!current) return { state: null, finalCard: null };
+  let state = current;
+  let finalCard: FinalCard | null = null;
+  for (const s of settled) {
+    if (state.ownerUserId !== s.tap.userId) continue;
+    const res = applyTapOutcome(state, s.tap, s.outcome, nowMs, formatClock);
+    if (state.pendingTap?.id === s.tap.id) {
+      state = res.state;
+      finalCard = res.finalCard ?? finalCard;
+    } else if (res.finalCard) {
+      finalCard = res.finalCard;
+    }
+  }
+  return { state, finalCard };
+}
+
+// ── Links and the session ────────────────────────────────────────────────
+
+/**
+ * Whether a URL is SURFACE_OPEN_URL (the widget's Clock in, the Live
+ * Activity, the notification). It opens the Clock screen and nothing else;
+ * every other clox:// link only opens the app. No link ever punches.
+ */
+export function isSurfaceOpenUrl(url: string | null | undefined): boolean {
+  if (typeof url !== "string") return false;
+  return /^clox:\/\/\/?clock\/?(?:[?#].*)?$/i.test(url.trim());
+}
+
+/**
+ * The user id of the session saved on this phone (the JSON Supabase keeps
+ * in secure storage), or null when there is none or it cannot be parsed.
+ * Used when the session cannot be refreshed (offline with an expired access
+ * token): that is still this person's session, not a sign-out.
+ */
+export function storedSessionUserId(raw: string | null | undefined): string | null {
+  const parsed = safeJson(raw);
+  if (!isObj(parsed)) return null;
+  if (typeof parsed.refresh_token !== "string" || parsed.refresh_token.length === 0) return null;
+  const user = parsed.user;
+  return isObj(user) ? strOrNull(user.id) : null;
 }
 
 // ── Reading native's blobs ───────────────────────────────────────────────

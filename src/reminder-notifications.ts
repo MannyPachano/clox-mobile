@@ -4,6 +4,7 @@ import { Platform } from "react-native";
 
 import { reportError } from "./error-reporting";
 import {
+  LONG_SHIFT_ID_PREFIX,
   parsePrefsCache,
   planLongShiftReminder,
   planShiftReminders,
@@ -169,6 +170,30 @@ export function syncLongShiftReminder(
     if (plan.schedule.length > 0 && !(await allowed())) plan.schedule = [];
     await apply(plan);
   }, "reminders.syncLong");
+}
+
+/**
+ * Cancel the long shift reminder ("Still on the clock?") without the Clock
+ * screen. A clock-out from the Lock Screen, the widget or the Android
+ * notification can be handled while the Clock screen is not mounted (the
+ * app lock is up, the app was started in the background for the tap, or a
+ * manager is on another tab), and then nothing is armed to run
+ * syncLongShiftReminder. The shift is over either way, so this needs
+ * neither the preferences nor arming. It runs in the same line as every
+ * other sync, after any sync already queued, so that one cannot put the
+ * reminder back afterwards.
+ * The shift start reminders held while on the clock come back at the Clock
+ * screen's next refresh.
+ */
+export function cancelLongShiftReminders(): Promise<void> {
+  return serial(async () => {
+    const ids = await scheduledIds();
+    for (const id of ids) {
+      if (id.startsWith(LONG_SHIFT_ID_PREFIX)) {
+        await Notifications.cancelScheduledNotificationAsync(id);
+      }
+    }
+  }, "reminders.cancelLong");
 }
 
 /** Sign-out and re-authentication: disarm, then cancel every reminder this
