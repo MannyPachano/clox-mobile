@@ -3,9 +3,11 @@ import { AppState } from "react-native";
 
 import { Ionicons } from "@expo/vector-icons";
 import {
+  CommonActions,
   NavigationContainer,
   DefaultTheme,
   useFocusEffect,
+  useNavigationContainerRef,
   type Theme,
 } from "@react-navigation/native";
 import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
@@ -13,6 +15,7 @@ import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
 import type { Session } from "@supabase/supabase-js";
 
 import { getManagerSummary } from "../api";
+import type { TapTarget } from "../reminders";
 import { ApprovalsScreen } from "../screens/ApprovalsScreen";
 import { ClockScreen } from "../screens/ClockScreen";
 import { RosterScreen } from "../screens/RosterScreen";
@@ -84,11 +87,29 @@ const navTheme: Theme = {
 export function ManagerTabs({
   session,
   onSignOut,
+  pendingTab = null,
+  onPendingTabHandled,
 }: {
   session: Session;
   onSignOut: () => void;
+  /** A tapped notification's tab (App.tsx): Roster for a refused clock-in,
+   *  Clock for a reminder. Opened once the navigator is ready, then handed
+   *  back through onPendingTabHandled so App forgets it. Remounting (after
+   *  an unlock) never opens it again. */
+  pendingTab?: TapTarget | null;
+  onPendingTabHandled?: () => void;
 }) {
   const [pending, setPending] = useState(0);
+  const navRef = useNavigationContainerRef();
+  const [navReady, setNavReady] = useState(false);
+
+  useEffect(() => {
+    if (!navReady || !pendingTab) return;
+    if (navRef.isReady()) {
+      navRef.dispatch(CommonActions.navigate({ name: pendingTab }));
+    }
+    onPendingTabHandled?.();
+  }, [navReady, pendingTab, navRef, onPendingTabHandled]);
 
   // Poll a light summary so the Approvals tab shows a pending-count badge.
   useEffect(() => {
@@ -122,7 +143,11 @@ export function ManagerTabs({
   }, []);
 
   return (
-    <NavigationContainer theme={navTheme}>
+    <NavigationContainer
+      ref={navRef}
+      theme={navTheme}
+      onReady={() => setNavReady(true)}
+    >
       <Tab.Navigator
         screenOptions={({ route }) => ({
           headerShown: false,

@@ -99,6 +99,19 @@ After changing `.env`, restart: `Ctrl+C` → `npx expo start -c` (a plain reload
 5. **Verify:** open the web app as the manager → that employee's timesheet shows the shift.
 6. **Undo:** clock in again, then tap **Undo clock-in** within 10 seconds (45 with a screen reader on) → back to Not clocked in, and no new shift on the web timesheet. Online, the punch has usually synced by then, so this exercises the server undo (`/undo-clock-in`, needs web PR #19 deployed). In Airplane mode, a clock-in the phone never tried to send is simply taken out of its queue. One whose send had already started stays queued and the phone says it can't undo it offline; try again once online. When a send had started and the phone is online, the punch leaves the queue and the screen waits for the server: done shows the undone note, a refusal or a 404 leaves the server's state on screen with a banner, and no answer at all shows Not clocked in with "The undo isn't confirmed yet" while the phone asks again on each sync.
 
+**Reminders test** (needs the web PR #19 server, whose `/status` carries `preferences`)
+1. Account menu → **Reminders**. Against an older server the screen says reminders aren't available yet, and every switch is off and can't be turned on. That is the expected state until PR #19 is deployed.
+2. Turn on **Before a scheduled shift**. If notifications are not allowed yet, turning the switch on asks where the phone still allows it, or offers Open Settings (iOS after one refusal). Allow it.
+3. As the manager on the web, schedule a shift for this employee that starts about 15 minutes from now, then bring the app to the front (a refresh schedules the reminders). About 5 minutes later: "Your shift starts at h:mm AM." in the **org's** time zone. It opens the Clock screen when tapped.
+4. Clock in early for that shift before the reminder fires: the reminder is cancelled. Clock out: reminders for later shifts come back.
+5. As the **manager**, turn on **When a shift passes 10 hours**, clock in, then use **Adjust start time** to set the start to 9 hours 55 minutes ago. The refresh moves the reminder: "Still on the clock?" arrives about 5 minutes later, and tells a manager to fix the end time under Recent shifts (an employee's copy says to tap the shift there to ask for a change). Clock out before then and nothing arrives.
+6. Deny path: turn notifications off for Clox in the phone's Settings. The Reminders screen says they can't show and offers **Open Settings**. Turning a switch on after a refusal leaves it off, says why and offers **Open Settings** (VoiceOver and TalkBack read the reason). With a reminder on (from the phone or web Settings) and notifications off, the Clock screen says so once per session in its banner; it never asks for permission itself.
+7. Refused clock-in push (EAS build only, it is a remote push): as a manager, turn on **When a punch is refused**, then have a geofenced employee clock in off-site. Tap the push: the **Roster** tab opens, from a cold start, from the background, and after the app lock's PIN screen. For the lock case, set a lock, leave the app in the background for more than a minute, tap the push, enter the PIN, and check that Roster is showing. Repeat once with a lock set up in the same session (App.tsx gives the tap back to the tabs when the lock comes on after they took it).
+8. **Sign out**: every reminder is cancelled.
+- **Android is not on time.** Android 12 and later can deliver these up to an hour late (longer in Doze or battery saver), because the 1.3.0 build has no `SCHEDULE_EXACT_ALARM`: expo-notifications then falls back to `setAndAllowWhileIdle`. So a shift reminder can land after the shift starts. While the app is in the foreground such a late one is held back (`isLateShiftReminder`, via each reminder's `data.startsAt`); in the background the phone shows it. The Android sublabel says it can sometimes arrive late. On-time delivery needs `SCHEDULE_EXACT_ALARM` in a future store build (and, on Android 14 and later, the person granting it in Settings). iOS is on time.
+- A change made off the phone (a shift moved or deleted on the web, a clock-in or clock-out on the web, a kiosk, a manager or the auto-clock-out cron) reaches the reminders only when the app next refreshes. The Reminders screen's footnote says so.
+- Local reminders work in Expo Go; only the refused clock-in push needs an EAS build.
+
 **Offline test**
 1. Clock in while online (so you have a running shift).
 2. Turn on **Airplane mode**.
@@ -138,6 +151,10 @@ clox-mobile/
     supabase.ts        # Supabase client + getAccessToken()
     secure-storage.ts  # keeps the session in iOS Keychain / Android Keystore
     api.ts             # typed calls to /api/mobile/v1/* (getStatus, clockIn, clockOut, breakStart, breakEnd)
+    push.ts            # push token registration + the notification permission ask
+    reminders.ts       # pure reminder rules (checkable with a plain node script)
+    reminder-notifications.ts  # schedules/cancels reminders, caches the preferences
+    components/RemindersSheet.tsx  # the Reminders screen (account menu)
     queue.ts           # offline punch queue + sync/drain logic
     location.ts        # GPS capture (expo-location)
     uuid.ts            # idempotency-key generator
@@ -160,6 +177,8 @@ Routes: `src/app/api/mobile/v1/`
 | `/break/end` | POST | end a break |
 | `/switch-project` | POST | switch or retag the running shift's project |
 | `/undo-clock-in` | POST | undo a clock-in by its idempotency key, within a minute (web PR #19) |
+| `/my-schedule` | GET | the employee's own upcoming scheduled shifts (the app reads the next 14 days and reminds for the next 7) |
+| `/profile/preferences` | POST | save any of `shiftReminderMinutes` (10 or null), `longShiftHours` (10 or null), `notifyRefusedPunch` (managers only); `/status` returns them as `preferences` (web PR #19) |
 
 - **Auth:** `Authorization: Bearer <supabase access token>` → validated in `src/lib/mobile-auth.ts`.
 - **Deploy backend changes:** commit + push the web repo → Vercel auto-deploys.
@@ -210,5 +229,6 @@ Routes: `src/app/api/mobile/v1/`
 ## What's built vs not (v1 scope)
 - ✅ Login, clock in/out, breaks, project/task picker, mid-shift project switch, geofence enforcement, selfie-on-punch, GPS capture, offline queue + sync, light/dark theme (user setting), Clox wordmark, live clock when off, recent-shifts history, **push reminders** (pipeline built; needs an EAS build to actually receive).
 - 🚧 Nothing major left on the roadmap. Next step is shipping an **EAS build** (`EAS-BUILD.md`) to run on real devices + exercise push.
-- **Push:** the app registers its Expo token on launch and the auto-clock-out cron sends a "we clocked you out" notification to opted-in employees. Needs `npx expo install expo-notifications expo-device` + migration **0033**. Remote push only works in an EAS build, not Expo Go.
+- **Push:** the app registers its Expo token on launch, but only when notifications are already allowed: it asks for permission only when someone first turns on a switch on the Reminders screen (`src/push.ts` `askForNotifications`). The auto-clock-out cron sends a "we clocked you out" notification to opted-in employees who have a registered token, and the server sends managers who opt in a push when a clock-in is refused (`data.type` "refused_punch", which opens the Roster tab). Remote push only works in an EAS build, not Expo Go.
+- **Reminders:** local notifications the phone schedules for itself, no server needed: one before each scheduled shift in the next 7 days and one when a running shift passes 10 hours. The rules are pure in `src/reminders.ts` (identifiers, text, what to schedule and cancel); `src/reminder-notifications.ts` carries them out with expo-notifications on an Android "reminders" channel created at runtime; `src/components/RemindersSheet.tsx` is the screen. All of it uses only what the 1.3.0 store build already has, so it ships as an EAS Update. Once it is live in both stores, flip `PHONE_REMINDERS_IN_STORE_APP` in the web repo's `src/lib/reminder-preferences.ts`.
 - **Theme setting:** dark-on-shift / always-light / always-dark is set on the web (Settings → Profile → On-shift appearance) and read by both apps from `profiles.theme_preference`. Needs migration **0032** applied before deploy.

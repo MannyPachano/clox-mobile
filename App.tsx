@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   AppState,
@@ -6,6 +6,7 @@ import {
   StyleSheet,
   View,
 } from "react-native";
+import * as Notifications from "expo-notifications";
 import { StatusBar } from "expo-status-bar";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
@@ -28,9 +29,14 @@ import {
   clearFenceCache,
   clearFenceCacheUnlessOwner,
 } from "./src/fence-cache";
-import { installErrorReporting } from "./src/error-reporting";
+import { installErrorReporting, reportError } from "./src/error-reporting";
 import { ManagerTabs } from "./src/navigation/ManagerTabs";
 import { registerForPush, unregisterForPush } from "./src/push";
+import {
+  cancelAllReminders,
+  clearReminderPrefsCache,
+} from "./src/reminder-notifications";
+import { tapTargetFor } from "./src/reminders";
 import {
   clearQueue,
   drainQueue,
@@ -48,6 +54,47 @@ import { TutorialProvider } from "./src/tutorial/TutorialContext";
 // render, so even boot-time crashes are reported.
 installErrorReporting();
 
+/** A tapped notification waiting for the screen it opens. */
+type Tapped = { data: unknown };
+
+/** Back in the foreground after longer than this, a configured app lock
+ *  challenges again. */
+const LOCK_GRACE_MS = 60_000;
+/** A tap the manager tabs took this recently is given to them again when
+ *  the app lock comes back on (see the relock below). */
+const TAP_REPLAY_MS = 10_000;
+
+// Taps already taken, by notification. On a cold start the launching tap can
+// arrive both as the last response and through the listener; it is acted on
+// once. Module state, because App mounts once per JS runtime.
+const seenTaps = new Set<string>();
+
+function takeTap(res: Notifications.NotificationResponse | null): Tapped | null {
+  if (!res) return null;
+  // A tap on the notification itself, not an action button.
+  if (res.actionIdentifier !== Notifications.DEFAULT_ACTION_IDENTIFIER) {
+    return null;
+  }
+  const key = `${res.notification.request.identifier}|${res.notification.date}`;
+  if (seenTaps.has(key)) return null;
+  seenTaps.add(key);
+  return { data: res.notification.request.content.data };
+}
+
+/** The tap that launched the app, if any. expo-notifications' copy of it is
+ *  cleared as it is taken, so a later launch of this JS (an update reload)
+ *  never acts on it again; from here on only App's state holds it. */
+function coldStartTap(): Tapped | null {
+  try {
+    const t = takeTap(Notifications.getLastNotificationResponse());
+    if (t) Notifications.clearLastNotificationResponse();
+    return t;
+  } catch (err) {
+    reportError(err, "App.coldStartTap");
+    return null;
+  }
+}
+
 /**
  * App root. No navigation library needed for a two-screen app: we render the
  * Login screen or the Clock screen purely off the Supabase auth state, which
@@ -63,13 +110,59 @@ export default function App() {
   // Default true → never auto-run the tour until the server confirms it's unseen
   // (so an offline/failed status fetch doesn't surprise an existing user).
   const [tutorialDone, setTutorialDone] = useState(true);
-  // Offline app lock. `lockStatus` is read once on boot; `locked` starts true
+  // Offline app lock. `lockStatus` is read on boot, on the way to the
+  // background and on a return after the grace period; `locked` starts true
   // whenever a lock is configured and a session is being restored (a cold start
   // always challenges), and flips false on a successful unlock. `bgSinceRef`
   // powers the re-lock grace period on foreground.
   const [lockStatus, setLockStatus] = useState<LockStatus | null>(null);
   const [locked, setLocked] = useState(false);
   const bgSinceRef = useRef<number | null>(null);
+  // Notification taps are caught here because App is always mounted: on a
+  // cold start, and while the app lock is up, the manager tabs are not. The
+  // tap waits until the shell that can act on it is showing
+  // (reminders.ts tapTargetFor): the refused clock-in push opens the Roster
+  // tab for a manager, and a reminder opens the Clock tab.
+  const [tapped, setTapped] = useState<Tapped | null>(coldStartTap);
+  // Mirrors for the listeners below, which must decide at the moment an
+  // event arrives: whether a lock is known to be set, and the tap the
+  // manager tabs most recently took.
+  const lockConfiguredRef = useRef(false);
+  useEffect(() => {
+    lockConfiguredRef.current = !!lockStatus?.configured;
+  }, [lockStatus]);
+  const tappedRef = useRef<Tapped | null>(tapped);
+  useEffect(() => {
+    tappedRef.current = tapped;
+  }, [tapped]);
+  const lastTakenTapRef = useRef<{ tap: Tapped; at: number } | null>(null);
+
+  useEffect(() => {
+    const sub = Notifications.addNotificationResponseReceivedListener((res) => {
+      const t = takeTap(res);
+      if (!t) return;
+      // A tap that brings the app back after the grace period locks it in
+      // the same render, so the manager tabs are gone before the tap could
+      // reach them and it waits for the PIN (Android can deliver the tap
+      // before the app is active again, iOS after).
+      const since = bgSinceRef.current;
+      if (
+        lockConfiguredRef.current &&
+        since != null &&
+        Date.now() - since > LOCK_GRACE_MS
+      ) {
+        setLocked(true);
+      }
+      setTapped(t);
+    });
+    return () => sub.remove();
+  }, []);
+
+  const onTapHandled = useCallback(() => {
+    const t = tappedRef.current;
+    if (t) lastTakenTapRef.current = { tap: t, at: Date.now() };
+    setTapped(null);
+  }, []);
 
   useEffect(() => {
     void (async () => {
@@ -93,22 +186,36 @@ export default function App() {
   // Re-lock when the app returns to the foreground after a grace period, so a
   // quick app-switch doesn't nag but a phone left down re-challenges. Cold
   // start is already covered above. Only arms while a lock is configured.
-  const LOCK_GRACE_MS = 60_000;
   useEffect(() => {
     const sub = AppState.addEventListener("change", (state) => {
       if (state === "active") {
         const since = bgSinceRef.current;
         bgSinceRef.current = null;
-        // Re-read status on foreground (not on every tick) so a lock set up
-        // mid-session arms without a restart, and a removed one stops locking.
         if (since != null && Date.now() - since > LOCK_GRACE_MS) {
+          // Lock at once from the status already known, so nothing behind
+          // the lock (a notification tap included) runs first.
+          if (lockConfiguredRef.current) setLocked(true);
+          // Then re-read it (not on every tick) so a lock set up mid-session
+          // arms without a restart, and a removed one stops locking.
           void getLockStatus().then((st) => {
             setLockStatus(st);
-            if (st.configured) setLocked(true);
+            setLocked(st.configured);
+            if (!st.configured) return;
+            // A lock set up in this session was not known above, so a tap
+            // may have reached the manager tabs just before this lock took
+            // them away. Give it to the tabs that mount after the PIN.
+            const last = lastTakenTapRef.current;
+            lastTakenTapRef.current = null;
+            if (last && Date.now() - last.at < TAP_REPLAY_MS) {
+              setTapped(last.tap);
+            }
           });
         }
       } else if (state === "background" || state === "inactive") {
         if (bgSinceRef.current == null) bgSinceRef.current = Date.now();
+        // Bring the known status up to date on the way out (a lock set up or
+        // removed in this session), so the lock at once above is right.
+        if (state === "background") void getLockStatus().then(setLockStatus);
       }
     });
     return () => sub.remove();
@@ -219,6 +326,9 @@ export default function App() {
     await clearQueue();
     await clearBootSnapshot();
     await clearFenceCache();
+    // Reminders are this person's: none may fire for whoever signs in next.
+    await cancelAllReminders();
+    await clearReminderPrefsCache();
     // The lock is bound to this account; the next person to sign in must set
     // their own. clearing also resets the failed-attempt counter.
     await clearLock();
@@ -241,6 +351,8 @@ export default function App() {
       if (t) await unregisterForPush(t);
       await clearBootSnapshot();
       await clearFenceCache();
+      await cancelAllReminders();
+      await clearReminderPrefsCache();
       await clearLock();
       setLockStatus({ configured: false, biometric: false, identity: null });
       setLocked(false);
@@ -249,6 +361,20 @@ export default function App() {
   };
 
   const onUnlocked = () => setLocked(false);
+
+  // A tap the current shell has nothing to do with is dropped once the shell
+  // is known: an employee (a demoted manager tapping an old alert, or a
+  // reminder, which opens on the only screen they have), or no one signed
+  // in. A manager's tap waits for ManagerTabs, which takes it on its own.
+  const managerTab =
+    tapped && role === "manager" ? tapTargetFor(tapped.data, true) : null;
+  const tapUnclaimed =
+    tapped !== null &&
+    !loading &&
+    (session === null || (role !== null && managerTab === null));
+  // Adjusting state during render (React's pattern for state derived from
+  // other state): the render restarts at once without the tap.
+  if (tapUnclaimed) setTapped(null);
 
   // Signed in but role not resolved yet — hold on the spinner so we don't flash
   // the employee screen before swapping to the manager tabs.
@@ -278,7 +404,12 @@ export default function App() {
           </View>
         ) : role === "manager" ? (
           <TutorialProvider role="manager" autoStart={!tutorialDone}>
-            <ManagerTabs session={session} onSignOut={handleSignOut} />
+            <ManagerTabs
+              session={session}
+              onSignOut={handleSignOut}
+              pendingTab={managerTab}
+              onPendingTabHandled={onTapHandled}
+            />
           </TutorialProvider>
         ) : (
           <TutorialProvider role="employee" autoStart={!tutorialDone}>
