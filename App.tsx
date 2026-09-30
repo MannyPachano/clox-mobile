@@ -43,6 +43,7 @@ import {
   drainQueue,
   getQueueOwner,
   storedPunchCount,
+  whenDrainIdle,
 } from "./src/queue";
 import { ClockScreen } from "./src/screens/ClockScreen";
 import { processSurfaceTaps } from "./src/shift-actions";
@@ -371,8 +372,14 @@ export default function App() {
       // otherwise record this user's punches as the next user's.
       try {
         await drainQueue(t);
+        // drainQueue returns at once while another drain runs (the Clock
+        // screen's sync right after a punch, or a lock screen tap's send past
+        // its budget), and the clear below would then drop what that drain
+        // has not sent yet. Wait for it, then send what it left.
+        await whenDrainIdle();
+        await drainQueue(t);
       } catch {
-        // Offline or a failed send — the clear below drops the remainder
+        // Offline or a failed send: the clear below drops the remainder
         // rather than leaving it to mis-attribute.
       }
     }
