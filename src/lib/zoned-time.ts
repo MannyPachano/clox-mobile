@@ -11,6 +11,9 @@
 // helpers several times per row per render. The cache stays tiny: a handful
 // of shapes times the handful of org zones one device ever sees.
 const dtfCache = new Map<string, Intl.DateTimeFormat>();
+// Cache keys whose formatter fell back to the device zone (the catch below).
+// orgWallClock reads this so a reminder never names a device-zone time.
+const deviceFallbackKeys = new Set<string>();
 
 export function zonedFormat(
   shape: string,
@@ -42,6 +45,7 @@ function cachedFormatter(
       // Device zone beats a crash; the web repo guards this same
       // constructor (isFormattableZone) for the same reason.
       f = new Intl.DateTimeFormat(locale, opts);
+      deviceFallbackKeys.add(key);
     }
     dtfCache.set(key, f);
   }
@@ -85,6 +89,24 @@ export function wallPartsInZone(
     h: get("hour") % 24,
     mi: get("minute"),
   };
+}
+
+/**
+ * The org wall-clock hour and minute at an instant, or null when it cannot
+ * be told truthfully: no org zone yet, or a zone this phone's ICU does not
+ * know (wallPartsInZone would quietly answer in the device zone). For text
+ * that must name the org's time or nothing, like a shift reminder. Reuses
+ * the "wall" formatter above; it adds no formatter of its own.
+ */
+export function orgWallClock(
+  ms: number,
+  tz: string | undefined,
+): { h: number; mi: number } | null {
+  if (!tz || !Number.isFinite(ms)) return null;
+  const w = wallPartsInZone(ms, tz);
+  if (deviceFallbackKeys.has(`wall|${tz}`)) return null;
+  if (!Number.isInteger(w.h) || !Number.isInteger(w.mi)) return null;
+  return { h: w.h, mi: w.mi };
 }
 
 /**

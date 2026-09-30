@@ -30,6 +30,11 @@ export type StatusResponse = {
   } | null;
   onBreakSince: string | null;
   themePreference: string;
+  /** This person's reminder and alert choices (web PR #19). Absent from a
+   *  server that predates them: the Reminders screen then says they are not
+   *  available yet and the phone schedules nothing. Read it through
+   *  reminders.ts parseReminderPrefs, never directly. */
+  preferences?: unknown;
   tutorialCompleted: boolean;
   projects: Option[];
   tasksByProject: Record<string, Option[]>;
@@ -91,6 +96,23 @@ export async function getStatus(
   // read it (lib/org-tz) without prop-drilling or its own fetch.
   if (res.ok) setOrgTz(res.data.organization.timeZone);
   return res;
+}
+
+/**
+ * Save some of the caller's reminder preferences (any subset, at least one).
+ * The answer carries all three as saved. On `ok:false` the `error` is a code:
+ * "bad_input" | "not_manager" | "unauthorized" | "rate_limited" | "unknown",
+ * or "http_404" from a server that does not have the route yet.
+ */
+export function saveReminderPreferences(
+  token: string,
+  patch: {
+    shiftReminderMinutes?: number | null;
+    longShiftHours?: number | null;
+    notifyRefusedPunch?: boolean;
+  },
+): Promise<ApiResult<{ ok: true; preferences: unknown }>> {
+  return request("profile/preferences", token, "POST", patch);
 }
 
 /** Mark the guided tour finished for this user (syncs with the web app). */

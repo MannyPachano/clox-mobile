@@ -59,6 +59,7 @@ import { getOrgTz } from "../lib/org-tz";
 import {
   clockInZone,
   clockWithDayInZone,
+  orgWallClock,
   weekdayDateInZone,
 } from "../lib/zoned-time";
 import { SelectField } from "../components/SelectField";
@@ -70,6 +71,10 @@ import { EditEntryModal } from "../components/EditEntryModal";
 import { RequestEditModal } from "../components/RequestEditModal";
 import { Wordmark } from "../components/Wordmark";
 import { LockSetupSheet } from "../components/LockSetupSheet";
+import {
+  RemindersSheet,
+  type ReminderSupport,
+} from "../components/RemindersSheet";
 import { getPunchLocation, warmUpLocation } from "../location";
 import {
   drainQueue,
@@ -81,6 +86,23 @@ import {
   type PunchKind,
   type QueuedPunch,
 } from "../queue";
+import {
+  armReminders,
+  clearReminderPrefsCache,
+  disarmReminders,
+  readReminderPrefsCache,
+  syncLongShiftReminder,
+  syncShiftReminders,
+  writeReminderPrefsCache,
+} from "../reminder-notifications";
+import {
+  isOn,
+  parseReminderPrefs,
+  PREFS_OFF,
+  REMINDERS_BLOCKED_COPY,
+  type ReminderPrefs,
+} from "../reminders";
+import { getNotificationAccess } from "../push";
 import { getAccessToken } from "../supabase";
 import { getLockStatus, type LockStatus } from "../lib/app-lock";
 import {
@@ -112,6 +134,11 @@ function wifiNetworkNames(ssids: string[]): string {
 // via the shared zoned-time formatters, matching the edit modals they open
 // and the web app. The live clock card is the one deliberate exception: it
 // is the PHONE's clock, so it formats with tz undefined (device zone).
+
+// Users told this app run that their reminders can't show because
+// notifications are off (refresh). Module state, so an unlock (which mounts
+// this screen again) doesn't say it again.
+const remindersBlockedTold = new Set<string>();
 
 function formatDuration(ms: number): string {
   const min = Math.round((ms > 0 ? ms : 0) / 60000);
@@ -239,6 +266,101 @@ export function ClockScreen({
   } | null>(null);
   const [adjustOpen, setAdjustOpen] = useState(false);
 
+  // Reminders (reminders.ts decides, reminder-notifications.ts schedules).
+  // The preferences come from each status answer, or from the copy saved on
+  // this phone until one arrives, so a clock-in after an offline cold start
+  // still knows whether the long shift reminder is on. `support` is what the
+  // Reminders screen shows: "unsupported" when the server predates the
+  // preferences (the phone then schedules nothing).
+  const [remindersOpen, setRemindersOpen] = useState(false);
+  const [reminderPrefs, setReminderPrefs] = useState<ReminderPrefs | null>(
+    null,
+  );
+  const [reminderSupport, setReminderSupport] =
+    useState<ReminderSupport>("unknown");
+  // What scheduling reads at the moment it runs. Null: not known on this
+  // phone yet, so nothing new is scheduled (reminders.ts planners).
+  const reminderPrefsRef = useRef<ReminderPrefs | null>(null);
+  const livePrefsRef = useRef(false);
+  // Bumped by every save on the Reminders screen. A refresh that started
+  // before a save carries preferences older than the save's answer, so it
+  // leaves them alone (a permission prompt brings the app back to the front,
+  // which refreshes while the save is on its way).
+  const prefsSaveSeqRef = useRef(0);
+  // The last schedule loaded this session. Null until one loads.
+  const upcomingRef = useRef<MyScheduledShift[] | null>(null);
+  // A read-only mirror of shiftStartedAt for callbacks. Reminders are never
+  // driven by this state changing: it starts null on every cold start and
+  // stays null offline, which would cancel a valid long shift reminder.
+  const shiftStartedAtRef = useRef<string | null>(null);
+  useEffect(() => {
+    shiftStartedAtRef.current = shiftStartedAt;
+  }, [shiftStartedAt]);
+  useEffect(() => {
+    armReminders(userId);
+    let cancelled = false;
+    void readReminderPrefsCache(userId).then((cached) => {
+      if (cancelled || livePrefsRef.current || !cached) return;
+      reminderPrefsRef.current = cached;
+      setReminderPrefs(cached);
+      setReminderSupport("supported");
+    });
+    return () => {
+      cancelled = true;
+      disarmReminders(userId);
+    };
+  }, [userId]);
+
+  // Preferences from the server: a status answer or a save. Null means the
+  // server predates them, which reads as all off.
+  const applyReminderPrefs = useCallback(
+    (prefs: ReminderPrefs | null) => {
+      livePrefsRef.current = true;
+      if (prefs) {
+        reminderPrefsRef.current = prefs;
+        setReminderPrefs(prefs);
+        setReminderSupport("supported");
+        void writeReminderPrefsCache(userId, prefs);
+      } else {
+        reminderPrefsRef.current = PREFS_OFF;
+        setReminderPrefs(null);
+        setReminderSupport("unsupported");
+        void clearReminderPrefsCache();
+      }
+    },
+    [userId],
+  );
+
+  // The shift start reminders against the last schedule, in the ORG zone
+  // (orgWallClock is null until the org zone is known, and then nothing new
+  // is scheduled rather than a device-zone time).
+  const reconcileShiftReminders = useCallback(
+    (runningSince: string | null) => {
+      const prefs = reminderPrefsRef.current;
+      const tz = getOrgTz();
+      void syncShiftReminders(userId, {
+        minutes: prefs ? prefs.shiftReminderMinutes : undefined,
+        shifts: upcomingRef.current,
+        runningSinceMs: runningSince ? Date.parse(runningSince) : null,
+        wallClock: tz ? (ms) => orgWallClock(ms, tz) : null,
+      });
+    },
+    [userId],
+  );
+
+  // The long shift reminder for the running shift (null: none running).
+  const reconcileLongShift = useCallback(
+    (runningSince: string | null) => {
+      const prefs = reminderPrefsRef.current;
+      void syncLongShiftReminder(userId, {
+        hours: prefs ? prefs.longShiftHours : undefined,
+        runningSinceMs: runningSince ? Date.parse(runningSince) : null,
+        isManager,
+      });
+    },
+    [userId, isManager],
+  );
+
   const refresh = useCallback(async () => {
     const token = await getAccessToken();
     if (!token) return;
@@ -252,6 +374,7 @@ export function ClockScreen({
     setPending(queuedBefore);
     setHeld(heldBefore);
     const epoch = localEpochRef.current;
+    const prefsSeq = prefsSaveSeqRef.current;
     try {
       const [statusRes, historyRes, scheduleRes] = await Promise.all([
         getStatus(token),
@@ -276,6 +399,30 @@ export function ClockScreen({
             ? { enforced: d.wifi.enforced, ssids: d.wifi.ssids ?? [] }
             : { enforced: false, ssids: [] },
         );
+        if (prefsSeq === prefsSaveSeqRef.current) {
+          const prefs = parseReminderPrefs(d.preferences);
+          applyReminderPrefs(prefs);
+          // Reminders that are on but can't show (turned on in web Settings,
+          // where no permission is asked, or notifications turned off since)
+          // are said in the banner once per app run. This never asks: the
+          // ask stays on the Reminders screen. Once notifications are allowed
+          // (every return from a prompt or Settings refreshes) or the
+          // reminders are off, the banner goes.
+          const anyOn =
+            isOn(prefs, "shiftReminderMinutes") ||
+            isOn(prefs, "longShiftHours") ||
+            isOn(prefs, "notifyRefusedPunch");
+          if (anyOn || remindersBlockedTold.has(userId)) {
+            void getNotificationAccess().then((a) => {
+              if (a.granted || !anyOn) {
+                setBanner((b) => (b === REMINDERS_BLOCKED_COPY ? null : b));
+              } else if (!remindersBlockedTold.has(userId)) {
+                remindersBlockedTold.add(userId);
+                setBanner(REMINDERS_BLOCKED_COPY);
+              }
+            });
+          }
+        }
         // Apply server truth only when the queue is empty — otherwise an
         // in-flight optimistic punch would be clobbered. (Also how a rejected
         // clock-in reverts: punch dropped → queue empty → server says "no
@@ -290,7 +437,9 @@ export function ClockScreen({
           serverUndoCallsRef.current === 0
         ) {
           const active = d.activeEntry;
-          setShiftStartedAt(active?.startedAt ?? null);
+          const runningSince = active?.startedAt ?? null;
+          shiftStartedAtRef.current = runningSince;
+          setShiftStartedAt(runningSince);
           setOnBreakSince(d.onBreakSince);
           setProjectId(active ? active.projectId : null);
           setTaskId(active ? active.taskId : null);
@@ -302,16 +451,29 @@ export function ClockScreen({
               ? prev
               : { id: active.id, start: active.entryStartIso };
           });
+          // Server truth for the running shift: schedule the long shift
+          // reminder from its start, or cancel it when none is running (a
+          // clock-out made on the web or by a manager, a clock-in the server
+          // refused, a start time edited elsewhere).
+          reconcileLongShift(runningSince);
         }
       }
       if (historyRes.ok) setHistory(historyRes.data.shifts);
-      if (scheduleRes.ok) setUpcoming(scheduleRes.data.shifts);
+      if (scheduleRes.ok) {
+        setUpcoming(scheduleRes.data.shifts);
+        upcomingRef.current = scheduleRes.data.shifts;
+      }
+      // The phone's running shift as it is now, after the fetch: the
+      // server's answer if it was applied above, or a punch made meanwhile.
+      if (statusRes.ok || scheduleRes.ok) {
+        reconcileShiftReminders(shiftStartedAtRef.current);
+      }
     } catch {
       // Offline — keep optimistic local state.
     } finally {
       setReady(true);
     }
-  }, [userId]);
+  }, [userId, applyReminderPrefs, reconcileLongShift, reconcileShiftReminders]);
 
   // Guided-tour replay + the first-run trigger (declared before sync so the
   // callback can fire it once a punch is accepted by the server).
@@ -718,8 +880,14 @@ export function ClockScreen({
       haptics.light();
       localEpochRef.current += 1;
       setLandingId(punch.id);
+      shiftStartedAtRef.current = punch.clientTime;
       setShiftStartedAt(punch.clientTime);
       setOnBreakSince(null);
+      // The punch is saved on the phone, so this holds offline too: the long
+      // shift reminder counts from the tap, and a shift reminder for the
+      // shift this clock-in started early is cancelled.
+      reconcileLongShift(punch.clientTime);
+      reconcileShiftReminders(punch.clientTime);
       // The new entry's server id is unknown until the punch syncs — clear any
       // stale one so the start-time editor can't target a previous entry.
       setActiveEntry(null);
@@ -756,6 +924,8 @@ export function ClockScreen({
       userId,
       screenReaderOn,
       setUndoOffer,
+      reconcileLongShift,
+      reconcileShiftReminders,
     ],
   );
 
@@ -782,12 +952,19 @@ export function ClockScreen({
     haptics.medium();
     setBusy(true);
     setBanner(null);
+    shiftStartedAtRef.current = null;
     setShiftStartedAt(null);
     setOnBreakSince(null);
     setActiveEntry(null);
+    // Clocked out on this phone: the long shift reminder goes now, offline
+    // too, and shift reminders held while on the clock come back. If the
+    // punch fails to save, the next refresh restores the reminder from the
+    // server's running shift.
+    reconcileLongShift(null);
+    reconcileShiftReminders(null);
     await enqueueSimple("out");
     setBusy(false);
-  }, [enqueueSimple]);
+  }, [enqueueSimple, reconcileLongShift, reconcileShiftReminders]);
 
   const onBreakStart = useCallback(async () => {
     haptics.light();
@@ -830,12 +1007,17 @@ export function ClockScreen({
   // The project and task picks are kept for the next clock-in.
   const clearShiftOnPhone = useCallback(() => {
     localEpochRef.current += 1;
+    shiftStartedAtRef.current = null;
     setShiftStartedAt(null);
     setOnBreakSince(null);
     setActiveEntry(null);
     setLandingId(null);
     closeUndoOffer(true);
-  }, [closeUndoOffer]);
+    // Every "undone on this phone" outcome passes here: the clock-in's long
+    // shift reminder goes, and held shift reminders come back.
+    reconcileLongShift(null);
+    reconcileShiftReminders(null);
+  }, [closeUndoOffer, reconcileLongShift, reconcileShiftReminders]);
 
   // The undo is done: the clock-in never reached the server, or the server
   // has undone it.
@@ -1081,6 +1263,19 @@ export function ClockScreen({
           }
         : null,
     [activeEntry],
+  );
+
+  // A switch on the Reminders screen saved: apply what the server saved and
+  // bring both kinds of reminder in line with it. Above the loading return
+  // like every hook here (Hermes rule, see handleDeleteAccount below).
+  const onRemindersSaved = useCallback(
+    (prefs: ReminderPrefs) => {
+      prefsSaveSeqRef.current += 1;
+      applyReminderPrefs(prefs);
+      reconcileLongShift(shiftStartedAtRef.current);
+      reconcileShiftReminders(shiftStartedAtRef.current);
+    },
+    [applyReminderPrefs, reconcileLongShift, reconcileShiftReminders],
   );
 
   // Declared BEFORE the early `if (!ready) return` below so the number of hooks
@@ -1713,6 +1908,15 @@ export function ClockScreen({
                   style={styles.sheetRow}
                   onPress={() => {
                     setAccountMenuOpen(false);
+                    setRemindersOpen(true);
+                  }}
+                >
+                  <Text style={styles.sheetRowText}>Reminders</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.sheetRow}
+                  onPress={() => {
+                    setAccountMenuOpen(false);
                     onSignOut();
                   }}
                 >
@@ -1745,6 +1949,15 @@ export function ClockScreen({
               role: isManager ? "manager" : "employee",
             }}
             onChanged={refreshLock}
+          />
+
+          <RemindersSheet
+            visible={remindersOpen}
+            onClose={() => setRemindersOpen(false)}
+            isManager={isManager}
+            support={reminderSupport}
+            prefs={reminderPrefs}
+            onSaved={onRemindersSaved}
           />
 
           {banner ? (
