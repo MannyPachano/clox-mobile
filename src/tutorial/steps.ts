@@ -15,8 +15,8 @@ export type TutorialStep = {
 
 const CLOCK_IN: TutorialStep = {
   key: "clock-in",
-  title: "One tap in, one tap out",
-  body: "The timer runs until you clock out, and breaks are a tap too. No signal is fine: the punch saves on your phone and syncs later.",
+  title: "Tap in, hold to clock out",
+  body: "Tap Clock in to start the timer. To clock out, press and hold the Hold to clock out button until it fills. With VoiceOver or TalkBack on, it is a plain Clock out button instead. Breaks are a tap. No signal is fine: the punch saves on your phone and syncs later.",
   targetKey: "clockIn",
 };
 

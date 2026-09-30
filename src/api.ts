@@ -134,6 +134,25 @@ export async function clockIn(
   });
 }
 
+/**
+ * Undo a clock-in tapped by mistake (web repo:
+ * src/app/api/mobile/v1/undo-clock-in/route.ts). `idempotencyKey` is the key
+ * the clock-in was sent with, which is its queue id (`punch.id`, see clockIn
+ * above). Only that clock-in can be undone, and only within a minute of its
+ * start by server time. On `ok:false` the `error` is "nothing_to_undo",
+ * "too_late", "approved", "locked", "switched_project", "had_break",
+ * "changed", "unauthorized", "rate_limited", "bad_input" or "unknown", or
+ * "http_404" from a server without the route. Take the punch out of the
+ * queue BEFORE calling this (queue.ts takeQueuedClockInForUndo); a queued copy
+ * sent afterwards would land as a new clock-in.
+ */
+export function undoClockIn(
+  token: string,
+  idempotencyKey: string,
+): Promise<ApiResult<{ ok: true; entryId: string; startTimeIso: string }>> {
+  return request("undo-clock-in", token, "POST", { idempotencyKey });
+}
+
 export function clockOut(
   token: string,
   punch: QueuedPunch,

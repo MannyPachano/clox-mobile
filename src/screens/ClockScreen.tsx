@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  AccessibilityInfo,
   ActivityIndicator,
   Alert,
   AppState,
@@ -23,13 +24,36 @@ import {
   getHistory,
   getMySchedule,
   getStatus,
+  undoClockIn,
   type EditableEntry,
   type HistoryShift,
   type MyScheduledShift,
   type Option,
 } from "../api";
+import {
+  CHECK_MS,
+  UNDO_COPY,
+  UNDO_DONE_NOTE_MS,
+  UNDO_REQUEST_TIMEOUT_MS,
+  UNDO_SEND_WAIT_MS,
+  classifyUndoAnswer,
+  formatElapsed,
+  owedUndoOutcome,
+  planUndo,
+  rearmUndoOffer,
+  syncLine,
+  undoFailureMessage,
+  undoNoticeMs,
+  undoOfferClosesAt,
+  undoSecondsLeft,
+  withTimeout,
+  type UndoAnswer,
+  type UndoOffer,
+  type UndoPlan,
+} from "../clock-moment";
 import { readFenceCache, writeFenceCache } from "../fence-cache";
 import { precheckGeofence, type Fence } from "../geofence";
+import { useAccessibilityPrefs } from "../lib/a11y-prefs";
 import { haptics } from "../lib/haptics";
 import { getOrgTz } from "../lib/org-tz";
 import {
@@ -39,6 +63,9 @@ import {
 } from "../lib/zoned-time";
 import { SelectField } from "../components/SelectField";
 import { SelfieCapture } from "../components/SelfieCapture";
+import { DrawnCheck } from "../components/DrawnCheck";
+import { HoldToClockOut } from "../components/HoldToClockOut";
+import { PaletteBackdrop } from "../components/PaletteBackdrop";
 import { EditEntryModal } from "../components/EditEntryModal";
 import { RequestEditModal } from "../components/RequestEditModal";
 import { Wordmark } from "../components/Wordmark";
@@ -47,8 +74,10 @@ import { getPunchLocation, warmUpLocation } from "../location";
 import {
   drainQueue,
   enqueuePunch,
+  heldCount,
   queuedCount,
   removeHeldPunches,
+  takeQueuedClockInForUndo,
   type PunchKind,
   type QueuedPunch,
 } from "../queue";
@@ -56,6 +85,7 @@ import { getAccessToken } from "../supabase";
 import { getLockStatus, type LockStatus } from "../lib/app-lock";
 import {
   darkColors,
+  lightColors,
   normalizeThemePreference,
   resolvePalette,
   ThemeContext,
@@ -76,14 +106,6 @@ function wifiNetworkNames(ssids: string[]): string {
   const named = ssids.map((s) => s.trim()).filter((s) => s.length > 0);
   if (named.length >= 1 && named.length <= 3) return named.join(" or ");
   return "one of the saved site networks";
-}
-
-function formatElapsed(ms: number): string {
-  const total = Math.floor((ms > 0 ? ms : 0) / 1000);
-  const pad = (n: number) => n.toString().padStart(2, "0");
-  return `${pad(Math.floor(total / 3600))}:${pad(
-    Math.floor((total % 3600) / 60),
-  )}:${pad(total % 60)}`;
 }
 
 // Shift times (history rows, upcoming scheduled) render in the ORG's zone
@@ -129,6 +151,35 @@ export function ClockScreen({
   const [banner, setBanner] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [ready, setReady] = useState(false);
+
+  // The clock-in moment (rules and copy in src/clock-moment.ts).
+  // `landingId` is the clock-in whose check is drawing in the button: the
+  // punch is saved and the shift state is set, but the screen keeps the
+  // off-shift look for CHECK_MS, then flips.
+  const [landingId, setLandingId] = useState<string | null>(null);
+  const [undoOffer, setUndoOfferState] = useState<UndoOffer | null>(null);
+  const [undoBusy, setUndoBusy] = useState(false);
+  const [undoNote, setUndoNote] = useState<string | null>(null);
+  const { screenReaderOn, reduceMotion } = useAccessibilityPrefs();
+  // Mirrors of state that callbacks need at the moment they run.
+  const undoOfferRef = useRef<UndoOffer | null>(null);
+  const undoBusyRef = useRef(false);
+  // Bumped whenever this phone changes the shift itself (a punch, an undo).
+  // A refresh that started before the bump carries an older snapshot of the
+  // server, so it must not overwrite the shift on screen.
+  const localEpochRef = useRef(0);
+  // Undo requests on their way to the server. Until one answers, the server
+  // may still report that clock-in as running, so refreshes wait.
+  const serverUndoCallsRef = useRef(0);
+  // Keys of clock-ins this phone took out of its queue for an undo after a
+  // send of them had started, whose server undo has had no final answer yet
+  // (no connection, a server error). Each is asked again before every drain
+  // until the server answers. `owedAskingRef` holds the ones being asked
+  // right now, so two syncs never ask for the same one at once.
+  const owedUndosRef = useRef(new Set<string>());
+  const owedAskingRef = useRef(new Set<string>());
+  // The first-run tour waits while the undo offer is up (see sync).
+  const tutorialDueRef = useRef(false);
 
   const [projects, setProjects] = useState<Option[]>([]);
   const [tasksByProject, setTasksByProject] = useState<
@@ -195,6 +246,12 @@ export function ClockScreen({
     // server mid-fetch, this status snapshot predates it, so we must not apply
     // it as truth (it would wipe the optimistic ON state).
     const queuedBefore = await queuedCount();
+    const heldBefore = await heldCount();
+    // The sync line follows the queue from the first screen on, not only
+    // once a drain returns (a slow selfie upload can take a while).
+    setPending(queuedBefore);
+    setHeld(heldBefore);
+    const epoch = localEpochRef.current;
     try {
       const [statusRes, historyRes, scheduleRes] = await Promise.all([
         getStatus(token),
@@ -223,7 +280,15 @@ export function ClockScreen({
         // in-flight optimistic punch would be clobbered. (Also how a rejected
         // clock-in reverts: punch dropped → queue empty → server says "no
         // active shift" → optimistic timer clears.)
-        if (queuedBefore === 0 && (await queuedCount()) === 0) {
+        // Nor after this phone changed the shift itself during the fetch (an
+        // undo, or a punch that has already synced), or while an undo waits
+        // on the server: this snapshot is older than what the phone shows.
+        if (
+          queuedBefore === 0 &&
+          (await queuedCount()) === 0 &&
+          epoch === localEpochRef.current &&
+          serverUndoCallsRef.current === 0
+        ) {
           const active = d.activeEntry;
           setShiftStartedAt(active?.startedAt ?? null);
           setOnBreakSince(d.onBreakSince);
@@ -252,16 +317,107 @@ export function ClockScreen({
   // callback can fire it once a punch is accepted by the server).
   const { start: startTutorial, onPunchSucceeded } = useTutorial();
 
+  const setUndoOffer = useCallback((offer: UndoOffer | null) => {
+    undoOfferRef.current = offer;
+    setUndoOfferState(offer);
+  }, []);
+
+  // Close the undo offer. A first-run tour held back by the offer opens now,
+  // unless the clock-in was undone: then it waits for the next punch.
+  const closeUndoOffer = useCallback(
+    (undone: boolean) => {
+      if (!undoOfferRef.current) return;
+      setUndoOffer(null);
+      if (tutorialDueRef.current) {
+        tutorialDueRef.current = false;
+        if (!undone) onPunchSucceeded();
+      }
+    },
+    [setUndoOffer, onPunchSucceeded],
+  );
+
+  // One undo request to the server for the clock-in sent with `key`. Null
+  // when no answer came back (no connection, or none in time).
+  const askServerUndo = useCallback(
+    async (
+      token: string,
+      key: string,
+    ): Promise<{ answer: UndoAnswer; code: string } | null> => {
+      serverUndoCallsRef.current += 1;
+      try {
+        const res = await withTimeout(
+          undoClockIn(token, key),
+          UNDO_REQUEST_TIMEOUT_MS,
+        );
+        return { answer: classifyUndoAnswer(res), code: res.ok ? "" : res.error };
+      } catch {
+        return null;
+      } finally {
+        serverUndoCallsRef.current -= 1;
+      }
+    },
+    [],
+  );
+
+  // Ask the server again for each undo this phone still owes
+  // (owedUndosRef). The screen already shows Not clocked in for these, with
+  // a banner saying the undo isn't confirmed. On a final answer the server
+  // knows best, so refreshes may apply its state again (the epoch bump):
+  //   done     say the undo went through.
+  //   refused  the clock-in reached the server and stays; the next refresh
+  //            shows the shift again and the banner says why.
+  //   other    (a server without the undo route, a bad request) the send
+  //            may or may not have landed; the next refresh shows which.
+  const settleOwedUndos = useCallback(
+    async (token: string) => {
+      for (const key of Array.from(owedUndosRef.current)) {
+        if (owedAskingRef.current.has(key)) continue;
+        owedAskingRef.current.add(key);
+        let result: { answer: UndoAnswer; code: string } | null;
+        try {
+          result = await askServerUndo(token, key);
+        } finally {
+          owedAskingRef.current.delete(key);
+        }
+        const outcome = owedUndoOutcome(result ? result.answer : null);
+        if (outcome === "pending") continue;
+        if (!owedUndosRef.current.delete(key)) continue;
+        localEpochRef.current += 1;
+        if (outcome === "done") {
+          setBanner((b) =>
+            b === UNDO_COPY.pending || b === UNDO_COPY.unauthorized ? null : b,
+          );
+          setUndoNote(UNDO_COPY.done);
+          AccessibilityInfo.announceForAccessibility(UNDO_COPY.done);
+        } else {
+          setUndoNote(null);
+          setBanner(
+            result?.answer === "refused"
+              ? UNDO_COPY.reachedServer
+              : UNDO_COPY.unconfirmed,
+          );
+        }
+      }
+    },
+    [askServerUndo],
+  );
+
   const sync = useCallback(async () => {
     const token = await getAccessToken();
     if (!token) return;
+    await settleOwedUndos(token);
     const result = await drainQueue(token);
     setPending(result.remaining);
     setHeld(result.held);
     if (result.errors.length > 0) setBanner(result.errors[0] ?? null);
-    if (result.synced > 0) onPunchSucceeded();
+    if (result.synced > 0) {
+      // The first-run tour opens on the first punch the server accepts. It
+      // must not cover the undo offer, so while the offer is up it waits.
+      if (undoOfferRef.current) tutorialDueRef.current = true;
+      else onPunchSucceeded();
+    }
     await refresh();
-  }, [refresh, onPunchSucceeded]);
+  }, [refresh, onPunchSucceeded, settleOwedUndos]);
 
   useEffect(() => {
     void refresh();
@@ -292,6 +448,29 @@ export function ClockScreen({
     return () => clearInterval(id);
   }, []);
 
+  // The check shows for CHECK_MS, then the screen flips to on shift.
+  useEffect(() => {
+    if (!landingId) return;
+    const t = setTimeout(() => setLandingId(null), CHECK_MS);
+    return () => clearTimeout(t);
+  }, [landingId]);
+
+  // The undo offer closes by itself; never in the middle of an undo.
+  useEffect(() => {
+    if (!undoOffer || undoBusy) return;
+    const t = setTimeout(
+      () => closeUndoOffer(false),
+      Math.max(0, undoOfferClosesAt(undoOffer) - Date.now()),
+    );
+    return () => clearTimeout(t);
+  }, [undoOffer, undoBusy, closeUndoOffer]);
+
+  useEffect(() => {
+    if (!undoNote) return;
+    const t = setTimeout(() => setUndoNote(null), UNDO_DONE_NOTE_MS);
+    return () => clearTimeout(t);
+  }, [undoNote]);
+
   useEffect(() => {
     // If the running entry disappears while the start-time editor is open
     // (e.g. the server closed the shift), drop the editor flag too. Otherwise
@@ -317,6 +496,10 @@ export function ClockScreen({
 
   const enqueueSimple = useCallback(
     async (kind: PunchKind) => {
+      // Any later punch ends the undo offer: undoing the clock-in would
+      // orphan this one.
+      closeUndoOffer(false);
+      localEpochRef.current += 1;
       const punch: QueuedPunch = {
         id: newUuid(),
         kind,
@@ -331,17 +514,17 @@ export function ClockScreen({
         mocked: null,
       };
       try {
-        await enqueuePunch(punch, session.user.id);
+        await enqueuePunch(punch, userId);
       } catch {
         setBanner(
-          "Couldn't save that — check your phone's storage and try again.",
+          "Couldn't save that. Check your phone's storage and try again.",
         );
         return;
       }
       setPending(await queuedCount());
       await sync();
     },
-    [projectId, sync],
+    [projectId, sync, closeUndoOffer, userId],
   );
 
   const enqueueSwitch = useCallback(
@@ -350,6 +533,8 @@ export function ClockScreen({
       nextTaskId: string | null,
       applyToShift: boolean,
     ) => {
+      closeUndoOffer(false);
+      localEpochRef.current += 1;
       const punch: QueuedPunch = {
         id: newUuid(),
         kind: "switch_project",
@@ -365,15 +550,15 @@ export function ClockScreen({
         ...(applyToShift ? { applyToShift: true } : {}),
       };
       try {
-        await enqueuePunch(punch, session.user.id);
+        await enqueuePunch(punch, userId);
       } catch {
-        setBanner("Couldn't save the project switch — try again.");
+        setBanner("Couldn't save the project switch. Try again.");
         return;
       }
       setPending(await queuedCount());
       await sync();
     },
-    [sync],
+    [sync, closeUndoOffer, userId],
   );
 
   const onProjectChange = useCallback(
@@ -518,20 +703,42 @@ export function ClockScreen({
         mocked: coords.mocked,
       };
       try {
-        await enqueuePunch(punch, session.user.id);
+        await enqueuePunch(punch, userId);
       } catch {
         setBusy(false);
         setBanner(
-          "Couldn't save your clock-in — check storage and try again.",
+          "Couldn't save your clock-in. Check your phone's storage and try again.",
         );
         return;
       }
+      // Saved. The check draws in the button with a light tap, and only now:
+      // the WiFi check or a slow GPS fix above can still stop or delay a tap,
+      // so the check means the punch is on the phone. The timer counts from
+      // the tap time, so it reads 0:00:00 when the screen flips.
+      haptics.light();
+      localEpochRef.current += 1;
+      setLandingId(punch.id);
       setShiftStartedAt(punch.clientTime);
       setOnBreakSince(null);
       // The new entry's server id is unknown until the punch syncs — clear any
       // stale one so the start-time editor can't target a previous entry.
       setActiveEntry(null);
       setNote("");
+      setUndoNote(null);
+      // Undo is offered from the flip, keyed to this punch's queue id, which
+      // is also the idempotency key it is sent with.
+      setUndoOffer({
+        punchId: punch.id,
+        tappedAt: punch.clientTime,
+        shownAtMs: Date.now() + CHECK_MS,
+        noticeMs: undoNoticeMs(screenReaderOn),
+      });
+      // With a screen reader on, focus moves to the offer once it shows (the
+      // effect before the loading return), and its label says all of this.
+      // Otherwise a short line, in case a reader is on but not detected yet.
+      if (!screenReaderOn) {
+        AccessibilityInfo.announceForAccessibility(UNDO_COPY.announceClockedIn);
+      }
       // The punch is safely queued, so free the button now and send in the
       // background — the clock-in registers instantly instead of waiting on the
       // network round-trip. The offline queue guarantees delivery and retry.
@@ -539,11 +746,22 @@ export function ClockScreen({
       setPending(await queuedCount());
       void sync();
     },
-    [projectId, taskId, note, sync, fences, wifi],
+    [
+      projectId,
+      taskId,
+      note,
+      sync,
+      fences,
+      wifi,
+      userId,
+      screenReaderOn,
+      setUndoOffer,
+    ],
   );
 
   const onClockIn = useCallback(() => {
-    haptics.medium();
+    // No haptic here: the light tap comes with the check, once the punch is
+    // saved (doClockIn).
     if (selfieRequired) {
       setBanner(null);
       setCameraOpen(true);
@@ -608,16 +826,229 @@ export function ClockScreen({
     setBusy(false);
   }, [enqueueSimple]);
 
+  // Back to Not clocked in after an undo, with no word on the outcome yet.
+  // The project and task picks are kept for the next clock-in.
+  const clearShiftOnPhone = useCallback(() => {
+    localEpochRef.current += 1;
+    setShiftStartedAt(null);
+    setOnBreakSince(null);
+    setActiveEntry(null);
+    setLandingId(null);
+    closeUndoOffer(true);
+  }, [closeUndoOffer]);
+
+  // The undo is done: the clock-in never reached the server, or the server
+  // has undone it.
+  const endShiftOnPhone = useCallback(() => {
+    clearShiftOnPhone();
+    setUndoNote(UNDO_COPY.done);
+    AccessibilityInfo.announceForAccessibility(UNDO_COPY.done);
+  }, [clearShiftOnPhone]);
+
+  /**
+   * Undo the clock-in the offer is for (clock-moment.ts planUndo):
+   *   - still in the queue and never sent: take it out of the queue. That is
+   *     the whole undo; the server never saw it.
+   *   - still in the queue after a send started, and online: take it out of
+   *     the queue first, so no sync can send it again, then undo it on the
+   *     server by its key. The screen changes once the server answers. With
+   *     no final answer, the screen shows Not clocked in with a banner that
+   *     says the undo isn't confirmed, and each sync asks again.
+   *   - out of the queue (sent and answered): undo it on the server by its
+   *     key; the screen changes once the server agrees.
+   *   - offline while the server has it or may have it: nothing changes.
+   * Every outcome that asks the worker to try again keeps the offer up.
+   */
+  const onUndoPress = useCallback(async () => {
+    const offer = undoOfferRef.current;
+    if (!offer || undoBusyRef.current) return;
+    undoBusyRef.current = true;
+    setUndoBusy(true);
+    setBanner(null);
+    const tapMs = Date.now();
+    // The offer starts over for another tap, unless something else closed
+    // it meanwhile (a project switch, say).
+    const keepOffer = () => {
+      if (undoOfferRef.current?.punchId === offer.punchId) {
+        setUndoOffer(rearmUndoOffer(offer, Date.now()));
+      }
+    };
+    try {
+      let online = true;
+      try {
+        online = (await NetInfo.fetch()).isConnected !== false;
+      } catch {
+        // Unknown: try the server, and a failed call says so.
+      }
+
+      let plan: UndoPlan | null;
+      try {
+        plan = await takeQueuedClockInForUndo(
+          offer.punchId,
+          (copy) =>
+            planUndo({
+              tappedAt: offer.tappedAt,
+              nowMs: tapMs,
+              queued: copy,
+              online,
+            }),
+          UNDO_SEND_WAIT_MS,
+        );
+      } catch {
+        // The queue could not be read or written. Nothing was removed.
+        setBanner(UNDO_COPY.unknown);
+        keepOffer();
+        return;
+      }
+
+      if (plan === null) {
+        // A send of this clock-in is still waiting for an answer.
+        setBanner(UNDO_COPY.unreachable);
+        keepOffer();
+        return;
+      }
+      if (plan === "too_late" || plan === "changed") {
+        closeUndoOffer(false);
+        setBanner(UNDO_COPY.refusals[plan] ?? UNDO_COPY.unknown);
+        return;
+      }
+      if (plan === "offline") {
+        setBanner(UNDO_COPY.offline);
+        keepOffer();
+        return;
+      }
+      if (plan === "local") {
+        endShiftOnPhone();
+        setPending(await queuedCount());
+        void sync();
+        return;
+      }
+
+      const token = await getAccessToken();
+
+      if (plan === "local_then_server") {
+        // The phone's copy is gone, so no sync can send it again. The send
+        // that was started may have landed, so the screen waits for the
+        // server's answer before it says anything.
+        setPending(await queuedCount());
+        const result = token ? await askServerUndo(token, offer.punchId) : null;
+        const answer: UndoAnswer | null = token
+          ? (result?.answer ?? null)
+          : "unauthorized";
+        const outcome = owedUndoOutcome(answer);
+        if (outcome === "done") {
+          endShiftOnPhone();
+          void sync();
+          return;
+        }
+        if (outcome === "final") {
+          // The server's state stands. A refusal means the clock-in landed;
+          // any other answer leaves it unknown, and the refresh shows which.
+          localEpochRef.current += 1;
+          closeUndoOffer(false);
+          setBanner(
+            answer === "refused" && result
+              ? undoFailureMessage("refused", result.code)
+              : UNDO_COPY.unconfirmed,
+          );
+          void sync();
+          return;
+        }
+        // No final answer yet. Nothing on this phone can send the clock-in
+        // any more, so the screen shows Not clocked in, the banner says the
+        // undo isn't confirmed, and each sync asks the server again.
+        owedUndosRef.current.add(offer.punchId);
+        clearShiftOnPhone();
+        setBanner(
+          answer === "unauthorized"
+            ? UNDO_COPY.unauthorized
+            : UNDO_COPY.pending,
+        );
+        return;
+      }
+
+      // plan === "server"
+      if (!token) {
+        closeUndoOffer(false);
+        setBanner(UNDO_COPY.unauthorized);
+        return;
+      }
+      const result = await askServerUndo(token, offer.punchId);
+      if (result === null) {
+        setBanner(UNDO_COPY.unreachable);
+        keepOffer();
+        return;
+      }
+      if (result.answer === "done") {
+        endShiftOnPhone();
+        void refresh();
+        return;
+      }
+      if (result.answer === "retry") {
+        setBanner(UNDO_COPY.unknown);
+        keepOffer();
+        return;
+      }
+      closeUndoOffer(false);
+      setBanner(undoFailureMessage(result.answer, result.code));
+      void refresh();
+    } finally {
+      undoBusyRef.current = false;
+      setUndoBusy(false);
+    }
+  }, [
+    askServerUndo,
+    clearShiftOnPhone,
+    closeUndoOffer,
+    endShiftOnPhone,
+    refresh,
+    setUndoOffer,
+    sync,
+  ]);
+
   // Guided-tour anchors (measured by the spotlight overlay).
   const clockInRef = useTutorialTarget("clockIn");
   const projectRef = useTutorialTarget("project");
   const historyRef = useTutorialTarget("history");
   const scheduleRef = useTutorialTarget("schedule");
 
-  const clockedIn = shiftStartedAt !== null;
+  // The shift is on from the moment the punch is saved, but the screen shows
+  // it once the check has had its moment.
+  const clockedIn = shiftStartedAt !== null && landingId === null;
   const palette = resolvePalette(themePreference, clockedIn);
   const isDark = palette === darkColors;
   const styles = useMemo(() => makeStyles(palette), [palette]);
+  const onBreak = onBreakSince !== null;
+  const undoVisible = undoOffer !== null && clockedIn && !onBreak;
+
+  // With a screen reader on, the Clock in button that had focus is gone at
+  // the flip, and the offer sits after the whole scrolling list, many swipes
+  // away. So focus moves to the offer's prompt as it shows; its label reads
+  // the whole offer, and one swipe reaches the Undo button. Hooks stay above
+  // the loading return (Hermes rule, see handleDeleteAccount below).
+  const undoPromptRef = useRef<Text>(null);
+  const undoShowing = ready && undoVisible;
+  useEffect(() => {
+    if (!screenReaderOn || !undoShowing) return;
+    const t = setTimeout(() => {
+      const prompt = undoPromptRef.current;
+      if (prompt) AccessibilityInfo.sendAccessibilityEvent(prompt, "focus");
+      else AccessibilityInfo.announceForAccessibility(UNDO_COPY.announceOffer);
+    }, 150);
+    return () => clearTimeout(t);
+  }, [screenReaderOn, undoShowing]);
+
+  // Every banner is spoken, undo outcomes included: the banner is not a live
+  // region on iOS, and several undo outcomes also take the offer (and the
+  // focus on it) away. `queue` waits for VoiceOver's current speech instead
+  // of cutting in (iOS only; Android ignores it).
+  useEffect(() => {
+    if (banner) {
+      AccessibilityInfo.announceForAccessibilityWithOptions(banner, {
+        queue: true,
+      });
+    }
+  }, [banner]);
 
   // A STABLE entry object for the manager's own-shift editor. Passing a fresh
   // object literal each render would re-fire EditEntryModal's prefill effect on
@@ -719,485 +1150,618 @@ export function ClockScreen({
     );
   }
 
-  const onBreak = onBreakSince !== null;
   const elapsed = shiftStartedAt ? now - Date.parse(shiftStartedAt) : 0;
   const breakElapsed = onBreakSince ? now - Date.parse(onBreakSince) : 0;
   const tasksForProject = projectId ? tasksByProject[projectId] ?? [] : [];
   const projectMissing = !clockedIn && requireProject && !projectId;
   const showPickers = !onBreak;
-
+  const line = syncLine({ pending, held });
+  const undoLeft = undoOffer ? undoSecondsLeft(undoOffer, now) : 0;
+  const punchBusy = busy || undoBusy;
 
   return (
     <ThemeContext.Provider value={palette}>
-      <SafeAreaView style={styles.container} edges={["top", "bottom"]}>
-        <StatusBar style={isDark ? "light" : "dark"} />
-        <View style={styles.header}>
-          <Wordmark palette={palette} size={22} />
-          <TouchableOpacity
-            onPress={() => setAccountMenuOpen(true)}
-            hitSlop={10}
-            accessibilityRole="button"
-            accessibilityLabel="Account menu"
-            style={styles.avatarBtn}
-          >
-            <Text style={styles.avatarInitial}>
-              {(userName || "U").trim().charAt(0).toUpperCase()}
-            </Text>
-          </TouchableOpacity>
-        </View>
-
-        <ScrollView
-          contentContainerStyle={styles.body}
-          keyboardShouldPersistTaps="handled"
-        >
-          <View style={styles.greeting}>
-            <Text style={styles.hello} numberOfLines={1}>
-              {userName}
-            </Text>
-            {orgName ? (
-              <Text style={styles.org} numberOfLines={1}>
-                {orgName}
+      <View style={styles.root}>
+        {/* The background cross-fades between palettes; the SafeAreaView on
+            top of it is transparent. */}
+        <PaletteBackdrop dark={isDark} reduceMotion={reduceMotion} />
+        <SafeAreaView style={styles.safe} edges={["top", "bottom"]}>
+          <StatusBar style={isDark ? "light" : "dark"} />
+          <View style={styles.header}>
+            <Wordmark palette={palette} size={22} />
+            <TouchableOpacity
+              onPress={() => setAccountMenuOpen(true)}
+              hitSlop={10}
+              accessibilityRole="button"
+              accessibilityLabel="Account menu"
+              style={styles.avatarBtn}
+            >
+              <Text style={styles.avatarInitial}>
+                {(userName || "U").trim().charAt(0).toUpperCase()}
               </Text>
+            </TouchableOpacity>
+          </View>
+
+          <View style={styles.main}>
+            <ScrollView
+              contentContainerStyle={styles.body}
+              keyboardShouldPersistTaps="handled"
+            >
+              <View style={styles.greeting}>
+                <Text style={styles.hello} numberOfLines={1}>
+                  {userName}
+                </Text>
+                {orgName ? (
+                  <Text style={styles.org} numberOfLines={1}>
+                    {orgName}
+                  </Text>
+                ) : null}
+              </View>
+
+              <View
+                style={[
+                  styles.statusCard,
+                  !clockedIn
+                    ? styles.statusCardOff
+                    : onBreak
+                      ? styles.statusCardBreak
+                      : styles.statusCardOn,
+                ]}
+              >
+                {!clockedIn ? (
+                  <>
+                    <Text style={styles.statusLabel}>NOT CLOCKED IN</Text>
+                    {/* The phone's own clock — device zone on purpose. */}
+                    <Text style={styles.clockNow}>{clockInZone(now, undefined)}</Text>
+                    <Text style={styles.dateNow}>
+                      {weekdayDateInZone(now, undefined)}
+                    </Text>
+                  </>
+                ) : (
+                  <>
+                    <Text style={styles.statusLabel}>
+                      {onBreak ? "ON BREAK" : "ON THE CLOCK"}
+                    </Text>
+                    <Text style={styles.timer}>
+                      {onBreak
+                        ? formatElapsed(breakElapsed)
+                        : formatElapsed(elapsed)}
+                    </Text>
+                    {onBreak ? (
+                      <Text style={styles.subMeta}>
+                        Shift running · {formatElapsed(elapsed)}
+                      </Text>
+                    ) : null}
+                    {activeEntry ? (
+                      // Hidden until the clock-in has synced: an offline punch has
+                      // no server entry id to adjust yet.
+                      <TouchableOpacity
+                        onPress={() => setAdjustOpen(true)}
+                        hitSlop={8}
+                        accessibilityRole="button"
+                        accessibilityLabel="Adjust start time"
+                      >
+                        {/* The underline is a clay border on a wrapper, not
+                            textDecorationColor, which Android ignores. */}
+                        <View style={styles.adjustLinkLine}>
+                          <Text style={styles.adjustLink}>Adjust start time</Text>
+                        </View>
+                      </TouchableOpacity>
+                    ) : null}
+                  </>
+                )}
+              </View>
+
+              {showPickers ? (
+                <>
+                  <View ref={projectRef}>
+                    <SelectField
+                      label="Project"
+                      value={projectId}
+                      options={projects}
+                      placeholder={
+                        requireProject
+                          ? "Choose a project (required)"
+                          : "No project"
+                      }
+                      onSelect={onProjectChange}
+                      noneLabel={requireProject ? undefined : "No project"}
+                    />
+                  </View>
+                  {projectId && tasksForProject.length > 0 ? (
+                    <SelectField
+                      label="Task"
+                      value={taskId}
+                      options={tasksForProject}
+                      placeholder="No task"
+                      onSelect={onTaskChange}
+                      noneLabel="No task"
+                    />
+                  ) : null}
+                  {clockedIn ? (
+                    <Text style={styles.switchHint}>
+                      Changing the project switches your shift from now, or you can
+                      apply it to the whole shift.
+                    </Text>
+                  ) : null}
+                </>
+              ) : null}
+
+              {!clockedIn ? (
+                <>
+                  <TextInput
+                    style={styles.note}
+                    placeholder="Add a note (optional)"
+                    placeholderTextColor={palette.textMuted}
+                    value={note}
+                    onChangeText={setNote}
+                    editable={!busy}
+                  />
+                  <TouchableOpacity
+                    ref={clockInRef}
+                    style={[
+                      styles.bigButton,
+                      styles.inButton,
+                      (punchBusy || projectMissing) && styles.buttonDisabled,
+                    ]}
+                    onPress={onClockIn}
+                    disabled={punchBusy || projectMissing || landingId !== null}
+                    activeOpacity={0.85}
+                    accessibilityRole="button"
+                    accessibilityLabel={
+                      landingId !== null
+                        ? "Clocked in"
+                        : selfieRequired
+                          ? "Clock in with selfie"
+                          : "Clock in"
+                    }
+                    accessibilityState={{
+                      disabled:
+                        punchBusy || projectMissing || landingId !== null,
+                      busy,
+                    }}
+                  >
+                    {landingId !== null ? (
+                      // The punch is saved: a check draws in, then the flip.
+                      <View style={styles.landingRow}>
+                        <DrawnCheck
+                          color={palette.accentText}
+                          animate={!reduceMotion}
+                        />
+                        <Text
+                          style={[
+                            styles.bigButtonText,
+                            { color: palette.accentText },
+                          ]}
+                        >
+                          Clocked in
+                        </Text>
+                      </View>
+                    ) : busy ? (
+                      <ActivityIndicator color={palette.accentText} />
+                    ) : (
+                      <Text
+                        style={[styles.bigButtonText, { color: palette.accentText }]}
+                      >
+                        {selfieRequired ? "Clock in with selfie" : "Clock in"}
+                      </Text>
+                    )}
+                  </TouchableOpacity>
+                </>
+              ) : (
+                <>
+                  <TouchableOpacity
+                    style={[
+                      styles.bigButton,
+                      styles.breakButton,
+                      punchBusy && styles.buttonDisabled,
+                    ]}
+                    onPress={onBreak ? onBreakEnd : onBreakStart}
+                    disabled={punchBusy}
+                    activeOpacity={0.85}
+                    accessibilityRole="button"
+                  >
+                    <Text style={[styles.bigButtonText, { color: palette.text }]}>
+                      {onBreak ? "End break" : "Take break"}
+                    </Text>
+                  </TouchableOpacity>
+                  {screenReaderOn ? (
+                    // A screen reader activates with a double tap, which is
+                    // already a deliberate step, and holding through one is
+                    // awkward (VoiceOver needs a double tap and hold, TalkBack
+                    // may not pass the press through at all). So with a screen
+                    // reader on, Clock out is a plain button and hold is not
+                    // offered next to it, which would read out two controls
+                    // that do the same thing.
+                    <TouchableOpacity
+                      style={[
+                        styles.bigButton,
+                        styles.outButton,
+                        styles.buttonStacked,
+                        punchBusy && styles.buttonDisabled,
+                      ]}
+                      onPress={onClockOut}
+                      disabled={punchBusy}
+                      activeOpacity={0.85}
+                      accessibilityRole="button"
+                      accessibilityLabel="Clock out"
+                      accessibilityState={{ disabled: punchBusy, busy }}
+                    >
+                      {busy ? (
+                        <ActivityIndicator color={palette.accentText} />
+                      ) : (
+                        <Text
+                          style={[
+                            styles.bigButtonText,
+                            { color: palette.accentText },
+                          ]}
+                        >
+                          Clock out
+                        </Text>
+                      )}
+                    </TouchableOpacity>
+                  ) : (
+                    <HoldToClockOut
+                      // A fresh button per shift, so a finished hold never
+                      // carries over.
+                      key={shiftStartedAt ?? "off"}
+                      onComplete={() => void onClockOut()}
+                      disabled={punchBusy}
+                      trackColor={palette.dangerTrack}
+                      fillColor={palette.dangerFill}
+                      textColor={palette.accentText}
+                      style={[
+                        styles.bigButton,
+                        styles.buttonStacked,
+                        punchBusy && styles.buttonDisabled,
+                      ]}
+                      textStyle={styles.bigButtonText}
+                    />
+                  )}
+                </>
+              )}
+
+              {projectMissing ? (
+                <Text style={styles.requireHint}>
+                  {projects.length === 0
+                    ? "Your organization requires a project to clock in, but none have been set up yet. Ask your manager to add a project on the Clox website."
+                    : "Pick a project to clock in."}
+                </Text>
+              ) : line.kind === "none" ? null : (
+                // Driven by the queue: amber while a punch is saved on this
+                // phone, green once none are waiting (queue.ts queuedCount).
+                <View style={styles.syncRow} accessibilityLiveRegion="polite">
+                  <View
+                    style={[
+                      styles.syncDot,
+                      {
+                        backgroundColor:
+                          line.kind === "saved" ? palette.warn : palette.success,
+                      },
+                    ]}
+                  />
+                  <Text
+                    style={line.kind === "saved" ? styles.pending : styles.synced}
+                  >
+                    {line.text}
+                  </Text>
+                </View>
+              )}
+
+              {held > 0 ? (
+                <TouchableOpacity
+                  onPress={onHeldPress}
+                  accessibilityRole="button"
+                  accessibilityHint="Removes the held punches after your manager has added the shift"
+                >
+                  <Text style={styles.held}>
+                    {held === 1
+                      ? "1 punch is held on this phone because it is too old to sync by itself. Ask your manager to add that shift, then tap here to remove it."
+                      : `${held} punches are held on this phone because they are too old to sync by themselves. Ask your manager to add that shift, then tap here to remove them.`}
+                  </Text>
+                </TouchableOpacity>
+              ) : null}
+
+              {upcoming.length > 0 ? (
+                <View ref={scheduleRef} style={styles.history}>
+                  <Text style={styles.historyTitle}>Upcoming shifts</Text>
+                  {upcoming.slice(0, 3).map((s) => (
+                    <View key={s.id} style={styles.historyRow}>
+                      <View style={styles.historyLeft}>
+                        <Text style={styles.historyDate}>
+                          {weekdayDateInZone(Date.parse(s.startsAt), getOrgTz())}
+                        </Text>
+                        <Text style={styles.historySub} numberOfLines={1}>
+                          {clockInZone(Date.parse(s.startsAt), getOrgTz())} to{" "}
+                          {clockWithDayInZone(
+                            Date.parse(s.endsAt),
+                            Date.parse(s.startsAt),
+                            getOrgTz(),
+                          )}
+                        </Text>
+                      </View>
+                    </View>
+                  ))}
+                  {upcoming.length > 3 ? (
+                    <Text style={styles.upcomingMore}>
+                      + {upcoming.length - 3} more scheduled
+                    </Text>
+                  ) : null}
+                </View>
+              ) : null}
+
+              {history.length > 0 ? (
+                <View ref={historyRef} style={styles.history}>
+                  <Text style={styles.historyTitle}>Recent shifts</Text>
+                  {history.map((s) => (
+                    <TouchableOpacity
+                      key={s.id}
+                      style={styles.historyRow}
+                      onPress={() =>
+                        isManager ? setEditShift(s) : setRequestShift(s)
+                      }
+                      activeOpacity={0.6}
+                    >
+                      <View style={styles.historyLeft}>
+                        <View style={styles.historyDateRow}>
+                          <Text style={styles.historyDate}>
+                            {weekdayDateInZone(Date.parse(s.start), getOrgTz())}
+                          </Text>
+                          {s.rejected ? (
+                            <View style={styles.rejectedBadge}>
+                              <Text style={styles.rejectedBadgeText}>REJECTED</Text>
+                            </View>
+                          ) : null}
+                        </View>
+                        <Text style={styles.historySub} numberOfLines={1}>
+                          {clockInZone(Date.parse(s.start), getOrgTz())} to{" "}
+                          {clockWithDayInZone(
+                            Date.parse(s.end),
+                            Date.parse(s.start),
+                            getOrgTz(),
+                          )}
+                          {s.project ? ` · ${s.project}` : ""}
+                        </Text>
+                        {s.rejected ? (
+                          <Text style={styles.rejectedReason} numberOfLines={2}>
+                            {s.rejectionReason
+                              ? `Reason: “${s.rejectionReason}”. Tap to fix and resubmit.`
+                              : "Tap to correct and resubmit."}
+                          </Text>
+                        ) : null}
+                      </View>
+                      <Text
+                        style={[
+                          styles.historyDur,
+                          s.rejected && styles.historyDurRejected,
+                        ]}
+                      >
+                        {formatDuration(s.durationMs)}
+                      </Text>
+                      <Text style={styles.historyChevron}>›</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              ) : null}
+
+              <Text style={styles.offlineHint}>
+                Works offline. Your punch is saved on this phone and syncs
+                automatically when you&apos;re back online.
+              </Text>
+            </ScrollView>
+
+            {undoVisible || undoNote ? (
+              // Floats over the bottom of the screen like the mockup's toast,
+              // on the paper palette in either theme so it stands off the
+              // dark on-shift screen. Not a live region: the offer gets focus
+              // and the done note is announced, and a live region on top
+              // would make TalkBack read them twice.
+              <View style={styles.undoCard}>
+                {undoVisible ? (
+                  <>
+                    <Text
+                      ref={undoPromptRef}
+                      style={styles.undoText}
+                      accessibilityLabel={
+                        screenReaderOn ? UNDO_COPY.announceOffer : undefined
+                      }
+                    >
+                      {UNDO_COPY.prompt}
+                      {/* The countdown is left out for screen readers, which
+                          would read every second of it. */}
+                      {!screenReaderOn && undoLeft > 0 ? (
+                        <Text style={styles.undoCount}>
+                          {`  ${undoLeft}s`}
+                        </Text>
+                      ) : null}
+                    </Text>
+                    <TouchableOpacity
+                      style={[
+                        styles.undoButton,
+                        undoBusy && styles.buttonDisabled,
+                      ]}
+                      onPress={() => void onUndoPress()}
+                      disabled={undoBusy}
+                      activeOpacity={0.8}
+                      accessibilityRole="button"
+                      // No separate label: the spoken name is the visible
+                      // text ("Undo clock-in", or "Undoing…" while busy).
+                      accessibilityState={{
+                        disabled: undoBusy,
+                        busy: undoBusy,
+                      }}
+                    >
+                      <Text style={styles.undoButtonText}>
+                        {undoBusy ? UNDO_COPY.busy : UNDO_COPY.button}
+                      </Text>
+                    </TouchableOpacity>
+                  </>
+                ) : (
+                  <Text style={styles.undoText}>{undoNote}</Text>
+                )}
+              </View>
             ) : null}
           </View>
 
-          <View
-            style={[
-              styles.statusCard,
-              !clockedIn
-                ? styles.statusCardOff
-                : onBreak
-                  ? styles.statusCardBreak
-                  : styles.statusCardOn,
-            ]}
-          >
-            {!clockedIn ? (
-              <>
-                <Text style={styles.statusLabel}>NOT CLOCKED IN</Text>
-                {/* The phone's own clock — device zone on purpose. */}
-                <Text style={styles.clockNow}>{clockInZone(now, undefined)}</Text>
-                <Text style={styles.dateNow}>
-                  {weekdayDateInZone(now, undefined)}
-                </Text>
-              </>
-            ) : (
-              <>
-                <Text style={styles.statusLabel}>
-                  {onBreak ? "ON BREAK" : "ON THE CLOCK"}
-                </Text>
-                <Text style={styles.timer}>
-                  {onBreak
-                    ? formatElapsed(breakElapsed)
-                    : formatElapsed(elapsed)}
-                </Text>
-                {onBreak ? (
-                  <Text style={styles.subMeta}>
-                    Shift running · {formatElapsed(elapsed)}
-                  </Text>
-                ) : null}
-                {activeEntry ? (
-                  // Hidden until the clock-in has synced: an offline punch has
-                  // no server entry id to adjust yet.
-                  <TouchableOpacity
-                    onPress={() => setAdjustOpen(true)}
-                    hitSlop={8}
-                    accessibilityRole="button"
-                    accessibilityLabel="Adjust start time"
-                  >
-                    {/* The underline is a clay border on a wrapper, not
-                        textDecorationColor, which Android ignores. */}
-                    <View style={styles.adjustLinkLine}>
-                      <Text style={styles.adjustLink}>Adjust start time</Text>
-                    </View>
-                  </TouchableOpacity>
-                ) : null}
-              </>
-            )}
-          </View>
+          <SelfieCapture
+            visible={cameraOpen}
+            onCancel={() => setCameraOpen(false)}
+            onUse={onSelfieUse}
+          />
 
-          {showPickers ? (
-            <>
-              <View ref={projectRef}>
-                <SelectField
-                  label="Project"
-                  value={projectId}
-                  options={projects}
-                  placeholder={
-                    requireProject
-                      ? "Choose a project (required)"
-                      : "No project"
-                  }
-                  onSelect={onProjectChange}
-                  noneLabel={requireProject ? undefined : "No project"}
-                />
-              </View>
-              {projectId && tasksForProject.length > 0 ? (
-                <SelectField
-                  label="Task"
-                  value={taskId}
-                  options={tasksForProject}
-                  placeholder="No task"
-                  onSelect={onTaskChange}
-                  noneLabel="No task"
-                />
-              ) : null}
-              {clockedIn ? (
-                <Text style={styles.switchHint}>
-                  Changing the project switches your shift from now, or you can
-                  apply it to the whole shift.
-                </Text>
-              ) : null}
-            </>
-          ) : null}
-
-          {!clockedIn ? (
-            <>
-              <TextInput
-                style={styles.note}
-                placeholder="Add a note (optional)"
-                placeholderTextColor={palette.textMuted}
-                value={note}
-                onChangeText={setNote}
-                editable={!busy}
-              />
-              <TouchableOpacity
-                ref={clockInRef}
-                style={[
-                  styles.bigButton,
-                  styles.inButton,
-                  (busy || projectMissing) && styles.buttonDisabled,
-                ]}
-                onPress={onClockIn}
-                disabled={busy || projectMissing}
-                activeOpacity={0.85}
-              >
-                {busy ? (
-                  <ActivityIndicator color={palette.accentText} />
-                ) : (
-                  <Text
-                    style={[styles.bigButtonText, { color: palette.accentText }]}
-                  >
-                    {selfieRequired ? "Clock in with selfie" : "Clock in"}
-                  </Text>
-                )}
-              </TouchableOpacity>
-            </>
-          ) : (
-            <>
-              <TouchableOpacity
-                style={[
-                  styles.bigButton,
-                  styles.breakButton,
-                  busy && styles.buttonDisabled,
-                ]}
-                onPress={onBreak ? onBreakEnd : onBreakStart}
-                disabled={busy}
-                activeOpacity={0.85}
-              >
-                <Text style={[styles.bigButtonText, { color: palette.text }]}>
-                  {onBreak ? "End break" : "Take break"}
-                </Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[
-                  styles.bigButton,
-                  styles.outButton,
-                  styles.buttonStacked,
-                  busy && styles.buttonDisabled,
-                ]}
-                onPress={onClockOut}
-                disabled={busy}
-                activeOpacity={0.85}
-              >
-                {busy ? (
-                  <ActivityIndicator color={palette.accentText} />
-                ) : (
-                  <Text
-                    style={[
-                      styles.bigButtonText,
-                      { color: palette.accentText },
-                    ]}
-                  >
-                    Clock out
-                  </Text>
-                )}
-              </TouchableOpacity>
-            </>
-          )}
-
-          {projectMissing ? (
-            <Text style={styles.requireHint}>
-              {projects.length === 0
-                ? "Your organization requires a project to clock in, but none have been set up yet. Ask your manager to add a project on the Clox website."
-                : "Pick a project to clock in."}
-            </Text>
-          ) : pending > 0 ? (
-            <Text style={styles.pending}>
-              {pending} {pending === 1 ? "punch" : "punches"} waiting to sync
-            </Text>
-          ) : held > 0 ? null : (
-            <Text style={styles.synced}>All punches synced</Text>
-          )}
-
-          {held > 0 ? (
-            <TouchableOpacity
-              onPress={onHeldPress}
-              accessibilityRole="button"
-              accessibilityHint="Removes the held punches after your manager has added the shift"
-            >
-              <Text style={styles.held}>
-                {held === 1
-                  ? "1 punch is held on this phone because it is too old to sync by itself. Ask your manager to add that shift, then tap here to remove it."
-                  : `${held} punches are held on this phone because they are too old to sync by themselves. Ask your manager to add that shift, then tap here to remove them.`}
-              </Text>
-            </TouchableOpacity>
-          ) : null}
-
-          {upcoming.length > 0 ? (
-            <View ref={scheduleRef} style={styles.history}>
-              <Text style={styles.historyTitle}>Upcoming shifts</Text>
-              {upcoming.slice(0, 3).map((s) => (
-                <View key={s.id} style={styles.historyRow}>
-                  <View style={styles.historyLeft}>
-                    <Text style={styles.historyDate}>
-                      {weekdayDateInZone(Date.parse(s.startsAt), getOrgTz())}
-                    </Text>
-                    <Text style={styles.historySub} numberOfLines={1}>
-                      {clockInZone(Date.parse(s.startsAt), getOrgTz())} to{" "}
-                      {clockWithDayInZone(
-                        Date.parse(s.endsAt),
-                        Date.parse(s.startsAt),
-                        getOrgTz(),
-                      )}
-                    </Text>
-                  </View>
-                </View>
-              ))}
-              {upcoming.length > 3 ? (
-                <Text style={styles.upcomingMore}>
-                  + {upcoming.length - 3} more scheduled
-                </Text>
-              ) : null}
-            </View>
-          ) : null}
-
-          {history.length > 0 ? (
-            <View ref={historyRef} style={styles.history}>
-              <Text style={styles.historyTitle}>Recent shifts</Text>
-              {history.map((s) => (
-                <TouchableOpacity
-                  key={s.id}
-                  style={styles.historyRow}
-                  onPress={() =>
-                    isManager ? setEditShift(s) : setRequestShift(s)
-                  }
-                  activeOpacity={0.6}
-                >
-                  <View style={styles.historyLeft}>
-                    <View style={styles.historyDateRow}>
-                      <Text style={styles.historyDate}>
-                        {weekdayDateInZone(Date.parse(s.start), getOrgTz())}
-                      </Text>
-                      {s.rejected ? (
-                        <View style={styles.rejectedBadge}>
-                          <Text style={styles.rejectedBadgeText}>REJECTED</Text>
-                        </View>
-                      ) : null}
-                    </View>
-                    <Text style={styles.historySub} numberOfLines={1}>
-                      {clockInZone(Date.parse(s.start), getOrgTz())} to{" "}
-                      {clockWithDayInZone(
-                        Date.parse(s.end),
-                        Date.parse(s.start),
-                        getOrgTz(),
-                      )}
-                      {s.project ? ` · ${s.project}` : ""}
-                    </Text>
-                    {s.rejected ? (
-                      <Text style={styles.rejectedReason} numberOfLines={2}>
-                        {s.rejectionReason
-                          ? `“${s.rejectionReason}” — tap to fix and resubmit`
-                          : "Tap to correct and resubmit"}
-                      </Text>
-                    ) : null}
-                  </View>
-                  <Text
-                    style={[
-                      styles.historyDur,
-                      s.rejected && styles.historyDurRejected,
-                    ]}
-                  >
-                    {formatDuration(s.durationMs)}
-                  </Text>
-                  <Text style={styles.historyChevron}>›</Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-          ) : null}
-
-          <Text style={styles.offlineHint}>
-            Works offline. Your punch is saved on this phone and syncs
-            automatically when you&apos;re back online.
-          </Text>
-        </ScrollView>
-
-        <SelfieCapture
-          visible={cameraOpen}
-          onCancel={() => setCameraOpen(false)}
-          onUse={onSelfieUse}
-        />
-
-        <EditEntryModal
-          visible={editShift !== null}
-          entry={editEntry}
-          onClose={() => setEditShift(null)}
-          onSaved={() => {
-            setEditShift(null);
-            void refresh();
-          }}
-        />
-
-        <RequestEditModal
-          visible={requestShift !== null}
-          shift={requestShift}
-          onClose={() => setRequestShift(null)}
-          onSubmitted={() => {
-            setRequestShift(null);
-            setBanner("Change requested. Your manager will review it.");
-          }}
-        />
-
-        {/* Start-time adjustment for the RUNNING shift. Managers edit the
-            entry directly; everyone else files a correction request that a
-            manager approves. */}
-        {isManager ? (
           <EditEntryModal
-            visible={adjustOpen && runningEditEntry !== null}
-            entry={runningEditEntry}
-            startOnly
-            onClose={() => setAdjustOpen(false)}
+            visible={editShift !== null}
+            entry={editEntry}
+            onClose={() => setEditShift(null)}
             onSaved={() => {
-              setAdjustOpen(false);
-              // The timer anchors on the server's startedAt. Refetch and show
-              // whatever the server returns instead of computing locally.
+              setEditShift(null);
               void refresh();
             }}
           />
-        ) : (
+
           <RequestEditModal
-            visible={adjustOpen && activeEntry !== null}
-            shift={null}
-            startOnly
-            running={activeEntry}
-            onClose={() => setAdjustOpen(false)}
+            visible={requestShift !== null}
+            shift={requestShift}
+            onClose={() => setRequestShift(null)}
             onSubmitted={() => {
-              setAdjustOpen(false);
-              setBanner(
-                "Sent. Your manager approves this before it changes your timesheet.",
-              );
+              setRequestShift(null);
+              setBanner("Change requested. Your manager will review it.");
             }}
           />
-        )}
 
-        <Modal
-          visible={accountMenuOpen}
-          transparent
-          animationType="fade"
-          onRequestClose={() => setAccountMenuOpen(false)}
-        >
-          <TouchableOpacity
-            style={styles.sheetBackdrop}
-            activeOpacity={1}
-            onPress={() => setAccountMenuOpen(false)}
+          {/* Start-time adjustment for the RUNNING shift. Managers edit the
+              entry directly; everyone else files a correction request that a
+              manager approves. */}
+          {isManager ? (
+            <EditEntryModal
+              visible={adjustOpen && runningEditEntry !== null}
+              entry={runningEditEntry}
+              startOnly
+              onClose={() => setAdjustOpen(false)}
+              onSaved={() => {
+                setAdjustOpen(false);
+                // The timer anchors on the server's startedAt. Refetch and show
+                // whatever the server returns instead of computing locally.
+                void refresh();
+              }}
+            />
+          ) : (
+            <RequestEditModal
+              visible={adjustOpen && activeEntry !== null}
+              shift={null}
+              startOnly
+              running={activeEntry}
+              onClose={() => setAdjustOpen(false)}
+              onSubmitted={() => {
+                setAdjustOpen(false);
+                setBanner(
+                  "Sent. Your manager approves this before it changes your timesheet.",
+                );
+              }}
+            />
+          )}
+
+          <Modal
+            visible={accountMenuOpen}
+            transparent
+            animationType="fade"
+            onRequestClose={() => setAccountMenuOpen(false)}
           >
-            <TouchableOpacity activeOpacity={1} style={styles.sheetCard}>
-              <Text style={styles.sheetName} numberOfLines={1}>
-                {userName}
-              </Text>
-              {orgName ? (
-                <Text style={styles.sheetSub} numberOfLines={1}>
-                  {orgName}
+            <TouchableOpacity
+              style={styles.sheetBackdrop}
+              activeOpacity={1}
+              onPress={() => setAccountMenuOpen(false)}
+            >
+              <TouchableOpacity activeOpacity={1} style={styles.sheetCard}>
+                <Text style={styles.sheetName} numberOfLines={1}>
+                  {userName}
                 </Text>
-              ) : null}
-              {session.user.email ? (
-                <Text style={styles.sheetEmail} numberOfLines={1}>
-                  {session.user.email}
-                </Text>
-              ) : null}
+                {orgName ? (
+                  <Text style={styles.sheetSub} numberOfLines={1}>
+                    {orgName}
+                  </Text>
+                ) : null}
+                {session.user.email ? (
+                  <Text style={styles.sheetEmail} numberOfLines={1}>
+                    {session.user.email}
+                  </Text>
+                ) : null}
 
-              <View style={styles.sheetDivider} />
+                <View style={styles.sheetDivider} />
 
-              <TouchableOpacity
-                style={styles.sheetRow}
-                onPress={() => {
-                  setAccountMenuOpen(false);
-                  startTutorial();
-                }}
-              >
-                <Text style={styles.sheetRowText}>Replay tutorial</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={styles.sheetRow}
-                onPress={() => {
-                  setAccountMenuOpen(false);
-                  setLockSheetOpen(true);
-                }}
-              >
-                <Text style={styles.sheetRowText}>
-                  {lockStatus?.configured ? "App lock" : "Set up app lock"}
-                </Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={styles.sheetRow}
-                onPress={() => {
-                  setAccountMenuOpen(false);
-                  onSignOut();
-                }}
-              >
-                <Text style={styles.sheetRowText}>Sign out</Text>
-              </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.sheetRow}
+                  onPress={() => {
+                    setAccountMenuOpen(false);
+                    startTutorial();
+                  }}
+                >
+                  <Text style={styles.sheetRowText}>Replay tutorial</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.sheetRow}
+                  onPress={() => {
+                    setAccountMenuOpen(false);
+                    setLockSheetOpen(true);
+                  }}
+                >
+                  <Text style={styles.sheetRowText}>
+                    {lockStatus?.configured ? "App lock" : "Set up app lock"}
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.sheetRow}
+                  onPress={() => {
+                    setAccountMenuOpen(false);
+                    onSignOut();
+                  }}
+                >
+                  <Text style={styles.sheetRowText}>Sign out</Text>
+                </TouchableOpacity>
 
-              <TouchableOpacity
-                style={styles.sheetDeleteLink}
-                hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
-                onPress={() => {
-                  setAccountMenuOpen(false);
-                  handleDeleteAccount();
-                }}
-              >
-                <Text style={styles.sheetDeleteText}>Delete my account</Text>
+                <TouchableOpacity
+                  style={styles.sheetDeleteLink}
+                  hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+                  onPress={() => {
+                    setAccountMenuOpen(false);
+                    handleDeleteAccount();
+                  }}
+                >
+                  <Text style={styles.sheetDeleteText}>Delete my account</Text>
+                </TouchableOpacity>
               </TouchableOpacity>
             </TouchableOpacity>
-          </TouchableOpacity>
-        </Modal>
+          </Modal>
 
-        <LockSetupSheet
-          visible={lockSheetOpen}
-          onClose={() => setLockSheetOpen(false)}
-          configured={lockStatus?.configured ?? false}
-          biometricEnabled={lockStatus?.biometric ?? false}
-          identity={{
-            userId: session.user.id,
-            email: session.user.email ?? null,
-            displayName: userName,
-            role: isManager ? "manager" : "employee",
-          }}
-          onChanged={refreshLock}
-        />
+          <LockSetupSheet
+            visible={lockSheetOpen}
+            onClose={() => setLockSheetOpen(false)}
+            configured={lockStatus?.configured ?? false}
+            biometricEnabled={lockStatus?.biometric ?? false}
+            identity={{
+              userId: session.user.id,
+              email: session.user.email ?? null,
+              displayName: userName,
+              role: isManager ? "manager" : "employee",
+            }}
+            onChanged={refreshLock}
+          />
 
-        {banner ? (
-          <TouchableOpacity
-            style={styles.bannerWrap}
-            onPress={() => setBanner(null)}
-          >
-            <Text style={styles.bannerText}>{banner}  (tap to dismiss)</Text>
-          </TouchableOpacity>
-        ) : null}
+          {banner ? (
+            <TouchableOpacity
+              style={styles.bannerWrap}
+              onPress={() => setBanner(null)}
+              accessibilityRole="alert"
+            >
+              <Text style={styles.bannerText}>{banner}  (tap to dismiss)</Text>
+            </TouchableOpacity>
+          ) : null}
 
-        {/* Guided tour — rendered inside the themed subtree so the spotlight
-            card follows the on-shift palette. */}
-        <TutorialOverlay />
-      </SafeAreaView>
+          {/* Guided tour — rendered inside the themed subtree so the spotlight
+              card follows the on-shift palette. */}
+          <TutorialOverlay />
+        </SafeAreaView>
+      </View>
     </ThemeContext.Provider>
   );
 }
@@ -1205,6 +1769,11 @@ export function ClockScreen({
 const makeStyles = (c: Palette) =>
   StyleSheet.create({
     container: { flex: 1, backgroundColor: c.bg },
+    // The on-screen tree: PaletteBackdrop paints the background under a
+    // transparent SafeAreaView.
+    root: { flex: 1 },
+    safe: { flex: 1 },
+    main: { flex: 1 },
     center: { alignItems: "center", justifyContent: "center" },
     header: {
       flexDirection: "row",
@@ -1340,6 +1909,12 @@ const makeStyles = (c: Palette) =>
       borderColor: c.border,
     },
     buttonStacked: { marginTop: 12 },
+    landingRow: {
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "center",
+      gap: 10,
+    },
     buttonDisabled: { opacity: 0.6 },
     bigButtonText: { fontSize: 22, fontWeight: "800" },
     requireHint: {
@@ -1349,18 +1924,23 @@ const makeStyles = (c: Palette) =>
       marginTop: 18,
       fontWeight: "600",
     },
+    syncRow: {
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "center",
+      gap: 8,
+      marginTop: 18,
+    },
+    syncDot: { width: 7, height: 7, borderRadius: 4 },
     pending: {
       color: c.warn,
       fontSize: 14,
-      textAlign: "center",
-      marginTop: 18,
       fontWeight: "600",
     },
     synced: {
       color: c.success,
       fontSize: 14,
-      textAlign: "center",
-      marginTop: 18,
+      fontWeight: "600",
     },
     held: {
       color: c.warn,
@@ -1425,4 +2005,41 @@ const makeStyles = (c: Palette) =>
       paddingHorizontal: 20,
     },
     bannerText: { color: c.accentText, fontSize: 14, textAlign: "center" },
+    undoCard: {
+      position: "absolute",
+      left: 16,
+      right: 16,
+      bottom: 16,
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 12,
+      paddingVertical: 11,
+      paddingLeft: 14,
+      paddingRight: 12,
+      borderRadius: 12,
+      borderWidth: 1,
+      borderColor: lightColors.border,
+      backgroundColor: lightColors.surface,
+      shadowColor: "#0f0f0e",
+      shadowOpacity: 0.3,
+      shadowRadius: 18,
+      shadowOffset: { width: 0, height: 10 },
+      elevation: 8,
+    },
+    undoText: { flex: 1, color: lightColors.text, fontSize: 15 },
+    undoCount: { color: lightColors.textMuted },
+    undoButton: {
+      minHeight: 44,
+      justifyContent: "center",
+      paddingHorizontal: 14,
+      borderRadius: 8,
+      borderWidth: 1,
+      borderColor: lightColors.border,
+      backgroundColor: lightColors.bg,
+    },
+    undoButtonText: {
+      color: lightColors.text,
+      fontSize: 15,
+      fontWeight: "600",
+    },
   });

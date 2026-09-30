@@ -93,15 +93,16 @@ After changing `.env`, restart: `Ctrl+C` → `npx expo start -c` (a plain reload
 
 **Happy path**
 1. Log in (employee) → clock screen.
-2. Pick a project/task if shown → tap **Clock in** → timer runs, "All punches synced" appears.
+2. Pick a project/task if shown → tap **Clock in** → a check draws in the button, the screen turns dark, the timer runs from 0:00:00, and the sync line goes from amber "Saved on this phone" to green "All punches synced".
 3. **Take break** → card turns to **ON BREAK** with a break timer → **End break**.
-4. **Clock out** → timer stops.
+4. **Hold to clock out** until the button fills (1.2 s) → timer stops. Letting go early resets it with "Keep holding". With VoiceOver or TalkBack on it is a plain **Clock out** button.
 5. **Verify:** open the web app as the manager → that employee's timesheet shows the shift.
+6. **Undo:** clock in again, then tap **Undo clock-in** within 10 seconds (45 with a screen reader on) → back to Not clocked in, and no new shift on the web timesheet. Online, the punch has usually synced by then, so this exercises the server undo (`/undo-clock-in`, needs web PR #19 deployed). In Airplane mode, a clock-in the phone never tried to send is simply taken out of its queue. One whose send had already started stays queued and the phone says it can't undo it offline; try again once online. When a send had started and the phone is online, the punch leaves the queue and the screen waits for the server: done shows the undone note, a refusal or a 404 leaves the server's state on screen with a banner, and no answer at all shows Not clocked in with "The undo isn't confirmed yet" while the phone asks again on each sync.
 
 **Offline test**
 1. Clock in while online (so you have a running shift).
 2. Turn on **Airplane mode**.
-3. Clock out / take a break → the UI updates instantly and shows "N punches waiting to sync".
+3. Clock out / take a break → the UI updates instantly and shows "Saved on this phone" in amber ("N punches saved on this phone" for more than one).
 4. Turn Wi-Fi back on → it auto-syncs → "All punches synced".
 5. Confirm on the web app. Re-syncing the same punch never duplicates (idempotency keys).
 
@@ -157,6 +158,8 @@ Routes: `src/app/api/mobile/v1/`
 | `/clock-out` | POST | end a shift |
 | `/break/start` | POST | start a break |
 | `/break/end` | POST | end a break |
+| `/switch-project` | POST | switch or retag the running shift's project |
+| `/undo-clock-in` | POST | undo a clock-in by its idempotency key, within a minute (web PR #19) |
 
 - **Auth:** `Authorization: Bearer <supabase access token>` → validated in `src/lib/mobile-auth.ts`.
 - **Deploy backend changes:** commit + push the web repo → Vercel auto-deploys.
