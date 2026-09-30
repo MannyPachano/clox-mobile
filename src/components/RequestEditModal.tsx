@@ -29,7 +29,7 @@ import { getOrgTz } from "../lib/org-tz";
 import { saveErrorMessage } from "../lib/save-error";
 import { pickerDateInZone, sameWallFields } from "../lib/zoned-time";
 import { getAccessToken } from "../supabase";
-import { lightColors as c, scrim } from "../theme";
+import { lightColors as c, scrim, ThemeContext } from "../theme";
 import { SelectField } from "./SelectField";
 import { TimeField } from "./TimeField";
 
@@ -226,6 +226,12 @@ export function RequestEditModal({
           padding is the only mechanism that works on Android too (see
           EditEntryModal for the full story). */}
       <KeyboardAvoidingView style={styles.kav} behavior="padding">
+      {/* This sheet is always light (its own styles use lightColors), but
+          SelectField follows the theme context, and the Clock screen sets
+          that to its dark on-shift palette. Without this, the Date and
+          Project fields draw dark on the light sheet, with a label at 2.2:1
+          against it. */}
+      <ThemeContext.Provider value={c}>
       <Pressable style={styles.backdrop} onPress={onClose}>
         <Pressable style={styles.sheet} onPress={() => {}}>
           <Text style={styles.title}>
@@ -296,6 +302,7 @@ export function RequestEditModal({
           </Pressable>
         </Pressable>
       </Pressable>
+      </ThemeContext.Provider>
       </KeyboardAvoidingView>
     </Modal>
   );

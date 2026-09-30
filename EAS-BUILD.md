@@ -22,6 +22,9 @@ npm install
 npx expo start
 ```
 Install **Expo Go** (App Store / Play Store), scan the QR. Full app except push.
+From 1.4.0 the project has `expo-dev-client`, so `npx expo start` opens in
+development-build mode: press `s` to switch to Expo Go, or run `npx expo start --go`.
+Expo Go never has the lock-screen module, so the app there behaves as 1.3.0 did.
 
 ---
 
@@ -44,7 +47,7 @@ eas init                    # creates the project on Expo's servers AND writes
 the repo, so `eas build:configure` isn't needed. It uses
 `appVersionSource: "remote"`, so EAS auto-manages iOS `buildNumber` / Android
 `versionCode` in the cloud — you don't set them in `app.json` (only the human
-`version`, currently `1.0.0`).
+`version`, now `1.4.0`; bump it by hand for every store release).
 
 ---
 
@@ -84,6 +87,68 @@ eas device:create          # register your iPhone (one-time, follow the link)
 eas build -p ios --profile preview
 ```
 Install via the link EAS gives you.
+
+---
+
+## 1.4.0: the Live Activity, widget and Android notification build
+
+1.4.0 adds native code (a widget extension, a local Expo module, an App
+Group, a notification receiver), so it is a store build, not an EAS Update.
+
+**The runtime splits at 1.4.0.** `runtimeVersion` uses the `appVersion`
+policy, so an update reaches only phones whose app version matches the
+`version` in the checkout it is published from. Once `app.json` says 1.4.0,
+`eas update --channel production` from `main` reaches only 1.4.0 phones, and
+1.3.0 phones get nothing.
+1. Before any branch with `"version": "1.4.0"` is merged, publish the pending
+   1.3.0 update from an up-to-date `main` that still says 1.3.0:
+   `eas update --channel production --message "..."`.
+2. Keep a branch at that commit for later 1.3.0 fixes:
+   `git branch release/1.3 && git push origin release/1.3`. Any 1.3.0 hotfix
+   update is published from `release/1.3`, never from `main`.
+
+**The first iOS build must be interactive**, signed in to the Apple account,
+from a terminal (no `--non-interactive`, not from CI):
+```bash
+eas build -p ios --profile production
+```
+Answer yes when EAS offers to sync capabilities and to create the App Group
+`group.com.getclox.clock`, the App ID `com.getclox.clock.widget` and its
+provisioning profile. (If it cannot, create them in the Apple Developer
+portal: the App Group, the App Groups capability on `com.getclox.clock` and on
+a new App ID `com.getclox.clock.widget`, both assigned to that group; then
+run the build again.)
+
+**Check the first .ipa before submitting it** (download it from the build
+page):
+```bash
+unzip -q Clox.ipa -d ipa        # the .ipa as downloaded, whatever its name
+plutil -p ipa/Payload/Clox.app/Info.plist | grep -E 'CFBundle(ShortVersionString|Version)'
+plutil -p ipa/Payload/Clox.app/PlugIns/widget.appex/Info.plist | grep -E 'CFBundle(ShortVersionString|Version)'
+codesign -d --entitlements - ipa/Payload/Clox.app
+codesign -d --entitlements - ipa/Payload/Clox.app/PlugIns/widget.appex
+```
+Both Info.plists must show `1.4.0` and the same build number
+(`plugins/with-extension-versions.js` is what makes that true; App Store
+Connect refuses an extension whose numbers differ from the app's). Both
+entitlement lists must include `group.com.getclox.clock`.
+
+**Development builds** (`expo-dev-client`, for trying JavaScript changes on
+the native 1.4.0 app without a store build):
+```bash
+eas device:create                                  # iPhone only, once per phone
+eas build -p ios --profile development             # interactive: makes the ad hoc profiles
+eas build -p android --profile development
+npx expo start --dev-client                        # from a checkout with .env
+```
+Install from the links EAS prints, open the dev build, and pick the Metro
+server. The development profile has no `env` block: the JavaScript comes from
+Metro, which reads `.env` in the checkout.
+
+**Android:** `eas build -p android --profile preview` gives an APK for the
+device tests, then `--profile production` for the Play Store. No new
+permission needs a Play Console declaration: `POST_NOTIFICATIONS` and
+`WAKE_LOCK` are ordinary permissions, and there is no foreground service.
 
 ---
 

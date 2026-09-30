@@ -83,7 +83,6 @@ import {
   queuedCount,
   removeHeldPunches,
   takeQueuedClockInForUndo,
-  type PunchKind,
   type QueuedPunch,
 } from "../queue";
 import {
@@ -103,6 +102,7 @@ import {
   type ReminderPrefs,
 } from "../reminders";
 import { getNotificationAccess } from "../push";
+import { askForLockScreenOnce } from "../notification-ask";
 import { getAccessToken } from "../supabase";
 import { getLockStatus, type LockStatus } from "../lib/app-lock";
 import {
@@ -117,6 +117,9 @@ import {
 import { useTutorial, useTutorialTarget } from "../tutorial/TutorialContext";
 import { TutorialOverlay } from "../tutorial/TutorialOverlay";
 import { newUuid } from "../uuid";
+import { buildSimplePunch, type SimplePunchKind } from "../punch-builders";
+import { subscribeSurfaceTaps } from "../shift-actions";
+import { armShiftSurface, pushShiftSurface } from "../shift-surface";
 
 // iOS only exposes the WiFi network name when this is on (plus the Access WiFi
 // Information entitlement and precise location permission). Harmless on
@@ -139,6 +142,28 @@ function wifiNetworkNames(ssids: string[]): string {
 // notifications are off (refresh). Module state, so an unlock (which mounts
 // this screen again) doesn't say it again.
 const remindersBlockedTold = new Set<string>();
+
+/** What a lock-screen push needs besides the shift: names for "Project ·
+ *  Task" and whether the org needs a project to clock out. */
+type SurfaceNames = {
+  projects: Option[];
+  tasksByProject: Record<string, Option[]>;
+  requireProject: boolean;
+};
+
+/** The shift a lock-screen push draws, in the screen's own terms. */
+type SurfaceShiftNow = {
+  startedAt: string | null;
+  breakSince: string | null;
+  projectId: string | null;
+  taskId: string | null;
+};
+
+function isoMs(iso: string | null): number | null {
+  if (!iso) return null;
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? ms : null;
+}
 
 function formatDuration(ms: number): string {
   const min = Math.round((ms > 0 ? ms : 0) / 60000);
@@ -207,6 +232,10 @@ export function ClockScreen({
   const owedAskingRef = useRef(new Set<string>());
   // The first-run tour waits while the undo offer is up (see sync).
   const tutorialDueRef = useRef(false);
+  // Android, decision 4: the one-time lock-screen notification question
+  // waits for the clock-in to stand (its undo offer closing by itself). Any
+  // other close (an undo, a clock-out or break in the window) drops it.
+  const lockScreenAskDueRef = useRef(false);
 
   const [projects, setProjects] = useState<Option[]>([]);
   const [tasksByProject, setTasksByProject] = useState<
@@ -296,6 +325,64 @@ export function ClockScreen({
   useEffect(() => {
     shiftStartedAtRef.current = shiftStartedAt;
   }, [shiftStartedAt]);
+
+  // The running shift on the Lock Screen, in the Dynamic Island, in the
+  // widget and in the Android notification (shift-surface.ts). This screen
+  // pushes only when it changes the shift itself (a clock-in, an undo, a
+  // break, a project or task switch, a clock-out) and when a refresh applies
+  // the server's answer; never on every render, since a cold start with
+  // punches still queued shows Not clocked in until they send. A tap on one
+  // of those surfaces is sent by shift-actions.ts, which draws its outcome
+  // itself and tells this screen (the listener below). The mirrors let the
+  // push callbacks see the shift as it is at the moment they run.
+  const onBreakSinceRef = useRef<string | null>(null);
+  const projectIdRef = useRef<string | null>(null);
+  const taskIdRef = useRef<string | null>(null);
+  const surfaceNamesRef = useRef<SurfaceNames>({
+    projects: [],
+    tasksByProject: {},
+    requireProject: false,
+  });
+  useEffect(() => {
+    onBreakSinceRef.current = onBreakSince;
+  }, [onBreakSince]);
+  useEffect(() => {
+    projectIdRef.current = projectId;
+    taskIdRef.current = taskId;
+  }, [projectId, taskId]);
+  useEffect(() => {
+    surfaceNamesRef.current = { projects, tasksByProject, requireProject };
+  }, [projects, tasksByProject, requireProject]);
+  // Pushes draw only for the person this screen belongs to; sign-out and
+  // re-authentication disarm before they clear (App.tsx).
+  useEffect(() => {
+    armShiftSurface(userId);
+  }, [userId]);
+  const pushSurface = useCallback(
+    (shift: SurfaceShiftNow, names?: SurfaceNames) => {
+      const n = names ?? surfaceNamesRef.current;
+      const project = shift.projectId
+        ? (n.projects.find((p) => p.id === shift.projectId) ?? null)
+        : null;
+      const task =
+        shift.projectId && shift.taskId
+          ? ((n.tasksByProject[shift.projectId] ?? []).find(
+              (t) => t.id === shift.taskId,
+            ) ?? null)
+          : null;
+      const startMs = isoMs(shift.startedAt);
+      void pushShiftSurface({
+        userId,
+        shiftStartMs: startMs,
+        breakStartMs: startMs === null ? null : isoMs(shift.breakSince),
+        projectId: shift.projectId,
+        projectName: project?.name ?? null,
+        taskName: task?.name ?? null,
+        requireProject: n.requireProject,
+      });
+    },
+    [userId],
+  );
   useEffect(() => {
     armReminders(userId);
     let cancelled = false;
@@ -456,6 +543,23 @@ export function ClockScreen({
           // clock-out made on the web or by a manager, a clock-in the server
           // refused, a start time edited elsewhere).
           reconcileLongShift(runningSince);
+          // And for the Lock Screen and the notification: this is how a
+          // clock-in or clock-out made on the web, at a kiosk or by a
+          // manager reaches them, and how a Live Activity comes back after
+          // iOS ends it at 8 hours (shift-surface-state.ts planActivity).
+          pushSurface(
+            {
+              startedAt: runningSince,
+              breakSince: active ? d.onBreakSince : null,
+              projectId: active ? active.projectId : null,
+              taskId: active ? active.taskId : null,
+            },
+            {
+              projects: d.projects,
+              tasksByProject: d.tasksByProject,
+              requireProject: d.organization.requireProject,
+            },
+          );
         }
       }
       if (historyRes.ok) setHistory(historyRes.data.shifts);
@@ -473,7 +577,13 @@ export function ClockScreen({
     } finally {
       setReady(true);
     }
-  }, [userId, applyReminderPrefs, reconcileLongShift, reconcileShiftReminders]);
+  }, [
+    userId,
+    applyReminderPrefs,
+    reconcileLongShift,
+    reconcileShiftReminders,
+    pushSurface,
+  ]);
 
   // Guided-tour replay + the first-run trigger (declared before sync so the
   // callback can fire it once a punch is accepted by the server).
@@ -488,6 +598,7 @@ export function ClockScreen({
   // unless the clock-in was undone: then it waits for the next punch.
   const closeUndoOffer = useCallback(
     (undone: boolean) => {
+      lockScreenAskDueRef.current = false;
       if (!undoOfferRef.current) return;
       setUndoOffer(null);
       if (tutorialDueRef.current) {
@@ -497,6 +608,25 @@ export function ClockScreen({
     },
     [setUndoOffer, onPunchSucceeded],
   );
+
+  // Decision 4 (Android): once a clock-in stands, ask once whether the
+  // running shift may show on the lock screen. After Allow, this screen's own
+  // view of the shift goes to the notification at once: a refresh pushes only
+  // with the queue empty, so an offline clock-in would otherwise wait for the
+  // connection. It runs only right after this screen's own clock-in (the
+  // undo offer closing by itself), never from a cold start's empty view.
+  const offerLockScreenOnce = useCallback(async () => {
+    const result = await askForLockScreenOnce(getAccessToken);
+    if (result === "allowed") {
+      pushSurface({
+        startedAt: shiftStartedAtRef.current,
+        breakSince: onBreakSinceRef.current,
+        projectId: projectIdRef.current,
+        taskId: taskIdRef.current,
+      });
+      void refresh();
+    }
+  }, [refresh, pushSurface]);
 
   // One undo request to the server for the clock-in sent with `key`. Null
   // when no answer came back (no connection, or none in time).
@@ -583,8 +713,6 @@ export function ClockScreen({
 
   useEffect(() => {
     void refresh();
-    // Warm the GPS on open so the first clock-in doesn't wait on a cold fix.
-    void warmUpLocation();
     // Draining the offline punch queue is non-critical boot work — defer it
     // past the first render (Part D) so it never competes with paint.
     const task = InteractionManager.runAfterInteractions(() => {
@@ -592,6 +720,31 @@ export function ClockScreen({
     });
     return () => task.cancel();
   }, [refresh, sync]);
+
+  // Warm the GPS on open so the first clock-in doesn't wait on a cold fix,
+  // but only in the foreground. iOS can start the app in the background for
+  // a Lock Screen or widget button, and this screen may mount then with
+  // nobody looking: location is read only at a punch the person makes here,
+  // never in the background. Such a start warms up at its first "active".
+  useEffect(() => {
+    if (AppState.currentState === "active") {
+      void warmUpLocation();
+      return;
+    }
+    let sub: { remove(): void } | null = AppState.addEventListener(
+      "change",
+      (state) => {
+        if (state !== "active") return;
+        sub?.remove();
+        sub = null;
+        void warmUpLocation();
+      },
+    );
+    return () => {
+      sub?.remove();
+      sub = null;
+    };
+  }, []);
 
   const didFocusMountRef = useRef(false);
   useEffect(() => {
@@ -621,11 +774,19 @@ export function ClockScreen({
   useEffect(() => {
     if (!undoOffer || undoBusy) return;
     const t = setTimeout(
-      () => closeUndoOffer(false),
+      () => {
+        // Read both before closing: closeUndoOffer drops the ask, and may
+        // open the first-run tour, which the question must not cover (it
+        // then waits for a later clock-in).
+        const askDue = lockScreenAskDueRef.current;
+        const tourOpens = tutorialDueRef.current;
+        closeUndoOffer(false);
+        if (askDue && !tourOpens) void offerLockScreenOnce();
+      },
       Math.max(0, undoOfferClosesAt(undoOffer) - Date.now()),
     );
     return () => clearTimeout(t);
-  }, [undoOffer, undoBusy, closeUndoOffer]);
+  }, [undoOffer, undoBusy, closeUndoOffer, offerLockScreenOnce]);
 
   useEffect(() => {
     if (!undoNote) return;
@@ -656,25 +817,62 @@ export function ClockScreen({
     };
   }, [refresh, sync]);
 
+  // A Lock Screen, widget or notification tap, queued by shift-actions.ts.
+  // It is this person's punch like one made here: the undo offer closes (an
+  // undo would orphan it), a refresh that started before it must not undo
+  // it on screen (the epoch bump), and the screen shows it at once, with the
+  // same reminder changes a tap here makes. The surfaces draw the outcome
+  // themselves; once it is known, the screen refreshes from the server.
+  useEffect(() => {
+    return subscribeSurfaceTaps((event) => {
+      if (event.type === "notice") {
+        setBanner(event.text);
+        return;
+      }
+      if (event.userId !== userId) return;
+      if (event.type === "queued") {
+        closeUndoOffer(false);
+        localEpochRef.current += 1;
+        for (const tap of event.taps) {
+          if (tap.kind === "out") {
+            shiftStartedAtRef.current = null;
+            setShiftStartedAt(null);
+            setOnBreakSince(null);
+            setActiveEntry(null);
+            setLandingId(null);
+            reconcileLongShift(null);
+            reconcileShiftReminders(null);
+          } else if (shiftStartedAtRef.current) {
+            setOnBreakSince(
+              tap.kind === "break_start" ? new Date(tap.tapMs).toISOString() : null,
+            );
+          }
+        }
+        void queuedCount().then(setPending);
+        return;
+      }
+      if (event.drain) {
+        setPending(event.drain.remaining);
+        setHeld(event.drain.held);
+        if (event.drain.errors.length > 0) setBanner(event.drain.errors[0] ?? null);
+      }
+      void refresh();
+    });
+  }, [userId, closeUndoOffer, reconcileLongShift, reconcileShiftReminders, refresh]);
+
   const enqueueSimple = useCallback(
-    async (kind: PunchKind) => {
+    async (kind: SimplePunchKind) => {
       // Any later punch ends the undo offer: undoing the clock-in would
       // orphan this one.
       closeUndoOffer(false);
       localEpochRef.current += 1;
-      const punch: QueuedPunch = {
+      // The same builder the lock-screen tap inbox uses, so a clock-out or
+      // break from either place is the same punch.
+      const punch = buildSimplePunch(kind, {
         id: newUuid(),
-        kind,
         clientTime: new Date().toISOString(),
-        projectId: kind === "out" ? projectId : null,
-        taskId: null,
-        note: null,
-        selfie: null,
-        latitude: null,
-        longitude: null,
-        accuracyM: null,
-        mocked: null,
-      };
+        projectId,
+      });
       try {
         await enqueuePunch(punch, userId);
       } catch {
@@ -734,6 +932,12 @@ export function ClockScreen({
       const apply = (applyToShift: boolean) => {
         setProjectId(id);
         setTaskId(null);
+        pushSurface({
+          startedAt: shiftStartedAtRef.current,
+          breakSince: onBreakSinceRef.current,
+          projectId: id,
+          taskId: null,
+        });
         void enqueueSwitch(id, null, applyToShift);
       };
       // Forgot-to-tag case: the running entry has no project yet, so the pick
@@ -754,7 +958,7 @@ export function ClockScreen({
         ],
       );
     },
-    [shiftStartedAt, projectId, enqueueSwitch],
+    [shiftStartedAt, projectId, enqueueSwitch, pushSurface],
   );
 
   const onTaskChange = useCallback(
@@ -766,6 +970,12 @@ export function ClockScreen({
       if (id === taskId) return;
       const apply = (applyToShift: boolean) => {
         setTaskId(id);
+        pushSurface({
+          startedAt: shiftStartedAtRef.current,
+          breakSince: onBreakSinceRef.current,
+          projectId,
+          taskId: id,
+        });
         void enqueueSwitch(projectId, id, applyToShift);
       };
       Alert.alert(
@@ -778,7 +988,7 @@ export function ClockScreen({
         ],
       );
     },
-    [shiftStartedAt, taskId, projectId, enqueueSwitch],
+    [shiftStartedAt, taskId, projectId, enqueueSwitch, pushSurface],
   );
 
   const doClockIn = useCallback(
@@ -888,6 +1098,15 @@ export function ClockScreen({
       // shift this clock-in started early is cancelled.
       reconcileLongShift(punch.clientTime);
       reconcileShiftReminders(punch.clientTime);
+      // The Live Activity starts now, anchored at the tap, offline too, and
+      // any card left from an earlier shift ends at once. On Android the
+      // notification posts if notifications are allowed.
+      pushSurface({
+        startedAt: punch.clientTime,
+        breakSince: null,
+        projectId,
+        taskId,
+      });
       // The new entry's server id is unknown until the punch syncs — clear any
       // stale one so the start-time editor can't target a previous entry.
       setActiveEntry(null);
@@ -901,6 +1120,7 @@ export function ClockScreen({
         shownAtMs: Date.now() + CHECK_MS,
         noticeMs: undoNoticeMs(screenReaderOn),
       });
+      lockScreenAskDueRef.current = true;
       // With a screen reader on, focus moves to the offer once it shows (the
       // effect before the loading return), and its label says all of this.
       // Otherwise a short line, in case a reader is on but not detected yet.
@@ -926,6 +1146,7 @@ export function ClockScreen({
       setUndoOffer,
       reconcileLongShift,
       reconcileShiftReminders,
+      pushSurface,
     ],
   );
 
@@ -962,18 +1183,35 @@ export function ClockScreen({
     // server's running shift.
     reconcileLongShift(null);
     reconcileShiftReminders(null);
+    // Clocked out in the app: the Live Activity and the notification end at
+    // once (the final line is only for a clock-out made from them).
+    pushSurface({
+      startedAt: null,
+      breakSince: null,
+      projectId: projectIdRef.current,
+      taskId: taskIdRef.current,
+    });
     await enqueueSimple("out");
     setBusy(false);
-  }, [enqueueSimple, reconcileLongShift, reconcileShiftReminders]);
+  }, [enqueueSimple, reconcileLongShift, reconcileShiftReminders, pushSurface]);
 
   const onBreakStart = useCallback(async () => {
     haptics.light();
     setBusy(true);
     setBanner(null);
-    setOnBreakSince(new Date().toISOString());
+    const since = new Date().toISOString();
+    setOnBreakSince(since);
+    // On break: the surfaces count the break and say since when the shift
+    // has run.
+    pushSurface({
+      startedAt: shiftStartedAtRef.current,
+      breakSince: since,
+      projectId: projectIdRef.current,
+      taskId: taskIdRef.current,
+    });
     await enqueueSimple("break_start");
     setBusy(false);
-  }, [enqueueSimple]);
+  }, [enqueueSimple, pushSurface]);
 
   // The held line is tappable: once the manager has added the shift, the
   // worker can remove the held punches from the phone.
@@ -999,9 +1237,15 @@ export function ClockScreen({
     setBusy(true);
     setBanner(null);
     setOnBreakSince(null);
+    pushSurface({
+      startedAt: shiftStartedAtRef.current,
+      breakSince: null,
+      projectId: projectIdRef.current,
+      taskId: taskIdRef.current,
+    });
     await enqueueSimple("break_end");
     setBusy(false);
-  }, [enqueueSimple]);
+  }, [enqueueSimple, pushSurface]);
 
   // Back to Not clocked in after an undo, with no word on the outcome yet.
   // The project and task picks are kept for the next clock-in.
@@ -1017,7 +1261,16 @@ export function ClockScreen({
     // shift reminder goes, and held shift reminders come back.
     reconcileLongShift(null);
     reconcileShiftReminders(null);
-  }, [closeUndoOffer, reconcileLongShift, reconcileShiftReminders]);
+    // The Live Activity and the notification end at once. If the server
+    // turns out to have kept the clock-in, the refresh that shows it again
+    // starts them again (the app is in the foreground).
+    pushSurface({
+      startedAt: null,
+      breakSince: null,
+      projectId: projectIdRef.current,
+      taskId: taskIdRef.current,
+    });
+  }, [closeUndoOffer, reconcileLongShift, reconcileShiftReminders, pushSurface]);
 
   // The undo is done: the clock-in never reached the server, or the server
   // has undone it.

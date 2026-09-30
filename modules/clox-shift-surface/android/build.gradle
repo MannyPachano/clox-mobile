@@ -1,0 +1,25 @@
+// The Android side of the app's own Expo module for the running shift outside
+// the app: the ongoing notification with a timer and Clock out. Autolinked
+// from modules/ (expo-module.config.json).
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'expo.modules.cloxshiftsurface'
+version = '1.0.0'
+
+android {
+  namespace "expo.modules.cloxshiftsurface"
+  defaultConfig {
+    versionCode 1
+    versionName "1.0.0"
+  }
+}
+
+dependencies {
+  // HeadlessJsTaskService and Arguments: a Clock out tap wakes the app's
+  // JavaScript without opening the app. The version comes from React
+  // Native's Gradle plugin, as for expo-font and expo-updates.
+  implementation 'com.facebook.react:react-android'
+}

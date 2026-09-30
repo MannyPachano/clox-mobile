@@ -1,0 +1,37 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <!-- Android 13 and later: the running-shift notification needs it.
+       expo-notifications declares it too; this module does not rely on that.
+       No boot permission (decision 6): after a restart the notification comes
+       back the next time Clox opens. -->
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+  <!-- HeadlessJsTaskService takes a wake lock for every tap, outside any
+       try: without this permission the tap would crash the app in the
+       background. firebase-messaging (through expo-notifications) declares
+       it today; this module does not rely on that either. -->
+  <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+  <application>
+    <!-- Taps (Android 12 and later), swipes and the stale redraw. Only this
+         app's own explicit, immutable PendingIntents reach it. -->
+    <receiver
+      android:name="expo.modules.cloxshiftsurface.ShiftActionReceiver"
+      android:exported="false" />
+
+    <!-- Taps on Android 7 to 11, so the system asks to unlock first. No UI. -->
+    <activity
+      android:name="expo.modules.cloxshiftsurface.ShiftActionActivity"
+      android:exported="false"
+      android:excludeFromRecents="true"
+      android:noHistory="true"
+      android:launchMode="standard"
+      android:taskAffinity=""
+      android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+    <!-- Runs the JavaScript task CloxShiftAction when a tap arrives and the
+         app is not running. An ordinary background service, never a
+         foreground service. -->
+    <service
+      android:name="expo.modules.cloxshiftsurface.ShiftActionTaskService"
+      android:exported="false" />
+  </application>
+</manifest>

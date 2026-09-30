@@ -3,6 +3,7 @@ import {
   ActivityIndicator,
   AppState,
   InteractionManager,
+  Linking,
   StyleSheet,
   View,
 } from "react-native";
@@ -36,14 +37,18 @@ import {
   cancelAllReminders,
   clearReminderPrefsCache,
 } from "./src/reminder-notifications";
-import { tapTargetFor } from "./src/reminders";
+import { tapTargetFor, type TapTarget } from "./src/reminders";
 import {
   clearQueue,
   drainQueue,
   getQueueOwner,
   storedPunchCount,
+  whenDrainIdle,
 } from "./src/queue";
 import { ClockScreen } from "./src/screens/ClockScreen";
+import { processSurfaceTaps } from "./src/shift-actions";
+import { clearShiftSurfaces, signOutShiftSurfaces } from "./src/shift-surface";
+import { isSurfaceOpenUrl } from "./src/shift-surface-state";
 import { LoginScreen } from "./src/screens/LoginScreen";
 import { UnlockScreen } from "./src/screens/UnlockScreen";
 import { getAccessToken, supabase } from "./src/supabase";
@@ -54,8 +59,21 @@ import { TutorialProvider } from "./src/tutorial/TutorialContext";
 // render, so even boot-time crashes are reported.
 installErrorReporting();
 
-/** A tapped notification waiting for the screen it opens. */
+/** A tapped notification, or a clox://clock link, waiting for the screen it
+ *  opens. */
 type Tapped = { data: unknown };
+
+/** The data of a Tapped made from clox://clock (the widget's Clock in, the
+ *  Live Activity and the Android notification). It only ever opens the
+ *  Clock screen: no link punches. */
+const OPEN_CLOCK_TYPE = "clox_open_clock";
+
+/** The manager tab a tap or link opens, or null to open the app as it is. */
+function managerTabFor(t: Tapped): TapTarget | null {
+  const type = (t.data as { type?: unknown } | null)?.type;
+  if (type === OPEN_CLOCK_TYPE) return "Clock";
+  return tapTargetFor(t.data, true);
+}
 
 /** Back in the foreground after longer than this, a configured app lock
  *  challenges again. */
@@ -158,6 +176,32 @@ export default function App() {
     return () => sub.remove();
   }, []);
 
+  // clox://clock, from the widget's Clock in, a tap on the Live Activity or
+  // the Android notification: open the Clock screen, and nothing else (it
+  // never clocks anyone in or out; any app or web page can open the link).
+  // An employee is on the Clock screen already; a manager's tabs switch to
+  // Clock. It goes through the same waiting slot as a notification tap, so
+  // the app lock's PIN screen comes first when it should.
+  useEffect(() => {
+    const take = (url: string | null) => {
+      if (!isSurfaceOpenUrl(url)) return;
+      const since = bgSinceRef.current;
+      if (
+        lockConfiguredRef.current &&
+        since != null &&
+        Date.now() - since > LOCK_GRACE_MS
+      ) {
+        setLocked(true);
+      }
+      setTapped({ data: { type: OPEN_CLOCK_TYPE } });
+    };
+    void Linking.getInitialURL()
+      .then(take)
+      .catch(() => {});
+    const sub = Linking.addEventListener("url", (e) => take(e.url));
+    return () => sub.remove();
+  }, []);
+
   const onTapHandled = useCallback(() => {
     const t = tappedRef.current;
     if (t) lastTakenTapRef.current = { tap: t, at: Date.now() };
@@ -235,6 +279,13 @@ export default function App() {
       if (owner && owner !== uid && (await storedPunchCount()) > 0) {
         await clearQueue();
       }
+      // The same guard for the Lock Screen, the widget and the Android
+      // notification: a shift left showing for another account comes down.
+      // Then saved taps are looked at under this account: its own are
+      // queued (a re-authentication keeps them, as it keeps the queue), and
+      // another account's are dropped with a word in the banner.
+      await signOutShiftSurfaces(uid);
+      await processSurfaceTaps("session");
     })();
   }, [session?.user?.id]);
 
@@ -311,6 +362,9 @@ export default function App() {
   const handleSignOut = async () => {
     const t = await getAccessToken();
     if (t) {
+      // A Lock Screen tap still saved on the phone joins the queue first, so
+      // the flush below sends it under this user.
+      await processSurfaceTaps("sign_out");
       await unregisterForPush(t);
       // Flush queued punches under THIS user first so they're attributed
       // correctly, then clear whatever couldn't send. The queue is device-
@@ -318,12 +372,22 @@ export default function App() {
       // otherwise record this user's punches as the next user's.
       try {
         await drainQueue(t);
+        // drainQueue returns at once while another drain runs (the Clock
+        // screen's sync right after a punch, or a lock screen tap's send past
+        // its budget), and the clear below would then drop what that drain
+        // has not sent yet. Wait for it, then send what it left.
+        await whenDrainIdle();
+        await drainQueue(t);
       } catch {
-        // Offline or a failed send — the clear below drops the remainder
+        // Offline or a failed send: the clear below drops the remainder
         // rather than leaving it to mis-attribute.
       }
     }
     await clearQueue();
+    // Nothing of this person's stays on the Lock Screen, in the widget or in
+    // the notification shade, and no saved tap sends later. Account deletion
+    // signs out through here too.
+    await clearShiftSurfaces();
     await clearBootSnapshot();
     await clearFenceCache();
     // Reminders are this person's: none may fire for whoever signs in next.
@@ -349,6 +413,10 @@ export default function App() {
     void (async () => {
       const t = await getAccessToken();
       if (t) await unregisterForPush(t);
+      // The shift comes off the Lock Screen and the notification shade (nobody
+      // is signed in to answer a tap), but saved taps are kept like the queue:
+      // they are sent once this same person signs in again.
+      await signOutShiftSurfaces();
       await clearBootSnapshot();
       await clearFenceCache();
       await cancelAllReminders();
@@ -367,7 +435,7 @@ export default function App() {
   // reminder, which opens on the only screen they have), or no one signed
   // in. A manager's tap waits for ManagerTabs, which takes it on its own.
   const managerTab =
-    tapped && role === "manager" ? tapTargetFor(tapped.data, true) : null;
+    tapped && role === "manager" ? managerTabFor(tapped) : null;
   const tapUnclaimed =
     tapped !== null &&
     !loading &&

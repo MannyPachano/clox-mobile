@@ -139,6 +139,11 @@ const ERROR_MESSAGES: Record<string, string> = {
   no_scheduled_shift: "You don't have a scheduled shift right now.",
   too_early: "It's too early for your scheduled shift.",
   nothing_to_stop: "You weren't clocked in.",
+  // A break started with no shift running (400). A break end with nothing
+  // open comes back 409 and counts as done, so it is never shown; the text is
+  // here in case that changes.
+  no_active_shift: "You weren't clocked in.",
+  no_open_break: "You weren't on a break.",
   // Server gates new clock-ins once the org's trial ends with no plan.
   trial_expired:
     "Your team's Clox trial has ended. Ask your manager to pick a plan, then you can clock in again.",
@@ -246,6 +251,44 @@ export async function heldCount(): Promise<number> {
  *  uses this, so another user's held punches are cleared too. */
 export async function storedPunchCount(): Promise<number> {
   return (await readQueue()).length;
+}
+
+/** The ids of every punch stored on the phone, and which of them are held.
+ *  The lock-screen tap pass (shift-actions.ts) reads it to queue a tap at
+ *  most once and to tell what became of it after a drain. */
+export async function storedPunchIds(): Promise<{ ids: string[]; held: string[] }> {
+  const items = await readQueue();
+  return {
+    ids: items.map((p) => p.id.toLowerCase()),
+    held: items.filter((p) => p.held).map((p) => p.id.toLowerCase()),
+  };
+}
+
+// How punches left the queue in this app session, by id: "sent" (2xx,
+// including the server's answer to a replayed idempotency key), "already"
+// (409: the state the punch asked for already held, e.g. a clock-out for a
+// shift that ended on the web, at a kiosk, by a manager or by the auto
+// clock-out, so this punch's time is not the one recorded) or "refused" (a
+// 4xx the queue dropped). The lock-screen tap pass reads it after a drain to
+// tell the person what happened to their tap. Newest last, capped.
+const SETTLED_CAP = 100;
+export type SettledOutcome = "sent" | "already" | "refused";
+const settledPunches = new Map<string, SettledOutcome>();
+
+function recordSettled(id: string, outcome: SettledOutcome): void {
+  const key = id.toLowerCase();
+  settledPunches.delete(key);
+  settledPunches.set(key, outcome);
+  if (settledPunches.size > SETTLED_CAP) {
+    const oldest = settledPunches.keys().next().value;
+    if (oldest !== undefined) settledPunches.delete(oldest);
+  }
+}
+
+/** How the punch `id` left the queue in this app session, or null when it
+ *  has not (still stored, or it left before this session started). */
+export function settledPunchOutcome(id: string): SettledOutcome | null {
+  return settledPunches.get(id.toLowerCase()) ?? null;
 }
 
 /** Remove the held punches, once the worker's manager has added the shift.
@@ -385,6 +428,15 @@ export async function takeQueuedClockInForUndo(
  * treat as "done".
  */
 let draining = false;
+// Resolves when the drain running now (if any) has finished. A caller whose
+// drainQueue() returned at once because another drain was running waits on
+// this to know its punch was tried.
+let drainIdle: Promise<void> = Promise.resolve();
+
+/** Resolves once no drain is running. */
+export function whenDrainIdle(): Promise<void> {
+  return drainIdle;
+}
 
 export async function drainQueue(token: string): Promise<DrainResult> {
   const errors: string[] = [];
@@ -396,6 +448,10 @@ export async function drainQueue(token: string): Promise<DrainResult> {
     return { synced, remaining: await queuedCount(), held: await heldCount(), errors };
   }
   draining = true;
+  let idle: () => void = () => {};
+  drainIdle = new Promise<void>((resolve) => {
+    idle = resolve;
+  });
 
   try {
     // Process the oldest punch still waiting to sync each pass. On the way,
@@ -446,11 +502,16 @@ export async function drainQueue(token: string): Promise<DrainResult> {
 
       try {
         let outcome: "done" | "drop" | "stop";
+        // A 409: what the punch asked for already holds on the server (a
+        // replayed idempotency key answers 2xx; a 409 is nothing_to_stop,
+        // already_on_break or no_open_break), so its own time was not used.
+        let conflict = false;
         try {
           const res = await send(token, head);
           if (res.ok || res.status === 409) {
-            // 409 = already reflected on the server (idempotent replay) — done.
+            // 409 = already reflected on the server — done.
             outcome = "done";
+            conflict = res.status === 409;
           } else if (res.status === 401) {
             // Token expired/invalid — stop; auth refresh + a later drain resumes.
             outcome = "stop";
@@ -481,6 +542,7 @@ export async function drainQueue(token: string): Promise<DrainResult> {
           }
         });
         sendAttempted.delete(head.id);
+        recordSettled(head.id, outcome === "drop" ? "refused" : conflict ? "already" : "sent");
 
         if (outcome === "done") synced += 1;
       } finally {
@@ -492,6 +554,7 @@ export async function drainQueue(token: string): Promise<DrainResult> {
     if (newlyHeld > 0) errors.unshift(HELD_MESSAGE);
   } finally {
     draining = false;
+    idle();
   }
 
   return { synced, remaining: await queuedCount(), held: await heldCount(), errors };
