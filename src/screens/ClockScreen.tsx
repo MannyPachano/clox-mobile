@@ -99,6 +99,7 @@ import {
   parseReminderPrefs,
   PREFS_OFF,
   REMINDERS_BLOCKED_COPY,
+  formatClock12,
   type ReminderPrefs,
 } from "../reminders";
 import { getNotificationAccess } from "../push";
@@ -163,6 +164,34 @@ function isoMs(iso: string | null): number | null {
   if (!iso) return null;
   const ms = Date.parse(iso);
   return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * The mid-shift change question. The server's re-tag (applyToShift, web
+ * repo retagActiveEntryCore) changes the current entry only. A "Switch from
+ * now" splits the shift into two entries, so after one the current entry is
+ * not the whole shift: the question then says which part changes and what
+ * the earlier part keeps. `partSince` is the current part's start as a
+ * clock time in the org's zone, "" when the zone is not known on this phone,
+ * or null for a shift in one part.
+ */
+function switchQuestion(
+  what: "project" | "task",
+  partSince: string | null,
+): { message: string; applyLabel: string } {
+  if (partSince === null) {
+    return {
+      message: `You are on the clock. You can switch to the new ${what} from now, or apply it to the whole shift.`,
+      applyLabel: "Apply to whole shift",
+    };
+  }
+  const part = partSince
+    ? `the part that started at ${partSince}`
+    : "the current part only";
+  return {
+    message: `You are on the clock, and this shift has an earlier part. You can switch to the new ${what} from now, or apply it to ${part}. The earlier part keeps its ${what}.`,
+    applyLabel: partSince ? `Apply since ${partSince}` : "Apply to this part",
+  };
 }
 
 function formatDuration(ms: number): string {
@@ -294,6 +323,24 @@ export function ClockScreen({
     start: string;
   } | null>(null);
   const [adjustOpen, setAdjustOpen] = useState(false);
+  // The start of the running shift's CURRENT part, when the shift has an
+  // earlier part: a "Switch from now" closes the entry and opens a new one,
+  // and the server keeps the first tap as the shift anchor (startedAt), so
+  // the new entry's own start (entryStartIso) is later. Null for a shift in
+  // one part. Set from server truth at a refresh, and by a switch made here
+  // before it syncs; cleared at a clock-in, a clock-out and an undo. The
+  // change question reads it (switchQuestion): the server's re-tag changes
+  // the current entry only, so "Apply to whole shift" is offered only when
+  // that entry is the whole shift.
+  const partStartRef = useRef<string | null>(null);
+  // "" when the shift has an earlier part but the org zone is not known.
+  const currentPartSince = useCallback((): string | null => {
+    const iso = partStartRef.current;
+    if (!iso) return null;
+    const tz = getOrgTz();
+    const wall = tz ? orgWallClock(Date.parse(iso), tz) : null;
+    return (wall && formatClock12(wall)) || "";
+  }, []);
 
   // Reminders (reminders.ts decides, reminder-notifications.ts schedules).
   // The preferences come from each status answer, or from the copy saved on
@@ -538,6 +585,12 @@ export function ClockScreen({
               ? prev
               : { id: active.id, start: active.entryStartIso };
           });
+          // The server sets the anchor only at a switch, so a later entry
+          // start means an earlier part exists (an edited start moves both).
+          partStartRef.current =
+            active && active.entryStartIso !== active.startedAt
+              ? active.entryStartIso
+              : null;
           // Server truth for the running shift: schedule the long shift
           // reminder from its start, or cancel it when none is running (a
           // clock-out made on the web or by a manager, a clock-in the server
@@ -839,6 +892,7 @@ export function ClockScreen({
             setShiftStartedAt(null);
             setOnBreakSince(null);
             setActiveEntry(null);
+            partStartRef.current = null;
             setLandingId(null);
             reconcileLongShift(null);
             reconcileShiftReminders(null);
@@ -915,6 +969,9 @@ export function ClockScreen({
         setBanner("Couldn't save the project switch. Try again.");
         return;
       }
+      // Saved: from now the shift has an earlier part, until the next
+      // refresh reads the server's own entry start.
+      if (!applyToShift) partStartRef.current = punch.clientTime;
       setPending(await queuedCount());
       await sync();
     },
@@ -941,24 +998,22 @@ export function ClockScreen({
         void enqueueSwitch(id, null, applyToShift);
       };
       // Forgot-to-tag case: the running entry has no project yet, so the pick
-      // simply labels the whole shift. No choice to make.
+      // simply labels it (the whole shift, unless an earlier part was
+      // switched away from). No choice to make.
       if (projectId === null) {
         apply(true);
         return;
       }
       // Cancel reverts by doing nothing: the picker is controlled by state,
       // which only updates once a choice is made.
-      Alert.alert(
-        "Change project",
-        "You are on the clock. You can switch to the new project from now, or apply it to the whole shift.",
-        [
-          { text: "Switch from now", onPress: () => apply(false) },
-          { text: "Apply to whole shift", onPress: () => apply(true) },
-          { text: "Cancel", style: "cancel" },
-        ],
-      );
+      const question = switchQuestion("project", currentPartSince());
+      Alert.alert("Change project", question.message, [
+        { text: "Switch from now", onPress: () => apply(false) },
+        { text: question.applyLabel, onPress: () => apply(true) },
+        { text: "Cancel", style: "cancel" },
+      ]);
     },
-    [shiftStartedAt, projectId, enqueueSwitch, pushSurface],
+    [shiftStartedAt, projectId, enqueueSwitch, pushSurface, currentPartSince],
   );
 
   const onTaskChange = useCallback(
@@ -978,17 +1033,14 @@ export function ClockScreen({
         });
         void enqueueSwitch(projectId, id, applyToShift);
       };
-      Alert.alert(
-        "Change task",
-        "You are on the clock. You can switch to the new task from now, or apply it to the whole shift.",
-        [
-          { text: "Switch from now", onPress: () => apply(false) },
-          { text: "Apply to whole shift", onPress: () => apply(true) },
-          { text: "Cancel", style: "cancel" },
-        ],
-      );
+      const question = switchQuestion("task", currentPartSince());
+      Alert.alert("Change task", question.message, [
+        { text: "Switch from now", onPress: () => apply(false) },
+        { text: question.applyLabel, onPress: () => apply(true) },
+        { text: "Cancel", style: "cancel" },
+      ]);
     },
-    [shiftStartedAt, taskId, projectId, enqueueSwitch, pushSurface],
+    [shiftStartedAt, taskId, projectId, enqueueSwitch, pushSurface, currentPartSince],
   );
 
   const doClockIn = useCallback(
@@ -1093,6 +1145,7 @@ export function ClockScreen({
       shiftStartedAtRef.current = punch.clientTime;
       setShiftStartedAt(punch.clientTime);
       setOnBreakSince(null);
+      partStartRef.current = null;
       // The punch is saved on the phone, so this holds offline too: the long
       // shift reminder counts from the tap, and a shift reminder for the
       // shift this clock-in started early is cancelled.
@@ -1177,6 +1230,7 @@ export function ClockScreen({
     setShiftStartedAt(null);
     setOnBreakSince(null);
     setActiveEntry(null);
+    partStartRef.current = null;
     // Clocked out on this phone: the long shift reminder goes now, offline
     // too, and shift reminders held while on the clock come back. If the
     // punch fails to save, the next refresh restores the reminder from the
@@ -1255,6 +1309,7 @@ export function ClockScreen({
     setShiftStartedAt(null);
     setOnBreakSince(null);
     setActiveEntry(null);
+    partStartRef.current = null;
     setLandingId(null);
     closeUndoOffer(true);
     // Every "undone on this phone" outcome passes here: the clock-in's long
