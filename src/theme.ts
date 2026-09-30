@@ -20,6 +20,11 @@ export type Palette = {
   accentText: string;
   success: string;
   danger: string;
+  /** A filled danger surface that carries accentText (Clock out, the error
+   *  banner, the rejected badge). Its own token because `danger` doubles as a
+   *  text colour on the dark surface, where it must stay light to read, while
+   *  a fill under light text must be dark enough to pass 4.5:1. */
+  dangerFill: string;
   border: string;
   warn: string;
   /* The four extra project board colors (clay/moss/amber map to accent/success
@@ -41,6 +46,9 @@ export const darkColors: Palette = {
   accentText: "#fbf8f3", // unified with light.accentText (web btn-primary-fg)
   success: "#8aa06f",
   danger: "#e2655a",
+  // #e2655a under accentText measured 3.18:1. This is the same hue and chroma
+  // (OKLCH), darkened just past 4.5:1: 4.65:1 under #fbf8f3.
+  dangerFill: "#c2473e",
   border: "#33332d",
   warn: "#e0b15a",
   // Lighter tones so the dot reads on the dark surface (mirrors web dark).
@@ -60,6 +68,7 @@ export const lightColors: Palette = {
   accentText: "#fbf8f3",
   success: "#4f5e42", // deep moss on purpose: readable at small sizes on paper
   danger: "#bb3b2a", // darker than web danger on purpose: readable on paper
+  dangerFill: "#bb3b2a", // 5.26:1 under accentText already
   border: "#ddd5c5",
   warn: "#9a6b15", // darker than web amber on purpose: readable on paper
   // Deepened on purpose, same reason as success/warn: readable on paper.

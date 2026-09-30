@@ -28,6 +28,7 @@ import {
   type MyScheduledShift,
   type Option,
 } from "../api";
+import { readFenceCache, writeFenceCache } from "../fence-cache";
 import { precheckGeofence, type Fence } from "../geofence";
 import { haptics } from "../lib/haptics";
 import { getOrgTz } from "../lib/org-tz";
@@ -47,6 +48,7 @@ import {
   drainQueue,
   enqueuePunch,
   queuedCount,
+  removeHeldPunches,
   type PunchKind,
   type QueuedPunch,
 } from "../queue";
@@ -119,6 +121,9 @@ export function ClockScreen({
   const [shiftStartedAt, setShiftStartedAt] = useState<string | null>(null);
   const [onBreakSince, setOnBreakSince] = useState<string | null>(null);
   const [pending, setPending] = useState(0);
+  // Punches kept on the phone because they are too old to sync on their own
+  // (queue.ts holdReasonFor). They never count as waiting to sync.
+  const [held, setHeld] = useState(0);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState("");
   const [banner, setBanner] = useState<string | null>(null);
@@ -150,7 +155,23 @@ export function ClockScreen({
     refreshLock();
   }, [refreshLock]);
   // Worksite fences for the client-side clock-in pre-check. Empty = no geofence.
+  // Seeded on mount from the last good getStatus on disk (fence-cache.ts), so a
+  // cold start with no signal can still warn an off-site worker; the live
+  // refresh below replaces them and the saved copy. The seed never overwrites
+  // fences a live refresh has already applied, whichever answers first.
   const [fences, setFences] = useState<Fence[]>([]);
+  const liveFencesRef = useRef(false);
+  const userId = session.user.id;
+  useEffect(() => {
+    let cancelled = false;
+    void readFenceCache(userId).then((cached) => {
+      if (cancelled || liveFencesRef.current || !cached) return;
+      setFences(cached);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [userId]);
   // WiFi-restricted clock-in config. Unlike the geofence advisory this one
   // BLOCKS: only the phone can see the SSID, so the check lives here.
   const [wifi, setWifi] = useState<{ enforced: boolean; ssids: string[] }>({
@@ -189,7 +210,10 @@ export function ClockScreen({
         setThemePreference(normalizeThemePreference(d.themePreference));
         setProjects(d.projects);
         setTasksByProject(d.tasksByProject);
-        setFences(d.geofence?.worksites ?? []);
+        const worksites = d.geofence?.worksites ?? [];
+        liveFencesRef.current = true;
+        setFences(worksites);
+        void writeFenceCache(userId, worksites);
         setWifi(
           d.wifi
             ? { enforced: d.wifi.enforced, ssids: d.wifi.ssids ?? [] }
@@ -222,7 +246,7 @@ export function ClockScreen({
     } finally {
       setReady(true);
     }
-  }, []);
+  }, [userId]);
 
   // Guided-tour replay + the first-run trigger (declared before sync so the
   // callback can fire it once a punch is accepted by the server).
@@ -233,6 +257,7 @@ export function ClockScreen({
     if (!token) return;
     const result = await drainQueue(token);
     setPending(result.remaining);
+    setHeld(result.held);
     if (result.errors.length > 0) setBanner(result.errors[0] ?? null);
     if (result.synced > 0) onPunchSucceeded();
     await refresh();
@@ -555,6 +580,25 @@ export function ClockScreen({
     setBusy(false);
   }, [enqueueSimple]);
 
+  // The held line is tappable: once the manager has added the shift, the
+  // worker can remove the held punches from the phone.
+  const onHeldPress = useCallback(() => {
+    Alert.alert(
+      held === 1 ? "Remove the held punch?" : "Remove the held punches?",
+      "Only do this after your manager has added the shift. The held punches are deleted from this phone, and punches waiting to sync are kept.",
+      [
+        { text: "Keep", style: "cancel" },
+        {
+          text: "Remove",
+          style: "destructive",
+          onPress: () => {
+            void removeHeldPunches().then(() => setHeld(0));
+          },
+        },
+      ],
+    );
+  }, [held]);
+
   const onBreakEnd = useCallback(async () => {
     haptics.light();
     setBusy(true);
@@ -760,7 +804,11 @@ export function ClockScreen({
                     accessibilityRole="button"
                     accessibilityLabel="Adjust start time"
                   >
-                    <Text style={styles.adjustLink}>Adjust start time</Text>
+                    {/* The underline is a clay border on a wrapper, not
+                        textDecorationColor, which Android ignores. */}
+                    <View style={styles.adjustLinkLine}>
+                      <Text style={styles.adjustLink}>Adjust start time</Text>
+                    </View>
                   </TouchableOpacity>
                 ) : null}
               </>
@@ -887,9 +935,23 @@ export function ClockScreen({
             <Text style={styles.pending}>
               {pending} {pending === 1 ? "punch" : "punches"} waiting to sync
             </Text>
-          ) : (
+          ) : held > 0 ? null : (
             <Text style={styles.synced}>All punches synced</Text>
           )}
+
+          {held > 0 ? (
+            <TouchableOpacity
+              onPress={onHeldPress}
+              accessibilityRole="button"
+              accessibilityHint="Removes the held punches after your manager has added the shift"
+            >
+              <Text style={styles.held}>
+                {held === 1
+                  ? "1 punch is held on this phone because it is too old to sync by itself. Ask your manager to add that shift, then tap here to remove it."
+                  : `${held} punches are held on this phone because they are too old to sync by themselves. Ask your manager to add that shift, then tap here to remove them.`}
+              </Text>
+            </TouchableOpacity>
+          ) : null}
 
           {upcoming.length > 0 ? (
             <View ref={scheduleRef} style={styles.history}>
@@ -1239,12 +1301,18 @@ const makeStyles = (c: Palette) =>
       fontWeight: "600",
       marginTop: 12,
     },
+    // Text in the card's own text colour with a clay underline: clay text on
+    // the dark card measured 2.94:1 (4.08:1 on the light card), and clay stays
+    // the accent as the underline instead of the letters.
+    adjustLinkLine: {
+      marginTop: 14,
+      borderBottomWidth: 1.5,
+      borderBottomColor: c.accent,
+    },
     adjustLink: {
-      color: c.accent,
+      color: c.text,
       fontSize: 14,
       fontWeight: "600",
-      textDecorationLine: "underline",
-      marginTop: 14,
     },
     switchHint: {
       color: c.textMuted,
@@ -1265,7 +1333,7 @@ const makeStyles = (c: Palette) =>
     },
     bigButton: { borderRadius: 18, paddingVertical: 22, alignItems: "center" },
     inButton: { backgroundColor: c.accent },
-    outButton: { backgroundColor: c.danger },
+    outButton: { backgroundColor: c.dangerFill },
     breakButton: {
       backgroundColor: c.surfaceAlt,
       borderWidth: 1,
@@ -1294,6 +1362,14 @@ const makeStyles = (c: Palette) =>
       textAlign: "center",
       marginTop: 18,
     },
+    held: {
+      color: c.warn,
+      fontSize: 14,
+      lineHeight: 20,
+      textAlign: "center",
+      marginTop: 12,
+      fontWeight: "600",
+    },
     history: { marginTop: 28 },
     historyTitle: {
       color: c.textMuted,
@@ -1320,7 +1396,7 @@ const makeStyles = (c: Palette) =>
     // a struck-through duration — it is not worked time until the employee fixes
     // it. Tapping the row opens the correction request sheet.
     rejectedBadge: {
-      backgroundColor: c.danger,
+      backgroundColor: c.dangerFill,
       borderRadius: 6,
       paddingHorizontal: 6,
       paddingVertical: 1,
@@ -1344,7 +1420,7 @@ const makeStyles = (c: Palette) =>
       lineHeight: 18,
     },
     bannerWrap: {
-      backgroundColor: c.danger,
+      backgroundColor: c.dangerFill,
       paddingVertical: 12,
       paddingHorizontal: 20,
     },
