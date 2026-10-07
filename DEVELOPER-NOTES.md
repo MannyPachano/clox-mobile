@@ -202,6 +202,9 @@ clox-mobile/
     theme.ts           # colors
     components/SelectField.tsx   # the project/task picker
     screens/LoginScreen.tsx
+    screens/MfaScreen.tsx   # the 6-digit code step for accounts with 2FA on
+    lib/mfa.ts         # pure 2FA rules: the mfa_required signal, the token's aal, the words
+    mfa-session.ts     # supabase.auth.mfa calls (list factors, verify a code)
     screens/ClockScreen.tsx
   modules/clox-shift-surface/  # Swift (Live Activity, widget taps) and Kotlin (ongoing notification)
   targets/widget/      # the iOS widget extension (Live Activity views, Home Screen widget), built by @bacons/apple-targets
@@ -225,6 +228,7 @@ Routes: `src/app/api/mobile/v1/`
 | `/profile/preferences` | POST | save any of `shiftReminderMinutes` (10 or null), `longShiftHours` (10 or null), `notifyRefusedPunch` (managers only); `/status` returns them as `preferences` (web PR #19) |
 
 - **Auth:** `Authorization: Bearer <supabase access token>` → validated in `src/lib/mobile-auth.ts`.
+- **Two-step verification (2FA).** An account with 2FA turned on (web Settings → Account & security) must send an `aal2` token. The server answers a password-only token with HTTP 401 `{ error: "mfa_required" }`, never 403. The app answers it with the 6-digit code step (`src/screens/MfaScreen.tsx`), both right after a password sign-in (App asks `mfa.listFactors()` alongside the status) and whenever any call answers `mfa_required` (a phone signed in before the app asked). It never signs the person out for it: the queue keeps punches on any 401, and after a correct code App sends them before the Clock screen comes back. Recovery codes stay on the web; the code step points to app.getclox.com/signin. The rules live in `src/lib/mfa.ts`; `node scripts/mfa-check.mjs` loads the real `queue.ts` and `api.ts` against a fake server to check that a queued punch survives `mfa_required` and is sent after the code.
 - **Deploy backend changes:** commit + push the web repo → Vercel auto-deploys.
 - **Verify it's live:**
   ```bash
