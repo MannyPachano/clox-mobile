@@ -9,8 +9,12 @@ const FAKES = {
   "./error-reporting": "./error-reporting.mjs",
 };
 
+// Only this repo's own src/ files get the fakes; a package that happens to
+// ship a src/ folder resolves normally.
+const APP_SRC = new URL("../../src/", import.meta.url).href;
+
 export async function resolve(specifier, context, next) {
-  const fromApp = context.parentURL?.includes("/src/") ?? false;
+  const fromApp = context.parentURL?.startsWith(APP_SRC) ?? false;
   const fake = FAKES[specifier];
   if (fake && (fromApp || specifier.startsWith("@"))) {
     return { url: new URL(fake, import.meta.url).href, shortCircuit: true };

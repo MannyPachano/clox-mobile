@@ -29,11 +29,12 @@ type Load =
 
 /**
  * The second step of signing in, for an account with 2FA turned on. App shows
- * it after a password sign-in, and whenever the server answers mfa_required
- * (a phone that signed in before the app asked for the code). It replaces
- * the app's screens until the code is in, and never signs anyone out by
- * itself: punches made meanwhile stay in the queue, and App sends them once
- * the code is accepted (`sending` is true while it does).
+ * it after a password sign-in on this phone, at launch when the app closed on
+ * it, and whenever the server answers mfa_required (lib/mfa.ts planCodeStep).
+ * It covers the app's screens until the code is in, without unmounting them,
+ * and never signs anyone out by itself: punches made meanwhile stay in the
+ * queue, and App sends them once the code is accepted (`sending` is true
+ * while it does).
  *
  * Recovery codes stay on the web: using one removes 2FA from the account,
  * which signs this phone out, and the person then signs in with a password.

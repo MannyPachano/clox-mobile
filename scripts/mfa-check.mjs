@@ -175,6 +175,70 @@ eq(classify({ name: "AuthApiError", status: 403, code: "session_not_found" }), "
 eq(classify({ name: "AuthApiError", status: 500 }), "unknown", "server error");
 eq(classify(null), "unknown", "nothing");
 
+// ── 6. When the code step is decided (planCodeStep) ──────────────────────
+const plan = (o) =>
+  mfa.planCodeStep({ aal: "aal1", passwordSignIn: false, pendingUserId: null, userId: "u1", ...o });
+eq(plan({}), "none", "a session restored at launch is never checked over the network");
+eq(plan({ aal: null }), "none", "restored, no readable aal: still no network check");
+eq(plan({ passwordSignIn: true }), "check_factors", "a password sign-in on this phone is checked");
+eq(plan({ pendingUserId: "u1" }), "code_step", "a code step left open asks again, from local state");
+eq(plan({ pendingUserId: "u2" }), "none", "another user's open code step does not apply");
+eq(plan({ pendingUserId: "u2", passwordSignIn: true }), "check_factors", "another user's marker does not block a sign-in check");
+eq(plan({ aal: "aal2", pendingUserId: "u1", passwordSignIn: true }), "none", "aal2 needs nothing");
+
+// ── 7. Why: supabase-js on a session the auth server deleted ──────────────
+// The auth server deletes a user's password-only sessions each time a factor
+// is verified (supabase/auth mfa.go, InvalidateSessionsWithAALLessThan). A
+// phone signed in before 2FA was turned on keeps that dead session. With the
+// supabase-js this app ships, listFactors on it calls GET /user, gets 403
+// session_not_found, deletes the stored session and fires SIGNED_OUT. Update
+// b4e947d3 made that call at launch, under screens still mounting.
+{
+  const { createClient } = await import("@supabase/supabase-js");
+  const now = Math.floor(Date.now() / 1000);
+  const deadJwt = jwt({ sub: "u1", aal: "aal1", session_id: "s1", exp: now + 3000, role: "authenticated" });
+  const KEY = "sb-abcdefgh-auth-token";
+  const store = new Map([[KEY, JSON.stringify({
+    access_token: deadJwt, refresh_token: "r1", token_type: "bearer",
+    expires_in: 3600, expires_at: now + 3000,
+    user: { id: "u1", aud: "authenticated", email: "pat@example.com" },
+  })]]);
+  const authCalls = [];
+  const client = createClient("https://abcdefgh.supabase.co", "anon", {
+    auth: {
+      storage: {
+        getItem: async (k) => store.get(k) ?? null,
+        setItem: async (k, v) => void store.set(k, v),
+        removeItem: async (k) => void store.delete(k),
+      },
+      persistSession: true,
+      autoRefreshToken: false,
+      detectSessionInUrl: false,
+    },
+    global: {
+      fetch: async (url, init) => {
+        authCalls.push(`${init?.method ?? "GET"} ${new URL(url).pathname}`);
+        return new Response(
+          JSON.stringify({ code: 403, error_code: "session_not_found", msg: "Session from session_id claim in JWT does not exist" }),
+          { status: 403, headers: { "Content-Type": "application/json" } },
+        );
+      },
+    },
+  });
+  const authEvents = [];
+  client.auth.onAuthStateChange((e) => authEvents.push(e));
+  await new Promise((r) => setTimeout(r, 30));
+  const res = await client.auth.mfa.listFactors();
+  await new Promise((r) => setTimeout(r, 30));
+  eq(authCalls, ["GET /auth/v1/user"], "dead session: listFactors calls GET /user");
+  eq(res.error?.name, "AuthSessionMissingError", "dead session: listFactors fails");
+  eq(store.has(KEY), false, "dead session: supabase-js deletes the stored session");
+  eq(authEvents.includes("SIGNED_OUT"), true, "dead session: supabase-js signs the app out");
+  // A restored session is reported as SIGNED_IN too, so App can't tell a
+  // fresh sign-in by the event name; LoginScreen marks it instead.
+  eq(authEvents[0], "SIGNED_IN", "a restored session arrives as SIGNED_IN");
+}
+
 // The words follow the house rules: no em or en dashes, no exclamation marks.
 const words = [];
 const collect = (v) => {
