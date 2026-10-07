@@ -31,10 +31,20 @@ import {
   clearFenceCacheUnlessOwner,
 } from "./src/fence-cache";
 import { installErrorReporting, reportError } from "./src/error-reporting";
-import { MFA_COPY, MFA_REQUIRED, onMfaRequired, tokenAal } from "./src/lib/mfa";
 import {
-  clearSecondFactorCache,
+  MFA_COPY,
+  MFA_REQUIRED,
+  onMfaRequired,
+  planCodeStep,
+  tokenAal,
+} from "./src/lib/mfa";
+import {
+  clearCodeStepPending,
+  closePasswordSignIn,
+  passwordSignInOpen,
+  readCodeStepPending,
   secondFactorNeeded,
+  writeCodeStepPending,
 } from "./src/mfa-session";
 import { ManagerTabs } from "./src/navigation/ManagerTabs";
 import { registerForPush, unregisterForPush } from "./src/push";
@@ -174,6 +184,7 @@ export default function App() {
       // A request sent with the password-only token just before the code
       // went in: this session no longer needs it.
       if (tokenAal(current.access_token) === "aal2") return;
+      void writeCodeStepPending(uid);
       setCodeStep((cur) =>
         cur?.userId === uid ? cur : { userId: uid, phase: "code" },
       );
@@ -309,35 +320,61 @@ export default function App() {
     }
     let cancelled = false;
     void (async () => {
-      const snap = await readBootSnapshot();
+      const userId = session.user.id;
+      const [snap, pending] = await Promise.all([
+        readBootSnapshot(),
+        readCodeStepPending(),
+      ]);
       if (cancelled) return;
-      const seeded =
-        snap && snap.userId === session.user.id ? snap.role : null;
-      if (seeded) setRole((cur) => cur ?? seeded);
+      // The second step, decided from local state (lib/mfa.ts planCodeStep).
+      // A session restored at launch is never checked over the network: the
+      // auth server deletes a user's password-only sessions when a factor is
+      // verified, and GET /user on such a session signs the app out on the
+      // spot. Only a password sign-in made on this phone is checked.
+      const aal = tokenAal(session.access_token);
+      if (aal === "aal2" && pending === userId) void clearCodeStepPending();
+      const plan = planCodeStep({
+        aal,
+        passwordSignIn: passwordSignInOpen(),
+        pendingUserId: pending,
+        userId,
+      });
+      if (plan === "code_step") {
+        // The app closed on the code step: ask again before any app screen
+        // shows. The role comes from the status asked after the code.
+        setCodeStep((cur) =>
+          cur?.userId === userId ? cur : { userId, phase: "code" },
+        );
+        return;
+      }
+      const seeded = snap && snap.userId === userId ? snap.role : null;
+      // A fresh password sign-in shows nothing behind the spinner until its
+      // factor check is answered, so no app screen mounts and then goes.
+      if (seeded && plan === "none") setRole((cur) => cur ?? seeded);
 
       const t = await getAccessToken();
       if (cancelled) return;
       if (!t) {
+        if (plan === "check_factors") closePasswordSignIn();
         setRole((cur) => cur ?? seeded ?? "employee");
         return;
       }
-      // A password-only session on an account with 2FA on gets the code
-      // step first. Asked alongside the status, so a phone without 2FA
-      // waits no longer than before. Offline the check answers "unknown"
-      // and the app carries on (punches queue as always); the server's
-      // mfa_required answer brings up the same step once it is reachable.
-      const userId = session.user.id;
+      // Asked alongside the status, so a sign-in without 2FA waits no longer
+      // than before. Offline it answers "unknown" and the app carries on; the
+      // server's mfa_required answer brings up the step once it is reachable.
       const check =
-        tokenAal(t) === "aal2"
-          ? Promise.resolve("clear" as const)
-          : secondFactorNeeded(userId);
+        plan === "check_factors"
+          ? secondFactorNeeded()
+          : Promise.resolve("clear" as const);
       try {
         const [need, res] = await Promise.all([
           check,
           getStatus(t).catch(() => null),
         ]);
         if (cancelled) return;
+        if (plan === "check_factors") closePasswordSignIn();
         if (need === "needed") {
+          void writeCodeStepPending(userId);
           setCodeStep((cur) =>
             cur?.userId === userId ? cur : { userId, phase: "code" },
           );
@@ -386,7 +423,8 @@ export default function App() {
 
   const signOutNow = async () => {
     setCodeStep(null);
-    clearSecondFactorCache();
+    closePasswordSignIn();
+    await clearCodeStepPending();
     const t = await getAccessToken();
     if (t) {
       await unregisterForPush(t);
@@ -426,7 +464,8 @@ export default function App() {
   const handleReauth = () => {
     void (async () => {
       setCodeStep(null);
-      clearSecondFactorCache();
+      closePasswordSignIn();
+      await clearCodeStepPending();
       const t = await getAccessToken();
       if (t) await unregisterForPush(t);
       await clearBootSnapshot();
@@ -444,11 +483,12 @@ export default function App() {
 
   // The code went in: the session is aal2 now (supabase-js stored it and
   // onAuthStateChange passed it on). Send the punches saved while the server
-  // was refusing this session, then hand over to the app, which reloads the
-  // status for the new session. The step stays up while they send, so the
-  // Clock screen never starts a second drain beside this one.
+  // was refusing this session, then uncover the app, which reloads the
+  // status for the new session. A Clock screen under the step that syncs at
+  // the same time finds this drain running and waits for the next pass.
   const onCodeVerified = () => {
     setCodeStep((cur) => (cur ? { ...cur, phase: "sending" } : cur));
+    void clearCodeStepPending();
     void (async () => {
       let errors: string[] = [];
       const t = await getAccessToken();
@@ -472,8 +512,13 @@ export default function App() {
   // 2FA was turned off since the step came up: no code is needed, so ask
   // for the status again.
   const onNoFactor = () => {
-    setCodeStep(null);
-    setStatusNonce((n) => n + 1);
+    void (async () => {
+      // Cleared before the status is asked again, or that pass could still
+      // read the marker and open the step once more.
+      await clearCodeStepPending();
+      setCodeStep(null);
+      setStatusNonce((n) => n + 1);
+    })();
   };
 
   // Signing out from the code step clears the queue, and its punches can't
@@ -534,30 +579,50 @@ export default function App() {
             onUnlocked={onUnlocked}
             onReauth={handleReauth}
           />
-        ) : showCodeStep ? (
-          <MfaScreen
-            sending={codeStep.phase === "sending"}
-            onVerified={onCodeVerified}
-            onNoFactor={onNoFactor}
-            onSignOut={onCodeStepSignOut}
-          />
-        ) : resolvingRole ? (
-          <View style={styles.center}>
-            <ActivityIndicator color={lightColors.accent} size="large" />
-          </View>
-        ) : role === "manager" ? (
-          <TutorialProvider role="manager" autoStart={!tutorialDone}>
-            <ManagerTabs
-              session={session}
-              onSignOut={handleSignOut}
-              pendingTab={managerTab}
-              onPendingTabHandled={onTapHandled}
-            />
-          </TutorialProvider>
         ) : (
-          <TutorialProvider role="employee" autoStart={!tutorialDone}>
-            <ClockScreen session={session} onSignOut={handleSignOut} />
-          </TutorialProvider>
+          // The code step covers the app instead of replacing it, so a screen
+          // that is already up is never torn down and mounted again for it.
+          // While it shows, what is under it is hidden from touch and from
+          // screen readers.
+          <View style={styles.root}>
+            <View
+              style={styles.root}
+              pointerEvents={showCodeStep ? "none" : "auto"}
+              accessibilityElementsHidden={showCodeStep}
+              importantForAccessibility={
+                showCodeStep ? "no-hide-descendants" : "auto"
+              }
+            >
+              {resolvingRole ? (
+                <View style={styles.center}>
+                  <ActivityIndicator color={lightColors.accent} size="large" />
+                </View>
+              ) : role === "manager" ? (
+                <TutorialProvider role="manager" autoStart={!tutorialDone}>
+                  <ManagerTabs
+                    session={session}
+                    onSignOut={handleSignOut}
+                    pendingTab={managerTab}
+                    onPendingTabHandled={onTapHandled}
+                  />
+                </TutorialProvider>
+              ) : (
+                <TutorialProvider role="employee" autoStart={!tutorialDone}>
+                  <ClockScreen session={session} onSignOut={handleSignOut} />
+                </TutorialProvider>
+              )}
+            </View>
+            {showCodeStep ? (
+              <View style={StyleSheet.absoluteFill}>
+                <MfaScreen
+                  sending={codeStep.phase === "sending"}
+                  onVerified={onCodeVerified}
+                  onNoFactor={onNoFactor}
+                  onSignOut={onCodeStepSignOut}
+                />
+              </View>
+            ) : null}
+          </View>
         )}
         </View>
       </ErrorBoundary>
