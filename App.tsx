@@ -32,7 +32,9 @@ import {
   clearFenceCacheUnlessOwner,
 } from "./src/fence-cache";
 import { installErrorReporting, reportError } from "./src/error-reporting";
+import { showLastCrashOnce } from "./src/crash-log";
 import {
+  CODE_STEP_ENABLED,
   MFA_COPY,
   MFA_REQUIRED,
   onMfaRequired,
@@ -196,6 +198,7 @@ export default function App() {
   const signingOutRef = useRef(false);
   useEffect(() => {
     return onMfaRequired(() => {
+      if (!CODE_STEP_ENABLED) return;
       const current = sessionRef.current;
       const uid = current?.user?.id;
       if (!uid || signingOutRef.current) return;
@@ -254,6 +257,11 @@ export default function App() {
       .catch(() => {});
     const sub = Linking.addEventListener("url", (e) => take(e.url));
     return () => sub.remove();
+  }, []);
+
+  // TEMPORARY: show a crash expo-updates recorded in the last day, once.
+  useEffect(() => {
+    void showLastCrashOnce();
   }, []);
 
   const onTapHandled = useCallback(() => {
@@ -383,13 +391,17 @@ export default function App() {
       // verified, and GET /user on such a session signs the app out on the
       // spot. Only a password sign-in made on this phone is checked.
       const aal = tokenAal(session.access_token);
-      if (aal === "aal2" && pending === userId) void clearCodeStepPending();
-      const plan = planCodeStep({
-        aal,
-        passwordSignIn: passwordSignInOpen(),
-        pendingUserId: pending,
-        userId,
-      });
+      if (pending && (aal === "aal2" || !CODE_STEP_ENABLED)) {
+        void clearCodeStepPending();
+      }
+      const plan = CODE_STEP_ENABLED
+        ? planCodeStep({
+            aal,
+            passwordSignIn: passwordSignInOpen(),
+            pendingUserId: pending,
+            userId,
+          })
+        : "none";
       if (plan === "code_step") {
         // The app closed on the code step: ask again before any app screen
         // shows. The role comes from the status asked after the code.
