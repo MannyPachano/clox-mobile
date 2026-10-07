@@ -1,5 +1,6 @@
 import { API_BASE_URL } from "./config";
 import { getAttestationForPunch } from "./attestation";
+import { noteApiAnswer } from "./lib/mfa";
 import { setOrgTz } from "./lib/org-tz";
 import type { QueuedPunch } from "./queue";
 
@@ -85,6 +86,10 @@ async function request<T>(
   if (res.ok) return { ok: true, status: res.status, data: data as T };
   const error =
     (data as { error?: string } | null)?.error ?? `http_${res.status}`;
+  // 401 "mfa_required": this session is password-only on an account with
+  // 2FA on. App shows the code step (lib/mfa.ts); callers see an ordinary
+  // 401, which the punch queue keeps.
+  noteApiAnswer(res.status, error);
   return { ok: false, status: res.status, error };
 }
 
