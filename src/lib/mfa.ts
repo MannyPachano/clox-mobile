@@ -62,6 +62,45 @@ export function tokenAal(token: string | null | undefined): string | null {
   }
 }
 
+// ── When the code step is decided ────────────────────────────────────────
+
+/**
+ * What App does about the second step when it has a session:
+ *   none           Carry on. A session at aal2 needs nothing, and so does a
+ *                  session restored at launch with no code step pending.
+ *   code_step      Show the code step now, from local state only: a code
+ *                  step was left open for this user (the app closed on it).
+ *   check_factors  Ask the auth server for the user's factors, before any
+ *                  app screen shows. Only right after a password sign-in on
+ *                  this phone, when the session is brand new.
+ *
+ * A restored session is never checked over the network. The auth server
+ * deletes every password-only session of a user each time a factor is
+ * verified, so a phone signed in before 2FA was turned on holds a session
+ * that no longer exists, and GET /user on it (what listFactors calls) makes
+ * supabase-js delete the stored session and sign the app out on the spot,
+ * under screens that are still mounting. Update b4e947d3 (1.4.0) did that
+ * at launch on the one phone with 2FA, which then crashed and rolled back.
+ * A live password-only session is caught by the server's mfa_required
+ * answer instead.
+ */
+export type CodeStepPlan = "none" | "code_step" | "check_factors";
+
+export function planCodeStep(input: {
+  /** The session token's aal claim (tokenAal). */
+  aal: string | null;
+  /** A password sign-in on this phone is waiting for its factor check. */
+  passwordSignIn: boolean;
+  /** The user a code step was left open for, if any. */
+  pendingUserId: string | null;
+  userId: string;
+}): CodeStepPlan {
+  if (input.aal === "aal2") return "none";
+  if (input.pendingUserId === input.userId) return "code_step";
+  if (input.passwordSignIn) return "check_factors";
+  return "none";
+}
+
 /** A complete code: exactly six digits. */
 export function isSixDigitCode(code: string): boolean {
   return /^\d{6}$/.test(code);
