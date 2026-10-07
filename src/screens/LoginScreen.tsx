@@ -14,6 +14,7 @@ import NetInfo from "@react-native-community/netinfo";
 
 import { Wordmark } from "../components/Wordmark";
 import { haptics } from "../lib/haptics";
+import { closePasswordSignIn, notePasswordSignIn } from "../mfa-session";
 import { supabase } from "../supabase";
 import { lightColors, type Palette } from "../theme";
 
@@ -49,12 +50,17 @@ export function LoginScreen() {
       return;
     }
     setBusy(true);
+    // Tells App this session comes from a password typed here, so it asks
+    // the auth server about 2FA before any app screen shows (lib/mfa.ts
+    // planCodeStep). Set first: the session reaches App before this resolves.
+    notePasswordSignIn();
     const { error: err } = await supabase.auth.signInWithPassword({
       email: email.trim(),
       password,
     });
     // On success, App's onAuthStateChange swaps to the Clock screen.
     if (err) {
+      closePasswordSignIn();
       // A dropped connection mid-request surfaces as a fetch failure; show the
       // same plain-language offline note rather than the raw library string.
       const isNetwork = /network request failed|fetch/i.test(err.message);
