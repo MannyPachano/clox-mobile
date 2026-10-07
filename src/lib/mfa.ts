@@ -7,6 +7,15 @@
 // signing the person out, and the punch queue keeps its punches on any 401
 // (queue.ts), so they are sent once the code is in.
 
+/**
+ * TEMPORARY off switch (2026-10-07). The code step crashed the app on an
+ * iPhone with a fatal JavaScript error not yet identified (see
+ * src/crash-log.ts). While false the phone never shows the code step and
+ * behaves like the App Store build: no 2FA on the phone. Keep the web branch
+ * that refuses password-only phone tokens unmerged until this is true again.
+ */
+export const CODE_STEP_ENABLED = false;
+
 /** The server's error code for a password-only token on a 2FA account. */
 export const MFA_REQUIRED = "mfa_required";
 
