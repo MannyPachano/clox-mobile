@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  Alert,
   AppState,
   InteractionManager,
   StyleSheet,
@@ -30,6 +31,11 @@ import {
   clearFenceCacheUnlessOwner,
 } from "./src/fence-cache";
 import { installErrorReporting, reportError } from "./src/error-reporting";
+import { MFA_COPY, MFA_REQUIRED, onMfaRequired, tokenAal } from "./src/lib/mfa";
+import {
+  clearSecondFactorCache,
+  secondFactorNeeded,
+} from "./src/mfa-session";
 import { ManagerTabs } from "./src/navigation/ManagerTabs";
 import { registerForPush, unregisterForPush } from "./src/push";
 import {
@@ -41,9 +47,11 @@ import {
   clearQueue,
   drainQueue,
   getQueueOwner,
+  queuedCount,
   storedPunchCount,
 } from "./src/queue";
 import { ClockScreen } from "./src/screens/ClockScreen";
+import { MfaScreen } from "./src/screens/MfaScreen";
 import { LoginScreen } from "./src/screens/LoginScreen";
 import { UnlockScreen } from "./src/screens/UnlockScreen";
 import { getAccessToken, supabase } from "./src/supabase";
@@ -63,6 +71,13 @@ const LOCK_GRACE_MS = 60_000;
 /** A tap the manager tabs took this recently is given to them again when
  *  the app lock comes back on (see the relock below). */
 const TAP_REPLAY_MS = 10_000;
+/** How long the code step waits for the saved punches to send before it
+ *  hands over to the Clock screen, which keeps retrying on its own. */
+const CODE_SEND_BUDGET_MS = 15_000;
+
+/** The second step of signing in, for one user: "code" while it is asked
+ *  for, "sending" while the punches saved meanwhile are sent. */
+type CodeStep = { userId: string; phase: "code" | "sending" };
 
 // Taps already taken, by notification. On a cold start the launching tap can
 // arrive both as the last response and through the listener; it is acted on
@@ -136,6 +151,34 @@ export default function App() {
     tappedRef.current = tapped;
   }, [tapped]);
   const lastTakenTapRef = useRef<{ tap: Tapped; at: number } | null>(null);
+  // Two-step verification. Set by the sign-in check below and by any server
+  // answer of mfa_required (api.ts), for a password-only session on an
+  // account with 2FA on; the code step then stands in for the app until the
+  // code is in and the saved punches are sent. Keyed to the user, so it
+  // never carries over to someone else.
+  const [codeStep, setCodeStep] = useState<CodeStep | null>(null);
+  // Bumped to ask for the status again (after the code step found 2FA off).
+  const [statusNonce, setStatusNonce] = useState(0);
+  const sessionRef = useRef<Session | null>(null);
+  useEffect(() => {
+    sessionRef.current = session;
+  }, [session]);
+  // A sign-out's last requests may answer mfa_required; they must not bring
+  // the code step back over the sign-in screen.
+  const signingOutRef = useRef(false);
+  useEffect(() => {
+    return onMfaRequired(() => {
+      const current = sessionRef.current;
+      const uid = current?.user?.id;
+      if (!uid || signingOutRef.current) return;
+      // A request sent with the password-only token just before the code
+      // went in: this session no longer needs it.
+      if (tokenAal(current.access_token) === "aal2") return;
+      setCodeStep((cur) =>
+        cur?.userId === uid ? cur : { userId: uid, phase: "code" },
+      );
+    });
+  }, []);
 
   useEffect(() => {
     const sub = Notifications.addNotificationResponseReceivedListener((res) => {
@@ -278,10 +321,32 @@ export default function App() {
         setRole((cur) => cur ?? seeded ?? "employee");
         return;
       }
+      // A password-only session on an account with 2FA on gets the code
+      // step first. Asked alongside the status, so a phone without 2FA
+      // waits no longer than before. Offline the check answers "unknown"
+      // and the app carries on (punches queue as always); the server's
+      // mfa_required answer brings up the same step once it is reachable.
+      const userId = session.user.id;
+      const check =
+        tokenAal(t) === "aal2"
+          ? Promise.resolve("clear" as const)
+          : secondFactorNeeded(userId);
       try {
-        const res = await getStatus(t);
+        const [need, res] = await Promise.all([
+          check,
+          getStatus(t).catch(() => null),
+        ]);
         if (cancelled) return;
-        if (res.ok) {
+        if (need === "needed") {
+          setCodeStep((cur) =>
+            cur?.userId === userId ? cur : { userId, phase: "code" },
+          );
+          return;
+        }
+        if (!res) {
+          // Offline or the request failed: keep the seeded role.
+          setRole((cur) => cur ?? seeded ?? "employee");
+        } else if (res.ok) {
           setRole(res.data.user.role);
           setTutorialDone(res.data.tutorialCompleted);
           void writeBootSnapshot({
@@ -296,7 +361,9 @@ export default function App() {
             displayName: res.data.user.name,
             role: res.data.user.role,
           });
-        } else {
+        } else if (res.error !== MFA_REQUIRED) {
+          // mfa_required has already brought up the code step (api.ts);
+          // the role comes from the status asked again after the code.
           setRole((cur) => cur ?? seeded ?? "employee");
         }
       } catch {
@@ -306,9 +373,20 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [session]);
+  }, [session, statusNonce]);
 
   const handleSignOut = async () => {
+    signingOutRef.current = true;
+    try {
+      await signOutNow();
+    } finally {
+      signingOutRef.current = false;
+    }
+  };
+
+  const signOutNow = async () => {
+    setCodeStep(null);
+    clearSecondFactorCache();
     const t = await getAccessToken();
     if (t) {
       await unregisterForPush(t);
@@ -347,6 +425,8 @@ export default function App() {
   // PIN can't gate anything) and the role snapshot.
   const handleReauth = () => {
     void (async () => {
+      setCodeStep(null);
+      clearSecondFactorCache();
       const t = await getAccessToken();
       if (t) await unregisterForPush(t);
       await clearBootSnapshot();
@@ -361,6 +441,60 @@ export default function App() {
   };
 
   const onUnlocked = () => setLocked(false);
+
+  // The code went in: the session is aal2 now (supabase-js stored it and
+  // onAuthStateChange passed it on). Send the punches saved while the server
+  // was refusing this session, then hand over to the app, which reloads the
+  // status for the new session. The step stays up while they send, so the
+  // Clock screen never starts a second drain beside this one.
+  const onCodeVerified = () => {
+    setCodeStep((cur) => (cur ? { ...cur, phase: "sending" } : cur));
+    void (async () => {
+      let errors: string[] = [];
+      const t = await getAccessToken();
+      if (t) {
+        const send = drainQueue(t).catch(() => null);
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        const late = new Promise<null>((resolve) => {
+          timer = setTimeout(() => resolve(null), CODE_SEND_BUDGET_MS);
+        });
+        const result = await Promise.race([send, late]);
+        if (timer) clearTimeout(timer);
+        errors = result?.errors ?? [];
+      }
+      setCodeStep(null);
+      if (errors.length > 0) {
+        Alert.alert(MFA_COPY.sentTitle, errors.join("\n\n"));
+      }
+    })();
+  };
+
+  // 2FA was turned off since the step came up: no code is needed, so ask
+  // for the status again.
+  const onNoFactor = () => {
+    setCodeStep(null);
+    setStatusNonce((n) => n + 1);
+  };
+
+  // Signing out from the code step clears the queue, and its punches can't
+  // be sent without the code, so say so first when any are waiting.
+  const onCodeStepSignOut = () => {
+    void (async () => {
+      const waiting = await queuedCount();
+      if (waiting === 0) {
+        await handleSignOut();
+        return;
+      }
+      Alert.alert(MFA_COPY.signOutTitle, MFA_COPY.signOutWithPunches(waiting), [
+        { text: MFA_COPY.cancel, style: "cancel" },
+        {
+          text: MFA_COPY.signOut,
+          style: "destructive",
+          onPress: () => void handleSignOut(),
+        },
+      ]);
+    })();
+  };
 
   // A tap the current shell has nothing to do with is dropped once the shell
   // is known: an employee (a demoted manager tapping an old alert, or a
@@ -379,6 +513,8 @@ export default function App() {
   // Signed in but role not resolved yet — hold on the spinner so we don't flash
   // the employee screen before swapping to the manager tabs.
   const resolvingRole = session !== null && role === null;
+  const showCodeStep =
+    session !== null && codeStep !== null && codeStep.userId === session.user.id;
 
   return (
     <SafeAreaProvider>
@@ -397,6 +533,13 @@ export default function App() {
             biometricEnabled={lockStatus.biometric}
             onUnlocked={onUnlocked}
             onReauth={handleReauth}
+          />
+        ) : showCodeStep ? (
+          <MfaScreen
+            sending={codeStep.phase === "sending"}
+            onVerified={onCodeVerified}
+            onNoFactor={onNoFactor}
+            onSignOut={onCodeStepSignOut}
           />
         ) : resolvingRole ? (
           <View style={styles.center}>

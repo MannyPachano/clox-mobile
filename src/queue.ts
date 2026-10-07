@@ -452,7 +452,11 @@ export async function drainQueue(token: string): Promise<DrainResult> {
             // 409 = already reflected on the server (idempotent replay) — done.
             outcome = "done";
           } else if (res.status === 401) {
-            // Token expired/invalid — stop; auth refresh + a later drain resumes.
+            // Token expired/invalid, or "mfa_required" (a password-only
+            // session on an account with 2FA on: App shows the code step and
+            // drains again once it is in). Keep the punch and stop; a later
+            // drain resumes. The server must answer these with 401, never
+            // 403, which the branch below would drop.
             outcome = "stop";
           } else if (res.status >= 400 && res.status < 500) {
             // Won't succeed on retry (geo_outside, project_required, …) — drop it
